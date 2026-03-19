@@ -52,7 +52,12 @@ let restartAttempts = 0;
 async function startPolling(): Promise<void> {
   try {
     // Drop pending updates to clear stale getUpdates offsets and avoid 409 conflicts
-    await bot!.start({ drop_pending_updates: true });
+    await bot!.start({
+      drop_pending_updates: true,
+      onStart: () => {
+        restartAttempts = 0;
+      },
+    });
   } catch (error) {
     if (shuttingDown) return;
 

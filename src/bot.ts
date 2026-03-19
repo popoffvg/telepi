@@ -43,6 +43,7 @@ export function createBot(config: TelePiConfig, piSession: PiSessionService): Bo
   bot.api.config.use(autoRetry({ maxRetryAttempts: 3, maxDelaySeconds: 10 }));
 
   let isProcessing = false;
+  let isSwitching = false;
   const pendingSessionPicks = new Map<number, Array<{ path: string; cwd: string }>>();
   const pendingWorkspacePicks = new Map<number, string[]>();
   const pendingModelPicks = new Map<number, Array<{ provider: string; id: string }>>();
@@ -80,10 +81,16 @@ export function createBot(config: TelePiConfig, piSession: PiSessionService): Bo
   });
 
   bot.command("abort", async (ctx) => {
-    await piSession.abort();
-    await safeReply(ctx, escapeHTML("Aborted current operation"), {
-      fallbackText: "Aborted current operation",
-    });
+    try {
+      await piSession.abort();
+      await safeReply(ctx, escapeHTML("Aborted current operation"), {
+        fallbackText: "Aborted current operation",
+      });
+    } catch (error) {
+      await safeReply(ctx, `<b>Failed:</b> ${escapeHTML(formatError(error))}`, {
+        fallbackText: `Failed: ${formatError(error)}`,
+      });
+    }
   });
 
   bot.command("session", async (ctx) => {
@@ -93,12 +100,42 @@ export function createBot(config: TelePiConfig, piSession: PiSessionService): Bo
     });
   });
 
-  bot.command("sessions", async (ctx) => {
+  bot.command(["sessions", "switch"], async (ctx) => {
     const chatId = ctx.chat?.id;
     if (!chatId) {
       return;
     }
 
+    if (isProcessing || isSwitching || piSession.isStreaming()) {
+      await safeReply(ctx, escapeHTML("Cannot switch sessions while a prompt is running."), {
+        fallbackText: "Cannot switch sessions while a prompt is running.",
+      });
+      return;
+    }
+
+    // If a path argument is provided, switch directly
+    const rawText = ctx.message?.text ?? "";
+    const sessionPath = rawText.replace(/^\/(?:sessions|switch)(?:@\w+)?\s*/, "").trim();
+    if (sessionPath) {
+      isSwitching = true;
+      try {
+        // Resolve the workspace from known sessions so tools are scoped correctly
+        const resolvedWorkspace = await piSession.resolveWorkspaceForSession(sessionPath);
+        const info = await piSession.switchSession(sessionPath, resolvedWorkspace);
+        const plainText = `Switched session.\n\n${renderSessionInfoPlain(info)}`;
+        const html = `<b>Switched session.</b>\n\n${renderSessionInfoHTML(info)}`;
+        await safeReply(ctx, html, { fallbackText: plainText });
+      } catch (error) {
+        await safeReply(ctx, `<b>Failed:</b> ${escapeHTML(formatError(error))}`, {
+          fallbackText: `Failed: ${formatError(error)}`,
+        });
+      } finally {
+        isSwitching = false;
+      }
+      return;
+    }
+
+    // No argument — show session picker
     const allSessions = (await piSession.listAllSessions()).slice(0, 15);
     if (allSessions.length === 0) {
       await safeReply(ctx, escapeHTML("No saved sessions found."), {
@@ -146,14 +183,14 @@ export function createBot(config: TelePiConfig, piSession: PiSessionService): Bo
       "",
       ...textLines,
       "",
-      "Tap a button below to switch.",
+      "Tap a session to switch.",
     ].join("\n");
     const html = [
       `<b>Available sessions</b> <i>(${allSessions.length} shown)</i>`,
       "",
       ...textLines.map((line) => escapeHTML(line)),
       "",
-      "Tap a button below to switch.",
+      "Tap a session to switch.",
     ].join("\n");
 
     await safeReply(ctx, html, {
@@ -162,40 +199,13 @@ export function createBot(config: TelePiConfig, piSession: PiSessionService): Bo
     });
   });
 
-  bot.command("switch", async (ctx) => {
-    if (isProcessing || piSession.isStreaming()) {
-      await safeReply(ctx, escapeHTML("Cannot switch sessions while a prompt is running."), {
-        fallbackText: "Cannot switch sessions while a prompt is running.",
-      });
-      return;
-    }
-
-    const rawText = ctx.message?.text ?? "";
-    const sessionPath = rawText.replace(/^\/switch(?:@\w+)?\s*/, "").trim();
-    if (!sessionPath) {
-      await safeReply(
-        ctx,
-        escapeHTML("Usage: /switch <absolute-or-relative-session-path>\nOr run /sessions to pick from a list."),
-        {
-          fallbackText: "Usage: /switch <absolute-or-relative-session-path>\nOr run /sessions to pick from a list.",
-        },
-      );
-      return;
-    }
-
-    const info = await piSession.switchSession(sessionPath);
-    const plainText = `Switched session.\n\n${renderSessionInfoPlain(info)}`;
-    const html = `<b>Switched session.</b>\n\n${renderSessionInfoHTML(info)}`;
-    await safeReply(ctx, html, { fallbackText: plainText });
-  });
-
   bot.command("new", async (ctx) => {
     const chatId = ctx.chat?.id;
     if (!chatId) {
       return;
     }
 
-    if (isProcessing || piSession.isStreaming()) {
+    if (isProcessing || isSwitching || piSession.isStreaming()) {
       await safeReply(ctx, escapeHTML("Cannot create new session while a prompt is running."), {
         fallbackText: "Cannot create new session while a prompt is running.",
       });
@@ -242,7 +252,7 @@ export function createBot(config: TelePiConfig, piSession: PiSessionService): Bo
   });
 
   bot.command("handback", async (ctx) => {
-    if (isProcessing || piSession.isStreaming()) {
+    if (isProcessing || isSwitching || piSession.isStreaming()) {
       await safeReply(ctx, escapeHTML("Cannot hand back while a prompt is running. Use /abort first."), {
         fallbackText: "Cannot hand back while a prompt is running. Use /abort first.",
       });
@@ -256,68 +266,76 @@ export function createBot(config: TelePiConfig, piSession: PiSessionService): Bo
       return;
     }
 
-    const { sessionFile, workspace } = await piSession.handback();
-
-    if (!sessionFile) {
-      await safeReply(ctx, escapeHTML("Session was in-memory. No file to resume.\nUse /new to start a fresh session."), {
-        fallbackText: "Session was in-memory. No file to resume.\nUse /new to start a fresh session.",
-      });
-      return;
-    }
-
-    // Use single-quote shell escaping for safe copy-paste
-    const shellEscape = (s: string): string => "'" + s.replace(/'/g, "'\\''") + "'";
-    const piCommand = `cd ${shellEscape(workspace)} && pi --session ${shellEscape(sessionFile)}`;
-    const piContinueCommand = `cd ${shellEscape(workspace)} && pi -c`;
-
-    let copiedToClipboard = false;
     try {
-      const { spawnSync } = await import("node:child_process");
-      const result = spawnSync("pbcopy", [], {
-        input: piCommand,
-        timeout: 2000,
-        stdio: ["pipe", "ignore", "ignore"],
+      const { sessionFile, workspace } = await piSession.handback();
+
+      if (!sessionFile) {
+        await safeReply(ctx, escapeHTML("Session was in-memory. No file to resume.\nUse /new to start a fresh session."), {
+          fallbackText: "Session was in-memory. No file to resume.\nUse /new to start a fresh session.",
+        });
+        return;
+      }
+
+      // Use single-quote shell escaping for safe copy-paste
+      const shellEscape = (s: string): string => "'" + s.replace(/'/g, "'\\''") + "'";
+      const piCommand = `cd ${shellEscape(workspace)} && pi --session ${shellEscape(sessionFile)}`;
+      const piContinueCommand = `cd ${shellEscape(workspace)} && pi -c`;
+
+      let copiedToClipboard = false;
+      if (process.platform === "darwin") {
+        try {
+          const { spawnSync } = await import("node:child_process");
+          const result = spawnSync("pbcopy", [], {
+            input: piCommand,
+            timeout: 2000,
+            stdio: ["pipe", "ignore", "ignore"],
+          });
+          copiedToClipboard = result.status === 0;
+        } catch {
+          // Ignore clipboard failures.
+        }
+      }
+
+      const plainText = [
+        "🔄 Session handed back to Pi CLI.",
+        "",
+        "Run this in your terminal:",
+        piCommand,
+        "",
+        "Or simply:",
+        piContinueCommand,
+        "(to continue the most recent session)",
+        copiedToClipboard ? "" : undefined,
+        copiedToClipboard ? "📋 Command copied to clipboard!" : undefined,
+        "",
+        "Send any message here to start a new TelePi session.",
+      ]
+        .filter((line): line is string => line !== undefined)
+        .join("\n");
+
+      const html = [
+        "<b>🔄 Session handed back to Pi CLI.</b>",
+        "",
+        "Run this in your terminal:",
+        `<pre>${escapeHTML(piCommand)}</pre>`,
+        "",
+        "Or simply:",
+        `<pre>${escapeHTML(piContinueCommand)}</pre>`,
+        "<i>(to continue the most recent session)</i>",
+        copiedToClipboard ? "" : undefined,
+        copiedToClipboard ? "📋 <i>Command copied to clipboard!</i>" : undefined,
+        "",
+        "Send any message here to start a new TelePi session.",
+      ]
+        .filter((line): line is string => line !== undefined)
+        .join("\n");
+
+      await safeReply(ctx, html, { fallbackText: plainText });
+    } catch (error) {
+      await safeReply(ctx, `<b>Failed:</b> ${escapeHTML(formatError(error))}`, {
+        fallbackText: `Failed: ${formatError(error)}`,
       });
-      copiedToClipboard = result.status === 0;
-    } catch {
-      // Ignore clipboard failures.
     }
-
-    const plainText = [
-      "🔄 Session handed back to Pi CLI.",
-      "",
-      "Run this in your terminal:",
-      piCommand,
-      "",
-      "Or simply:",
-      piContinueCommand,
-      "(to continue the most recent session)",
-      copiedToClipboard ? "" : undefined,
-      copiedToClipboard ? "📋 Command copied to clipboard!" : undefined,
-      "",
-      "Send any message here to start a new TelePi session.",
-    ]
-      .filter((line): line is string => line !== undefined)
-      .join("\n");
-
-    const html = [
-      "<b>🔄 Session handed back to Pi CLI.</b>",
-      "",
-      "Run this in your terminal:",
-      `<pre>${escapeHTML(piCommand)}</pre>`,
-      "",
-      "Or simply:",
-      `<pre>${escapeHTML(piContinueCommand)}</pre>`,
-      "<i>(to continue the most recent session)</i>",
-      copiedToClipboard ? "" : undefined,
-      copiedToClipboard ? "📋 <i>Command copied to clipboard!</i>" : undefined,
-      "",
-      "Send any message here to start a new TelePi session.",
-    ]
-      .filter((line): line is string => line !== undefined)
-      .join("\n");
-
-    await safeReply(ctx, html, { fallbackText: plainText });
   });
 
   bot.command("model", async (ctx) => {
@@ -386,7 +404,7 @@ export function createBot(config: TelePiConfig, piSession: PiSessionService): Bo
       return;
     }
 
-    if (isProcessing || piSession.isStreaming()) {
+    if (isProcessing || isSwitching || piSession.isStreaming()) {
       await ctx.answerCallbackQuery({ text: "Wait for the current prompt to finish" });
       return;
     }
@@ -394,16 +412,29 @@ export function createBot(config: TelePiConfig, piSession: PiSessionService): Bo
     await ctx.answerCallbackQuery({ text: "Switching..." });
     pendingSessionPicks.delete(chatId);
 
-    const info = await piSession.switchSession(sessions[index].path, sessions[index].cwd);
-    const plainText = `Switched!\n\n${renderSessionInfoPlain(info)}`;
-    const html = `<b>Switched!</b>\n\n${renderSessionInfoHTML(info)}`;
+    isSwitching = true;
+    try {
+      const info = await piSession.switchSession(sessions[index].path, sessions[index].cwd);
+      const plainText = `Switched!\n\n${renderSessionInfoPlain(info)}`;
+      const html = `<b>Switched!</b>\n\n${renderSessionInfoHTML(info)}`;
 
-    if (messageId) {
-      await safeEditMessage(bot, chatId, messageId, html, { fallbackText: plainText });
-      return;
+      if (messageId) {
+        await safeEditMessage(bot, chatId, messageId, html, { fallbackText: plainText });
+        return;
+      }
+
+      await safeReply(ctx, html, { fallbackText: plainText });
+    } catch (error) {
+      const errHtml = `<b>Failed:</b> ${escapeHTML(formatError(error))}`;
+      const errPlain = `Failed: ${formatError(error)}`;
+      if (messageId) {
+        await safeEditMessage(bot, chatId, messageId, errHtml, { fallbackText: errPlain });
+      } else {
+        await safeReply(ctx, errHtml, { fallbackText: errPlain });
+      }
+    } finally {
+      isSwitching = false;
     }
-
-    await safeReply(ctx, html, { fallbackText: plainText });
   });
 
   bot.callbackQuery(/^newws_(\d+)$/, async (ctx) => {
@@ -421,7 +452,7 @@ export function createBot(config: TelePiConfig, piSession: PiSessionService): Bo
       return;
     }
 
-    if (isProcessing || piSession.isStreaming()) {
+    if (isProcessing || isSwitching || piSession.isStreaming()) {
       await ctx.answerCallbackQuery({ text: "Wait for the current prompt to finish" });
       return;
     }
@@ -429,6 +460,7 @@ export function createBot(config: TelePiConfig, piSession: PiSessionService): Bo
     await ctx.answerCallbackQuery({ text: "Creating session..." });
     pendingWorkspacePicks.delete(chatId);
 
+    isSwitching = true;
     try {
       const { info, created } = await piSession.newSession(workspaces[index]);
       if (!created) {
@@ -456,6 +488,8 @@ export function createBot(config: TelePiConfig, piSession: PiSessionService): Bo
       } else {
         await safeReply(ctx, errHtml, { fallbackText: errPlain });
       }
+    } finally {
+      isSwitching = false;
     }
   });
 
@@ -474,7 +508,7 @@ export function createBot(config: TelePiConfig, piSession: PiSessionService): Bo
       return;
     }
 
-    if (isProcessing || piSession.isStreaming()) {
+    if (isProcessing || isSwitching || piSession.isStreaming()) {
       await ctx.answerCallbackQuery({ text: "Wait for the current prompt to finish" });
       return;
     }
@@ -482,6 +516,7 @@ export function createBot(config: TelePiConfig, piSession: PiSessionService): Bo
     await ctx.answerCallbackQuery({ text: "Switching model..." });
     pendingModelPicks.delete(chatId);
 
+    isSwitching = true;
     try {
       const modelName = await piSession.setModel(models[index].provider, models[index].id);
       const html = `<b>Model switched to:</b> <code>${escapeHTML(modelName)}</code>`;
@@ -504,6 +539,8 @@ export function createBot(config: TelePiConfig, piSession: PiSessionService): Bo
       await safeReply(ctx, `<b>Failed:</b> ${escapeHTML(message)}`, {
         fallbackText: `Failed: ${message}`,
       });
+    } finally {
+      isSwitching = false;
     }
   });
 
@@ -513,7 +550,7 @@ export function createBot(config: TelePiConfig, piSession: PiSessionService): Bo
       return;
     }
 
-    if (isProcessing || piSession.isStreaming()) {
+    if (isProcessing || isSwitching || piSession.isStreaming()) {
       await safeReply(ctx, escapeHTML("Still working on previous message..."), {
         fallbackText: "Still working on previous message...",
       });
@@ -903,8 +940,7 @@ export async function registerCommands(bot: Bot<Context>): Promise<void> {
     { command: "handback", description: "Hand session back to Pi CLI" },
     { command: "abort", description: "Cancel current operation" },
     { command: "session", description: "Current session details" },
-    { command: "sessions", description: "List available sessions" },
-    { command: "switch", description: "Switch to another session" },
+    { command: "sessions", description: "List and switch sessions (or /sessions <path>)" },
     { command: "model", description: "Switch AI model" },
   ]);
 }

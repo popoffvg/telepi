@@ -194,16 +194,6 @@ export class PiSessionService {
     await this.handle.session.abort();
   }
 
-  async listSessions(): Promise<Array<{ id: string; firstMessage: string; path: string; messageCount: number }>> {
-    const sessions = await SessionManager.list(this.currentWorkspace);
-    return sessions.map((s) => ({
-      id: s.id,
-      firstMessage: s.firstMessage,
-      path: s.path,
-      messageCount: s.messageCount,
-    }));
-  }
-
   async listAllSessions(): Promise<
     Array<{
       id: string;
@@ -283,6 +273,16 @@ export class PiSessionService {
     }
     await this.getSession().setModel(model);
     return `${model.provider}/${model.id}`;
+  }
+
+  async resolveWorkspaceForSession(sessionPath: string): Promise<string | undefined> {
+    try {
+      const allSessions = await SessionManager.listAll();
+      const match = allSessions.find((s) => s.path === sessionPath);
+      return match?.cwd;
+    } catch {
+      return undefined;
+    }
   }
 
   async switchSession(sessionPath: string, workspace?: string): Promise<PiSessionInfo> {
