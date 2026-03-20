@@ -138,6 +138,12 @@ TelePi/
 │   ├── pi-session.ts            ← Pi SDK session wrapper
 │   ├── config.ts                ← environment config
 │   └── format.ts                ← markdown → Telegram HTML
+├── test/
+│   ├── bot.test.ts              ← bot command/callback integration tests
+│   ├── config.test.ts           ← config/env loading tests
+│   ├── format.test.ts           ← formatter unit tests
+│   └── pi-session.test.ts       ← session service integration tests
+├── vitest.config.ts
 ├── .env.example
 ├── Dockerfile
 └── docker-compose.yml
@@ -185,6 +191,8 @@ Telegram ←→ Grammy bot (auto-retry, HTML formatting, inline keyboards)
 
 ```bash
 npm install
-npm run build    # TypeScript compilation
-npm run dev      # Run with tsx (auto-loads .env)
+npm run build          # TypeScript compilation
+npm run dev            # Run with tsx (auto-loads .env)
+npm test               # Run tests
+npm run test:coverage  # Run tests with coverage report
 ```
