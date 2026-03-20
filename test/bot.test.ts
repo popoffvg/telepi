@@ -16,6 +16,35 @@ vi.mock("node:child_process", () => ({
 const ALLOWED_USER_ID = 123;
 const ALLOWED_CHAT_ID = 456;
 
+function makeTreeNode(
+  entry: Record<string, any>,
+  children: any[] = [],
+  label?: string,
+): { entry: Record<string, any>; children: any[]; label?: string } {
+  return { entry, children, label };
+}
+
+function makeMessageTreeNode(
+  id: string,
+  role: string,
+  content: string,
+  parentId: string | null = null,
+  children: any[] = [],
+  label?: string,
+): { entry: Record<string, any>; children: any[]; label?: string } {
+  return makeTreeNode(
+    {
+      type: "message",
+      id,
+      parentId,
+      timestamp: "2025-01-01T00:00:00Z",
+      message: { role, content },
+    },
+    children,
+    label,
+  );
+}
+
 type SetupOptions = {
   configOverrides?: Partial<TelePiConfig>;
   piSessionOverrides?: Partial<PiSessionService>;
@@ -45,6 +74,27 @@ function createMockPiSession(overrides: Partial<PiSessionService> = {}) {
     sessionName: undefined,
     modelFallbackMessage: undefined,
   };
+
+  const defaultTree = [
+    makeMessageTreeNode(
+      "root1234",
+      "user",
+      "Start",
+      null,
+      [
+        makeMessageTreeNode(
+          "branch111",
+          "assistant",
+          "Pick a branch",
+          "root1234",
+          [
+            makeMessageTreeNode("leaf1234", "user", "Active leaf", "branch111"),
+            makeMessageTreeNode("leaf5678", "user", "Other leaf", "branch111", [], "saved"),
+          ],
+        ),
+      ],
+    ),
+  ];
 
   const session = {
     getInfo: vi.fn().mockReturnValue(defaultInfo),
@@ -107,6 +157,29 @@ function createMockPiSession(overrides: Partial<PiSessionService> = {}) {
       },
     ]),
     setModel: vi.fn().mockResolvedValue("openai/gpt-4o"),
+    getTree: vi.fn().mockReturnValue(defaultTree),
+    getLeafId: vi.fn().mockReturnValue("leaf1234"),
+    getEntry: vi.fn().mockImplementation((id: string) => {
+      const entries = [
+        defaultTree[0].entry,
+        defaultTree[0].children[0].entry,
+        defaultTree[0].children[0].children[0].entry,
+        defaultTree[0].children[0].children[1].entry,
+      ];
+      return entries.find((entry) => entry.id === id);
+    }),
+    getChildren: vi.fn().mockImplementation((id: string) => {
+      if (id === "branch111") {
+        return [defaultTree[0].children[0].children[0].entry, defaultTree[0].children[0].children[1].entry];
+      }
+      if (id === "root1234") {
+        return [defaultTree[0].children[0].entry];
+      }
+      return [];
+    }),
+    navigateTree: vi.fn().mockResolvedValue({ cancelled: false }),
+    setLabel: vi.fn(),
+    getLabels: vi.fn().mockReturnValue([{ id: "leaf5678", label: "saved", description: 'user: "Other leaf"' }]),
     resolveWorkspaceForSession: vi.fn().mockResolvedValue("/workspace/A"),
     prompt: vi.fn().mockResolvedValue(undefined),
     subscribe: vi.fn().mockImplementation((nextCallbacks: PiSessionCallbacks) => {
@@ -300,6 +373,19 @@ describe("createBot", () => {
     expect(api.sendMessage).not.toHaveBeenCalled();
   });
 
+  it("rejects unauthorized tree commands", async () => {
+    const { bot, api } = setupBot();
+
+    await bot.handleUpdate(
+      createTestUpdate({
+        message: { text: "/tree", from: { id: 999, is_bot: false, first_name: "Eve" } },
+      }),
+    );
+
+    expect(api.sendMessage).toHaveBeenCalledTimes(1);
+    expect(api.sendMessage.mock.calls[0]?.[1]).toBe("Unauthorized");
+  });
+
   it("handles /session", async () => {
     const { bot, api } = setupBot();
 
@@ -473,6 +559,162 @@ describe("createBot", () => {
     expect(api.editMessageText).toHaveBeenCalled();
   });
 
+  it("handles /tree command variants and missing sessions", async () => {
+    const empty = setupBot({
+      piSessionOverrides: {
+        getTree: vi.fn().mockReturnValue([]),
+      },
+    });
+    await empty.bot.handleUpdate(createTestUpdate({ message: { text: "/tree" } }));
+    expect(empty.api.sendMessage.mock.calls[0]?.[1]).toContain("Session tree is empty.");
+
+    const branched = setupBot();
+    await branched.bot.handleUpdate(createTestUpdate({ message: { text: "/tree" } }));
+    expect(branched.api.sendMessage.mock.calls[0]?.[1]).toContain("Start");
+    expect(getReplyMarkupData(branched.api)).toContain("tree_nav_branch111");
+    expect(getReplyMarkupData(branched.api)).toContain("tree_nav_leaf5678");
+
+    const userMode = setupBot();
+    await userMode.bot.handleUpdate(createTestUpdate({ message: { text: "/tree user" } }));
+    expect(userMode.api.sendMessage.mock.calls[0]?.[1]).toContain("Filter: user messages only.");
+
+    const allMode = setupBot();
+    await allMode.bot.handleUpdate(createTestUpdate({ message: { text: "/tree all" } }));
+    expect(allMode.api.sendMessage.mock.calls[0]?.[1]).toContain("Filter: all entries with navigation buttons.");
+
+    const noActive = setupBot({
+      piSessionOverrides: {
+        hasActiveSession: vi.fn().mockReturnValue(false),
+      },
+    });
+    await noActive.bot.handleUpdate(createTestUpdate({ message: { text: "/tree" } }));
+    expect(noActive.api.sendMessage.mock.calls[0]?.[1]).toContain("No active session");
+  });
+
+  it("handles /branch command success and validation", async () => {
+    const usage = setupBot();
+    await usage.bot.handleUpdate(createTestUpdate({ message: { text: "/branch" } }));
+    expect(usage.api.sendMessage.mock.calls[0]?.[1]).toContain("Usage: /branch &lt;entry-id&gt;");
+
+    const missing = setupBot();
+    await missing.bot.handleUpdate(createTestUpdate({ message: { text: "/branch missing" } }));
+    expect(missing.api.sendMessage.mock.calls[0]?.[1]).toContain("Entry not found: missing");
+
+    const sameLeaf = setupBot();
+    await sameLeaf.bot.handleUpdate(createTestUpdate({ message: { text: "/branch leaf1234" } }));
+    expect(sameLeaf.api.sendMessage.mock.calls[0]?.[1]).toContain("already at this point");
+
+    const ok = setupBot();
+    await ok.bot.handleUpdate(createTestUpdate({ message: { text: "/branch branch111" } }));
+    expect(ok.api.sendMessage.mock.calls[0]?.[1]).toContain("Navigate to this point?");
+    expect(getReplyMarkupData(ok.api)).toEqual(["tree_go_branch111", "tree_sum_branch111", "tree_cancel"]);
+  });
+
+  it("handles /label command flows", async () => {
+    const show = setupBot();
+    await show.bot.handleUpdate(createTestUpdate({ message: { text: "/label" } }));
+    expect(show.api.sendMessage.mock.calls[0]?.[1]).toContain("saved");
+
+    const current = setupBot();
+    await current.bot.handleUpdate(createTestUpdate({ message: { text: "/label checkpoint" } }));
+    expect(current.pi.service.setLabel).toHaveBeenCalledWith("leaf1234", "checkpoint");
+    expect(current.api.sendMessage.mock.calls[0]?.[1]).toContain("current leaf");
+
+    const specific = setupBot();
+    await specific.bot.handleUpdate(createTestUpdate({ message: { text: "/label branch111 origin" } }));
+    expect(specific.pi.service.setLabel).toHaveBeenCalledWith("branch111", "origin");
+    expect(specific.api.sendMessage.mock.calls[0]?.[1]).toContain("set on");
+
+    const clear = setupBot();
+    await clear.bot.handleUpdate(createTestUpdate({ message: { text: "/label clear branch111" } }));
+    expect(clear.pi.service.setLabel).toHaveBeenCalledWith("branch111", "");
+    expect(clear.api.sendMessage.mock.calls[0]?.[1]).toContain("Label cleared");
+
+    const unknown = setupBot({
+      piSessionOverrides: {
+        getEntry: vi.fn().mockReturnValue(undefined),
+      },
+    });
+    await unknown.bot.handleUpdate(createTestUpdate({ message: { text: "/label clear nope" } }));
+    expect(unknown.api.sendMessage.mock.calls[0]?.[1]).toContain("Entry not found: nope");
+  });
+
+  it("handles tree callback queries", async () => {
+    const nav = setupBot();
+    await nav.bot.handleUpdate(createCallbackUpdate("tree_nav_branch111"));
+    expect(nav.api.answerCallbackQuery).toHaveBeenCalledWith("cb_1", { text: "Loading..." });
+    expect(nav.api.editMessageText.mock.calls[0]?.[2]).toContain("Navigate to this point?");
+
+    // tree_go_ requires prior tree_nav_ confirmation (pendingTreeNavs)
+    const go = setupBot();
+    // First trigger nav to set pending state
+    await go.bot.handleUpdate(createCallbackUpdate("tree_nav_branch111"));
+    go.api.answerCallbackQuery.mockClear();
+    go.api.editMessageText.mockClear();
+    // Now confirm navigate
+    await go.bot.handleUpdate(createCallbackUpdate("tree_go_branch111"));
+    expect(go.api.answerCallbackQuery).toHaveBeenCalledWith("cb_1", { text: "Navigating..." });
+    expect(go.pi.service.navigateTree).toHaveBeenCalledWith("branch111");
+    expect(go.api.editMessageText.mock.calls[0]?.[2]).toContain("✅ Navigated to");
+
+    // tree_go_ without prior nav shows "expired"
+    const goExpired = setupBot();
+    await goExpired.bot.handleUpdate(createCallbackUpdate("tree_go_branch111"));
+    expect(goExpired.api.answerCallbackQuery).toHaveBeenCalledWith("cb_1", {
+      text: "Confirmation expired. Use /branch again.",
+    });
+
+    // tree_go_ with navigation error
+    const goFail = setupBot({
+      piSessionOverrides: {
+        navigateTree: vi.fn().mockRejectedValue(new Error("nav failed")),
+      },
+    });
+    await goFail.bot.handleUpdate(createCallbackUpdate("tree_nav_branch111"));
+    goFail.api.editMessageText.mockClear();
+    await goFail.bot.handleUpdate(createCallbackUpdate("tree_go_branch111"));
+    expect(goFail.api.editMessageText.mock.calls[0]?.[2]).toContain("nav failed");
+
+    // tree_sum_ requires prior tree_nav_ confirmation
+    const sum = setupBot();
+    await sum.bot.handleUpdate(createCallbackUpdate("tree_nav_branch111"));
+    sum.api.answerCallbackQuery.mockClear();
+    sum.api.editMessageText.mockClear();
+    await sum.bot.handleUpdate(createCallbackUpdate("tree_sum_branch111"));
+    expect(sum.api.answerCallbackQuery).toHaveBeenCalledWith("cb_1", {
+      text: "Navigating with summary...",
+    });
+    expect(sum.pi.service.navigateTree).toHaveBeenCalledWith("branch111", { summarize: true });
+    expect(sum.api.editMessageText.mock.calls[0]?.[2]).toContain("Branch summary saved");
+
+    // tree_sum_ without prior nav shows "expired"
+    const sumExpired = setupBot();
+    await sumExpired.bot.handleUpdate(createCallbackUpdate("tree_sum_branch111"));
+    expect(sumExpired.api.answerCallbackQuery).toHaveBeenCalledWith("cb_1", {
+      text: "Confirmation expired. Use /branch again.",
+    });
+
+    // tree_go_ with cancelled navigation
+    const goCancelled = setupBot({
+      piSessionOverrides: {
+        navigateTree: vi.fn().mockResolvedValue({ cancelled: true }),
+      },
+    });
+    await goCancelled.bot.handleUpdate(createCallbackUpdate("tree_nav_branch111"));
+    goCancelled.api.editMessageText.mockClear();
+    await goCancelled.bot.handleUpdate(createCallbackUpdate("tree_go_branch111"));
+    expect(goCancelled.api.editMessageText.mock.calls[0]?.[2]).toContain("Navigation cancelled.");
+
+    const cancel = setupBot();
+    await cancel.bot.handleUpdate(createCallbackUpdate("tree_cancel"));
+    expect(cancel.api.answerCallbackQuery).toHaveBeenCalledWith("cb_1", { text: "Cancelled" });
+    expect(cancel.api.editMessageText.mock.calls[0]?.[2]).toContain("Navigation cancelled.");
+
+    const mode = setupBot();
+    await mode.bot.handleUpdate(createCallbackUpdate("tree_mode_user"));
+    expect(mode.api.editMessageText.mock.calls[0]?.[2]).toContain("Filter: user messages only.");
+  });
+
   it("processes plain text messages, subscribes to Pi events, and ignores slash commands", async () => {
     const { bot, pi, api } = setupBot({
       configOverrides: { toolVerbosity: "all" },
@@ -569,6 +811,37 @@ describe("createBot", () => {
       model: "anthropic/claude-sonnet-4-5",
     });
     await switching;
+  });
+
+  it("blocks tree commands while processing or switching", async () => {
+    let resolvePrompt!: () => void;
+    const busy = setupBot({
+      piSessionOverrides: {
+        prompt: vi.fn().mockImplementation(
+          () =>
+            new Promise<void>((resolve) => {
+              resolvePrompt = resolve;
+            }),
+        ),
+      },
+    });
+
+    const pending = busy.bot.handleUpdate(createTestUpdate({ message: { text: "hello" } }));
+    await nextTick();
+    await busy.bot.handleUpdate(createTestUpdate({ message: { text: "/tree" } }));
+    await busy.bot.handleUpdate(createTestUpdate({ message: { text: "/branch branch111" } }));
+    await busy.bot.handleUpdate(createTestUpdate({ message: { text: "/label mark" } }));
+    await busy.bot.handleUpdate(createCallbackUpdate("tree_nav_branch111"));
+
+    expect(busy.api.sendMessage.mock.calls.some((call) => String(call[1]).includes("Cannot view tree while a prompt is running."))).toBe(true);
+    expect(busy.api.sendMessage.mock.calls.some((call) => String(call[1]).includes("Cannot navigate while a prompt is running."))).toBe(true);
+    expect(busy.api.sendMessage.mock.calls.some((call) => String(call[1]).includes("Cannot label entries while a prompt is running."))).toBe(true);
+    expect(busy.api.answerCallbackQuery).toHaveBeenCalledWith("cb_1", {
+      text: "Wait for the current prompt to finish",
+    });
+
+    resolvePrompt();
+    await pending;
   });
 
   it("covers additional command edge cases", async () => {
@@ -782,6 +1055,9 @@ describe("createBot", () => {
       { command: "session", description: "Current session details" },
       { command: "sessions", description: "List and switch sessions (or /sessions <path>)" },
       { command: "model", description: "Switch AI model" },
+      { command: "tree", description: "View and navigate the session tree" },
+      { command: "branch", description: "Navigate to a tree entry (/branch <id>)" },
+      { command: "label", description: "Label an entry (/label [name] or /label <id> <name>)" },
     ]);
   });
 
@@ -804,22 +1080,22 @@ describe("createBot", () => {
     await streaming.bot.handleUpdate(createTestUpdate({ message: { text: "/handback" } }));
     expect(streaming.api.sendMessage.mock.calls[2]?.[1]).toContain("Cannot hand back while a prompt is running.");
 
+    // tree commands should be blocked
+    await streaming.bot.handleUpdate(createTestUpdate({ message: { text: "/tree" } }));
+    expect(streaming.api.sendMessage.mock.calls[3]?.[1]).toContain("Cannot view tree while a prompt is running.");
+    await streaming.bot.handleUpdate(createTestUpdate({ message: { text: "/branch branch111" } }));
+    expect(streaming.api.sendMessage.mock.calls[4]?.[1]).toContain("Cannot navigate while a prompt is running.");
+    await streaming.bot.handleUpdate(createTestUpdate({ message: { text: "/label saved" } }));
+    expect(streaming.api.sendMessage.mock.calls[5]?.[1]).toContain("Cannot label entries while a prompt is running.");
+
     // text messages should be blocked
     await streaming.bot.handleUpdate(createTestUpdate({ message: { text: "hello there" } }));
-    expect(streaming.api.sendMessage.mock.calls[3]?.[1]).toContain("Still working on previous message...");
+    expect(streaming.api.sendMessage.mock.calls[6]?.[1]).toContain("Still working on previous message...");
 
-    // callback queries should be blocked
-    await streaming.bot.handleUpdate(createTestUpdate({ message: { text: "/sessions" } }));
-    // isStreaming blocks the /sessions list too, so no picks are set. But let's test a callback:
-    const cbStreaming = setupBot({
-      piSessionOverrides: {
-        isStreaming: vi.fn().mockReturnValue(true),
-      },
+    await streaming.bot.handleUpdate(createCallbackUpdate("tree_nav_branch111"));
+    expect(streaming.api.answerCallbackQuery).toHaveBeenCalledWith("cb_1", {
+      text: "Wait for the current prompt to finish",
     });
-    // First set up picks with a non-streaming bot, then switch to streaming
-    const nonStreaming = setupBot();
-    await nonStreaming.bot.handleUpdate(createTestUpdate({ message: { text: "/sessions" } }));
-    // Now test the streaming guard on callbacks by using a fresh bot
   });
 
   it("sends '✅ Done' when agent ends with no text output", async () => {

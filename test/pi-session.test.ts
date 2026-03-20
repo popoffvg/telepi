@@ -46,6 +46,24 @@ const mockState = vi.hoisted(() => {
       prompt: vi.fn().mockResolvedValue(undefined),
       abort: vi.fn().mockResolvedValue(undefined),
       newSession: vi.fn().mockResolvedValue(true),
+      navigateTree: vi.fn().mockResolvedValue({ cancelled: false }),
+      sessionManager: {
+        getTree: vi.fn().mockReturnValue([]),
+        getLeafId: vi.fn().mockReturnValue("leaf-id"),
+        getEntry: vi.fn().mockImplementation((id: string) =>
+          id === "known-id"
+            ? {
+                type: "message",
+                id: "known-id",
+                parentId: null,
+                timestamp: "2025-01-01T00:00:00Z",
+                message: { role: "user", content: "Known entry" },
+              }
+            : undefined,
+        ),
+        getChildren: vi.fn().mockReturnValue([]),
+        appendLabelChange: vi.fn(),
+      },
       setModel: vi.fn().mockImplementation(async (model) => {
         session.model = model;
       }),
@@ -394,6 +412,84 @@ describe("PiSessionService", () => {
       id: "gpt-4o",
       name: "GPT-4o",
     });
+  });
+
+  it("delegates tree access, navigation, and labels", async () => {
+    const service = await PiSessionService.create(createConfig());
+    const currentSession = mockState.createdSessions[0]?.session;
+
+    currentSession.sessionManager.getTree.mockReturnValue([
+      {
+        entry: {
+          type: "message",
+          id: "labelled-id",
+          parentId: null,
+          timestamp: "2025-01-01T00:00:00Z",
+          message: { role: "user", content: "Pinned point" },
+        },
+        children: [],
+        label: "checkpoint",
+      },
+    ]);
+    currentSession.sessionManager.getChildren.mockReturnValueOnce([
+      {
+        type: "message",
+        id: "child-id",
+        parentId: "known-id",
+        timestamp: "2025-01-01T00:00:00Z",
+        message: { role: "assistant", content: "Child" },
+      },
+    ]);
+
+    expect(service.getTree()).toEqual([
+      expect.objectContaining({
+        entry: expect.objectContaining({ id: "labelled-id" }),
+        label: "checkpoint",
+      }),
+    ]);
+    expect(currentSession.sessionManager.getTree).toHaveBeenCalledTimes(1);
+
+    expect(service.getLeafId()).toBe("leaf-id");
+    expect(currentSession.sessionManager.getLeafId).toHaveBeenCalledTimes(1);
+
+    expect(service.getEntry("known-id")).toEqual(
+      expect.objectContaining({ type: "message", id: "known-id" }),
+    );
+    expect(service.getEntry("missing-id")).toBeUndefined();
+
+    expect(service.getChildren("known-id")).toEqual([
+      expect.objectContaining({ id: "child-id" }),
+    ]);
+    expect(currentSession.sessionManager.getChildren).toHaveBeenCalledWith("known-id");
+
+    await expect(service.navigateTree("known-id", { summarize: true })).resolves.toEqual({
+      cancelled: false,
+    });
+    expect(currentSession.navigateTree).toHaveBeenCalledWith("known-id", { summarize: true });
+
+    service.setLabel("known-id", "saved");
+    expect(currentSession.sessionManager.appendLabelChange).toHaveBeenCalledWith("known-id", "saved");
+
+    expect(service.getLabels()).toEqual([
+      {
+        id: "labelled-id",
+        label: "checkpoint",
+        description: 'user: "Pinned point"',
+      },
+    ]);
+  });
+
+  it("throws for tree helpers when no active session exists", async () => {
+    const service = await PiSessionService.create(createConfig());
+    await service.handback();
+
+    expect(() => service.getTree()).toThrow("Pi session is not initialized");
+    expect(() => service.getLeafId()).toThrow("Pi session is not initialized");
+    expect(() => service.getEntry("known-id")).toThrow("Pi session is not initialized");
+    expect(() => service.getChildren("known-id")).toThrow("Pi session is not initialized");
+    expect(() => service.setLabel("known-id", "saved")).toThrow("Pi session is not initialized");
+    expect(() => service.getLabels()).toThrow("Pi session is not initialized");
+    await expect(service.navigateTree("known-id")).rejects.toThrow("Pi session is not initialized");
   });
 
   it("subscribes to session events and forwards callbacks", async () => {

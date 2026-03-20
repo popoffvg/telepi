@@ -8,10 +8,12 @@ import {
   ModelRegistry,
   SessionManager,
   type AgentSession,
+  type SessionEntry,
 } from "@mariozechner/pi-coding-agent";
 import type { Api, Model } from "@mariozechner/pi-ai";
 
 import type { TelePiConfig } from "./config.js";
+import { describeEntry, type SessionTreeNodeLike as SessionTreeNode } from "./tree.js";
 
 export interface PiSessionCallbacks {
   onTextDelta: (delta: string) => void;
@@ -297,6 +299,58 @@ export class PiSessionService {
       console.error("Failed to dispose previous session:", error);
     }
     return this.getInfo();
+  }
+
+  getTree(): SessionTreeNode[] {
+    return this.getSession().sessionManager.getTree();
+  }
+
+  getLeafId(): string | null {
+    return this.getSession().sessionManager.getLeafId();
+  }
+
+  getEntry(id: string): SessionEntry | undefined {
+    return this.getSession().sessionManager.getEntry(id);
+  }
+
+  getChildren(id: string): SessionEntry[] {
+    return this.getSession().sessionManager.getChildren(id);
+  }
+
+  async navigateTree(
+    targetId: string,
+    options?: { summarize?: boolean },
+  ): Promise<{ editorText?: string; cancelled: boolean }> {
+    return this.getSession().navigateTree(targetId, options);
+  }
+
+  setLabel(targetId: string, label: string): void {
+    this.getSession().sessionManager.appendLabelChange(targetId, label);
+  }
+
+  getLabels(): Array<{ id: string; label: string; description: string }> {
+    const tree = this.getTree();
+    const labels: Array<{ id: string; label: string; description: string }> = [];
+
+    const walk = (node: SessionTreeNode): void => {
+      if (node.label) {
+        labels.push({
+          id: node.entry.id,
+          label: node.label,
+          description: describeEntry(node.entry),
+        });
+      }
+
+      for (const child of node.children) {
+        walk(child);
+      }
+    };
+
+    for (const root of tree) {
+      walk(root);
+    }
+
+    return labels;
   }
 
   async handback(): Promise<{ sessionFile?: string; workspace: string }> {

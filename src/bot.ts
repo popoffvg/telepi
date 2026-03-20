@@ -4,6 +4,13 @@ import { autoRetry } from "@grammyjs/auto-retry";
 import type { TelePiConfig, ToolVerbosity } from "./config.js";
 import { escapeHTML, formatTelegramHTML } from "./format.js";
 import { type PiSessionInfo, type PiSessionService } from "./pi-session.js";
+import {
+  renderBranchConfirmation,
+  renderLabels,
+  renderTree,
+  truncateText,
+  type TreeFilterMode,
+} from "./tree.js";
 
 const TELEGRAM_MESSAGE_LIMIT = 4000;
 const EDIT_DEBOUNCE_MS = 1500;
@@ -47,6 +54,7 @@ export function createBot(config: TelePiConfig, piSession: PiSessionService): Bo
   const pendingSessionPicks = new Map<number, Array<{ path: string; cwd: string }>>();
   const pendingWorkspacePicks = new Map<number, string[]>();
   const pendingModelPicks = new Map<number, Array<{ provider: string; id: string }>>();
+  const pendingTreeNavs = new Map<number, string>();
 
   bot.use(async (ctx, next) => {
     const fromId = ctx.from?.id;
@@ -61,6 +69,24 @@ export function createBot(config: TelePiConfig, piSession: PiSessionService): Bo
 
     await next();
   });
+
+  const collectLabelsMap = (): Map<string, string> => {
+    const labels = new Map<string, string>();
+    const walk = (node: { entry: { id: string }; children: any[]; label?: string }): void => {
+      if (node.label) {
+        labels.set(node.entry.id, node.label);
+      }
+      for (const child of node.children) {
+        walk(child);
+      }
+    };
+
+    for (const root of piSession.getTree()) {
+      walk(root);
+    }
+
+    return labels;
+  };
 
   bot.command("start", async (ctx) => {
     const info = piSession.getInfo();
@@ -385,6 +411,195 @@ export function createBot(config: TelePiConfig, piSession: PiSessionService): Bo
     });
   });
 
+  bot.command("tree", async (ctx) => {
+    const chatId = ctx.chat?.id;
+    if (!chatId) {
+      return;
+    }
+
+    if (isProcessing || isSwitching || piSession.isStreaming()) {
+      await safeReply(ctx, escapeHTML("Cannot view tree while a prompt is running."), {
+        fallbackText: "Cannot view tree while a prompt is running.",
+      });
+      return;
+    }
+
+    if (!piSession.hasActiveSession()) {
+      await safeReply(ctx, escapeHTML("No active session. Send a message to start one."), {
+        fallbackText: "No active session. Send a message to start one.",
+      });
+      return;
+    }
+
+    const rawText = ctx.message?.text ?? "";
+    const arg = rawText.replace(/^\/tree(?:@\w+)?\s*/, "").trim().toLowerCase();
+    let mode: TreeFilterMode = "default";
+    if (arg === "all") {
+      mode = "all-with-buttons";
+    } else if (arg === "user") {
+      mode = "user-only";
+    }
+
+    const tree = piSession.getTree();
+    const leafId = piSession.getLeafId();
+    const result = renderTree(tree, leafId, { mode });
+
+    if (result.buttons.length === 0) {
+      await safeReply(ctx, result.text, { fallbackText: stripHtml(result.text) });
+      return;
+    }
+
+    const keyboard = new InlineKeyboard();
+    for (const button of result.buttons) {
+      keyboard.text(button.label, button.callbackData).row();
+    }
+
+    await safeReply(ctx, result.text, {
+      fallbackText: stripHtml(result.text),
+      replyMarkup: keyboard,
+    });
+  });
+
+  bot.command("branch", async (ctx) => {
+    const chatId = ctx.chat?.id;
+    if (!chatId) {
+      return;
+    }
+
+    if (isProcessing || isSwitching || piSession.isStreaming()) {
+      await safeReply(ctx, escapeHTML("Cannot navigate while a prompt is running."), {
+        fallbackText: "Cannot navigate while a prompt is running.",
+      });
+      return;
+    }
+
+    if (!piSession.hasActiveSession()) {
+      await safeReply(ctx, escapeHTML("No active session."), { fallbackText: "No active session." });
+      return;
+    }
+
+    const rawText = ctx.message?.text ?? "";
+    const entryId = rawText.replace(/^\/branch(?:@\w+)?\s*/, "").trim();
+    if (!entryId) {
+      await safeReply(ctx, escapeHTML("Usage: /branch <entry-id>\nUse /tree to see entry IDs."), {
+        fallbackText: "Usage: /branch <entry-id>\nUse /tree to see entry IDs.",
+      });
+      return;
+    }
+
+    const entry = piSession.getEntry(entryId);
+    if (!entry) {
+      await safeReply(ctx, escapeHTML(`Entry not found: ${entryId}`), {
+        fallbackText: `Entry not found: ${entryId}`,
+      });
+      return;
+    }
+
+    const leafId = piSession.getLeafId();
+    if (entry.id === leafId) {
+      await safeReply(ctx, escapeHTML("You're already at this point."), {
+        fallbackText: "You're already at this point.",
+      });
+      return;
+    }
+
+    const children = piSession.getChildren(entry.id);
+    const confirmation = renderBranchConfirmation(entry, children, leafId, collectLabelsMap());
+
+    pendingTreeNavs.set(chatId, entry.id);
+
+    const keyboard = new InlineKeyboard();
+    for (const button of confirmation.buttons) {
+      keyboard.text(button.label, button.callbackData).row();
+    }
+
+    await safeReply(ctx, confirmation.text, {
+      fallbackText: stripHtml(confirmation.text),
+      replyMarkup: keyboard,
+    });
+  });
+
+  bot.command("label", async (ctx) => {
+    const chatId = ctx.chat?.id;
+    if (!chatId) {
+      return;
+    }
+
+    if (isProcessing || isSwitching || piSession.isStreaming()) {
+      await safeReply(ctx, escapeHTML("Cannot label entries while a prompt is running."), {
+        fallbackText: "Cannot label entries while a prompt is running.",
+      });
+      return;
+    }
+
+    if (!piSession.hasActiveSession()) {
+      await safeReply(ctx, escapeHTML("No active session."), { fallbackText: "No active session." });
+      return;
+    }
+
+    const rawText = ctx.message?.text ?? "";
+    const args = rawText.replace(/^\/label(?:@\w+)?\s*/, "").trim();
+
+    if (!args) {
+      const labelsText = renderLabels(piSession.getTree());
+      await safeReply(ctx, labelsText, { fallbackText: stripHtml(labelsText) });
+      return;
+    }
+
+    const clearMatch = args.match(/^clear\s+(\S+)/i);
+    if (clearMatch) {
+      const targetId = clearMatch[1];
+      const entry = piSession.getEntry(targetId);
+      if (!entry) {
+        await safeReply(ctx, escapeHTML(`Entry not found: ${targetId}`), {
+          fallbackText: `Entry not found: ${targetId}`,
+        });
+        return;
+      }
+
+      piSession.setLabel(targetId, "");
+      await safeReply(ctx, `🏷️ Label cleared on <code>${escapeHTML(targetId)}</code>`, {
+        fallbackText: `🏷️ Label cleared on ${targetId}`,
+      });
+      return;
+    }
+
+    const parts = args.split(/\s+/);
+    if (parts.length >= 2) {
+      const maybeId = parts[0];
+      const entry = piSession.getEntry(maybeId);
+      if (entry) {
+        const labelName = parts.slice(1).join(" ");
+        piSession.setLabel(maybeId, labelName);
+        await safeReply(
+          ctx,
+          `🏷️ Label <b>${escapeHTML(labelName)}</b> set on <code>${escapeHTML(maybeId)}</code>`,
+          {
+            fallbackText: `🏷️ Label "${labelName}" set on ${maybeId}`,
+          },
+        );
+        return;
+      }
+    }
+
+    const leafId = piSession.getLeafId();
+    if (!leafId) {
+      await safeReply(ctx, escapeHTML("No current leaf to label. Send a message first."), {
+        fallbackText: "No current leaf to label. Send a message first.",
+      });
+      return;
+    }
+
+    piSession.setLabel(leafId, args);
+    await safeReply(
+      ctx,
+      `🏷️ Label <b>${escapeHTML(args)}</b> set on current leaf <code>${escapeHTML(leafId)}</code>`,
+      {
+        fallbackText: `🏷️ Label "${args}" set on current leaf ${leafId}`,
+      },
+    );
+  });
+
   bot.callbackQuery("pi_abort", async (ctx) => {
     await ctx.answerCallbackQuery({ text: "Aborting..." });
     await piSession.abort();
@@ -543,6 +758,232 @@ export function createBot(config: TelePiConfig, piSession: PiSessionService): Bo
     } finally {
       isSwitching = false;
     }
+  });
+
+  bot.callbackQuery(/^tree_nav_(.+)$/, async (ctx) => {
+    const chatId = ctx.chat?.id;
+    const messageId = ctx.callbackQuery.message?.message_id;
+    const entryId = ctx.match?.[1];
+    if (!chatId || !entryId) {
+      return;
+    }
+
+    if (isProcessing || isSwitching || piSession.isStreaming()) {
+      await ctx.answerCallbackQuery({ text: "Wait for the current prompt to finish" });
+      return;
+    }
+
+    const entry = piSession.getEntry(entryId);
+    if (!entry) {
+      await ctx.answerCallbackQuery({ text: "Entry not found" });
+      return;
+    }
+
+    const leafId = piSession.getLeafId();
+    if (entry.id === leafId) {
+      await ctx.answerCallbackQuery({ text: "Already at this point" });
+      return;
+    }
+
+    await ctx.answerCallbackQuery({ text: "Loading..." });
+
+    const confirmation = renderBranchConfirmation(
+      entry,
+      piSession.getChildren(entry.id),
+      leafId,
+      collectLabelsMap(),
+    );
+    pendingTreeNavs.set(chatId, entry.id);
+
+    const keyboard = new InlineKeyboard();
+    for (const button of confirmation.buttons) {
+      keyboard.text(button.label, button.callbackData).row();
+    }
+
+    if (messageId) {
+      await safeEditMessage(bot, chatId, messageId, confirmation.text, {
+        fallbackText: stripHtml(confirmation.text),
+        replyMarkup: keyboard,
+      });
+    } else {
+      await safeReply(ctx, confirmation.text, {
+        fallbackText: stripHtml(confirmation.text),
+        replyMarkup: keyboard,
+      });
+    }
+  });
+
+  bot.callbackQuery(/^tree_go_(.+)$/, async (ctx) => {
+    const chatId = ctx.chat?.id;
+    const messageId = ctx.callbackQuery.message?.message_id;
+    const entryId = ctx.match?.[1];
+    if (!chatId || !entryId) {
+      return;
+    }
+
+    if (isProcessing || isSwitching || piSession.isStreaming()) {
+      await ctx.answerCallbackQuery({ text: "Wait for the current prompt to finish" });
+      return;
+    }
+
+    const pendingId = pendingTreeNavs.get(chatId);
+    if (pendingId !== entryId) {
+      await ctx.answerCallbackQuery({ text: "Confirmation expired. Use /branch again." });
+      return;
+    }
+
+    await ctx.answerCallbackQuery({ text: "Navigating..." });
+    pendingTreeNavs.delete(chatId);
+
+    isSwitching = true;
+    try {
+      const result = await piSession.navigateTree(entryId);
+      if (result.cancelled) {
+        const html = escapeHTML("Navigation cancelled.");
+        if (messageId) {
+          await safeEditMessage(bot, chatId, messageId, html, { fallbackText: "Navigation cancelled." });
+        } else {
+          await ctx.reply("Navigation cancelled.");
+        }
+        return;
+      }
+
+      let html = `<b>✅ Navigated to</b> <code>${escapeHTML(entryId.slice(0, 8))}</code>`;
+      let plain = `✅ Navigated to ${entryId.slice(0, 8)}`;
+      if (result.editorText) {
+        html += `\n\nRe-submit: <i>${escapeHTML(truncateText(result.editorText, 200))}</i>`;
+        plain += `\n\nRe-submit: ${truncateText(result.editorText, 200)}`;
+      }
+      html += "\n\nSend your next message to create a new branch from this point.";
+      plain += "\n\nSend your next message to create a new branch from this point.";
+
+      if (messageId) {
+        await safeEditMessage(bot, chatId, messageId, html, { fallbackText: plain });
+      } else {
+        await safeReply(ctx, html, { fallbackText: plain });
+      }
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      const errHtml = `<b>Failed:</b> ${escapeHTML(msg)}`;
+      if (messageId) {
+        await safeEditMessage(bot, chatId, messageId, errHtml, { fallbackText: `Failed: ${msg}` });
+      } else {
+        await safeReply(ctx, errHtml, { fallbackText: `Failed: ${msg}` });
+      }
+    } finally {
+      isSwitching = false;
+    }
+  });
+
+  bot.callbackQuery(/^tree_sum_(.+)$/, async (ctx) => {
+    const chatId = ctx.chat?.id;
+    const messageId = ctx.callbackQuery.message?.message_id;
+    const entryId = ctx.match?.[1];
+    if (!chatId || !entryId) {
+      return;
+    }
+
+    if (isProcessing || isSwitching || piSession.isStreaming()) {
+      await ctx.answerCallbackQuery({ text: "Wait for the current prompt to finish" });
+      return;
+    }
+
+    const pendingId = pendingTreeNavs.get(chatId);
+    if (pendingId !== entryId) {
+      await ctx.answerCallbackQuery({ text: "Confirmation expired. Use /branch again." });
+      return;
+    }
+
+    await ctx.answerCallbackQuery({ text: "Navigating with summary..." });
+    pendingTreeNavs.delete(chatId);
+
+    isSwitching = true;
+    try {
+      const result = await piSession.navigateTree(entryId, { summarize: true });
+      if (result.cancelled) {
+        const html = escapeHTML("Navigation cancelled.");
+        if (messageId) {
+          await safeEditMessage(bot, chatId, messageId, html, { fallbackText: "Navigation cancelled." });
+        } else {
+          await ctx.reply("Navigation cancelled.");
+        }
+        return;
+      }
+
+      let html = `<b>✅ Navigated to</b> <code>${escapeHTML(entryId.slice(0, 8))}</code>\n📝 Branch summary saved.`;
+      let plain = `✅ Navigated to ${entryId.slice(0, 8)}\n📝 Branch summary saved.`;
+      if (result.editorText) {
+        html += `\n\nRe-submit: <i>${escapeHTML(truncateText(result.editorText, 200))}</i>`;
+        plain += `\n\nRe-submit: ${truncateText(result.editorText, 200)}`;
+      }
+      html += "\n\nSend your next message to create a new branch from this point.";
+      plain += "\n\nSend your next message to create a new branch from this point.";
+
+      if (messageId) {
+        await safeEditMessage(bot, chatId, messageId, html, { fallbackText: plain });
+      } else {
+        await safeReply(ctx, html, { fallbackText: plain });
+      }
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      const errHtml = `<b>Failed:</b> ${escapeHTML(msg)}`;
+      if (messageId) {
+        await safeEditMessage(bot, chatId, messageId, errHtml, { fallbackText: `Failed: ${msg}` });
+      } else {
+        await safeReply(ctx, errHtml, { fallbackText: `Failed: ${msg}` });
+      }
+    } finally {
+      isSwitching = false;
+    }
+  });
+
+  bot.callbackQuery("tree_cancel", async (ctx) => {
+    const chatId = ctx.chat?.id;
+    if (chatId) {
+      pendingTreeNavs.delete(chatId);
+    }
+    await ctx.answerCallbackQuery({ text: "Cancelled" });
+    const messageId = ctx.callbackQuery.message?.message_id;
+    if (chatId && messageId) {
+      await safeEditMessage(bot, chatId, messageId, escapeHTML("Navigation cancelled."), {
+        fallbackText: "Navigation cancelled.",
+      });
+    }
+  });
+
+  bot.callbackQuery(/^tree_mode_(.+)$/, async (ctx) => {
+    const chatId = ctx.chat?.id;
+    const messageId = ctx.callbackQuery.message?.message_id;
+    const mode = ctx.match?.[1];
+    if (!chatId || !messageId) {
+      return;
+    }
+
+    if (isProcessing || isSwitching || piSession.isStreaming()) {
+      await ctx.answerCallbackQuery({ text: "Wait for the current prompt to finish" });
+      return;
+    }
+
+    await ctx.answerCallbackQuery();
+
+    let filterMode: TreeFilterMode = "default";
+    if (mode === "all") {
+      filterMode = "all-with-buttons";
+    } else if (mode === "user") {
+      filterMode = "user-only";
+    }
+
+    const result = renderTree(piSession.getTree(), piSession.getLeafId(), { mode: filterMode });
+
+    const keyboard = new InlineKeyboard();
+    for (const button of result.buttons) {
+      keyboard.text(button.label, button.callbackData).row();
+    }
+
+    await safeEditMessage(bot, chatId, messageId, result.text, {
+      fallbackText: stripHtml(result.text),
+      replyMarkup: result.buttons.length > 0 ? keyboard : undefined,
+    });
   });
 
   bot.on("message:text", async (ctx) => {
@@ -944,6 +1385,9 @@ export async function registerCommands(bot: Bot<Context>): Promise<void> {
     { command: "session", description: "Current session details" },
     { command: "sessions", description: "List and switch sessions (or /sessions <path>)" },
     { command: "model", description: "Switch AI model" },
+    { command: "tree", description: "View and navigate the session tree" },
+    { command: "branch", description: "Navigate to a tree entry (/branch <id>)" },
+    { command: "label", description: "Label an entry (/label [name] or /label <id> <name>)" },
   ]);
 }
 
@@ -1235,6 +1679,10 @@ function trimLine(text: string, maxLength: number): string {
   }
 
   return `${singleLine.slice(0, maxLength - 1)}…`;
+}
+
+function stripHtml(text: string): string {
+  return text.replace(/<[^>]+>/g, "");
 }
 
 function getWorkspaceShortName(workspace: string): string {
