@@ -48,16 +48,22 @@ TelePi is a Telegram bridge for the [Pi coding agent](https://github.com/badlogi
 | `/abort` | Cancel the current Pi operation |
 | `/session` | Show current session details (ID, file, workspace, model) |
 | `/sessions` | List all sessions across all workspaces with tap-to-switch buttons |
-| `/switch <path>` | Switch to a specific session file |
+| `/sessions <path>` | Switch directly to a specific session file |
 | `/model` | Pick a different AI model from an inline keyboard |
 
 ## Session Hand-off
 
+TelePi supports seamless bi-directional session hand-off between Pi CLI and Telegram. Both directions preserve the **full conversation context** — the JSONL session file is the single source of truth, and whichever side opens it gets the complete history, including any messages added by the other side.
+
 ### CLI → Telegram (`/handoff`)
 
-TelePi includes a Pi extension that hands off your current CLI session to Telegram.
+You're working in Pi CLI on your laptop and want to continue from your phone:
 
-**Installation** — symlink the extension into Pi's global extensions directory:
+1. **In Pi CLI**, type `/handoff`
+2. The extension kills any running TelePi instance, launches TelePi with your current session, and shuts down Pi CLI
+3. **Open Telegram** — TelePi is already running with your full conversation context. Just keep typing.
+
+**Extension installation** — symlink into Pi's global extensions directory:
 
 ```bash
 cd /path/to/TelePi
@@ -65,18 +71,6 @@ ln -s "$(pwd)/extensions/telepi-handoff.ts" ~/.pi/agent/extensions/telepi-handof
 ```
 
 Pi auto-discovers it after symlinking (or run `/reload` in Pi).
-
-**Usage** — in any Pi CLI session:
-
-```
-/handoff
-```
-
-This will:
-1. Kill any existing TelePi instance (avoids bot token conflicts)
-2. Launch TelePi in the background with `PI_SESSION_PATH` set to your current session
-3. Shut down the Pi CLI, releasing the session file
-4. You can now continue in Telegram
 
 Set `TELEPI_DIR` in your shell profile to point to your TelePi installation:
 
@@ -86,30 +80,41 @@ export TELEPI_DIR="/path/to/TelePi"
 
 ### Telegram → CLI (`/handback`)
 
-In Telegram, type `/handback` to release the session back to Pi CLI:
+You're on your phone and want to get back to your terminal:
 
-1. TelePi disposes the Pi session (releases the file)
-2. Sends you the exact `pi --session <path>` command to run in your terminal
-3. On macOS, copies the command to your clipboard automatically
-4. The bot stays alive — send any message to start a new TelePi session
+1. **In Telegram**, type `/handback`
+2. TelePi disposes the session and sends you the exact command to resume, e.g.:
+   ```
+   cd '/Users/you/myproject' && pi --session '/Users/you/.pi/agent/sessions/.../session.jsonl'
+   ```
+3. On macOS, the command is **copied to your clipboard** automatically
+4. **In your terminal**, paste and run — Pi CLI opens with the full conversation, including everything from Telegram
+5. TelePi stays alive — send any message in Telegram to start a fresh session
 
-The handed-back session can be resumed in Pi CLI with:
+You can also resume with the shorthand:
 
 ```bash
-# Exact session (shown in the /handback message)
-pi --session /path/to/session.jsonl
-
-# Or just continue the most recent session in the project
+# Continue the most recent session in the project
 cd /path/to/project && pi -c
 ```
 
 ### Manual hand-off
 
-Without extensions, you can hand off manually:
+Without the extension, you can hand off manually:
 
 1. Note the session file path from Pi CLI (shown on startup)
 2. Set `PI_SESSION_PATH` in TelePi's `.env`
 3. Start TelePi: `npm run dev`
+
+### How it works
+
+Both Pi CLI and TelePi use the same `SessionManager` from the Pi SDK to read/write session JSONL files stored under `~/.pi/agent/sessions/`. When either side opens a session file:
+
+1. `SessionManager.open(path)` loads all entries from the JSONL file
+2. `buildSessionContext()` walks the entry tree from the current leaf to the root
+3. The full message history (including compaction summaries and branch context) is sent to the LLM
+
+This means hand-off is lossless — no context is dropped regardless of how many times you switch between CLI and Telegram.
 
 ## Cross-Workspace Sessions
 
