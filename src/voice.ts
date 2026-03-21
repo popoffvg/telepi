@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { createRequire } from "node:module";
 import path from "node:path";
 import { readFile } from "node:fs/promises";
 
@@ -27,7 +28,8 @@ Also requires ffmpeg: brew install ffmpeg
 Option 2: Set OPENAI_API_KEY for cloud transcription (~$0.006/min):
   Add OPENAI_API_KEY=sk-... to your .env file`;
 
-let _importModule: (specifier: string) => Promise<unknown> = (specifier) => import(specifier);
+const _require = createRequire(import.meta.url);
+let _importModule: (specifier: string) => Promise<unknown> = async (specifier) => _require(specifier);
 let _decodeAudio: (filePath: string) => Promise<Float32Array> = decodeAudioToSamples;
 let _engine: ParakeetEngine | null = null;
 
@@ -40,7 +42,7 @@ export function _setDecodeHook(hook: (filePath: string) => Promise<Float32Array>
 }
 
 export function _resetImportHook(): void {
-  _importModule = (specifier) => import(specifier);
+  _importModule = async (specifier) => _require(specifier);
   _decodeAudio = decodeAudioToSamples;
   _engine = null;
 }
