@@ -1510,7 +1510,7 @@ function renderSessionInfoHTML(info: PiSessionInfo): string {
 
 function renderVoiceSupportPlain(backends: string[]): string {
   if (backends.length === 0) {
-    return "Voice transcription: unavailable (install parakeet-node or set OPENAI_API_KEY).";
+    return "Voice transcription: unavailable (install parakeet-coreml + ffmpeg or set OPENAI_API_KEY).";
   }
 
   return `Voice transcription: ${backends.join(", ")}.`;

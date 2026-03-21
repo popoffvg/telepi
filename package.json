@@ -15,6 +15,9 @@
     "@mariozechner/pi-coding-agent": "^0.60.0",
     "grammy": "^1.35.0"
   },
+  "optionalDependencies": {
+    "parakeet-coreml": "^2.2.0"
+  },
   "devDependencies": {
     "@types/node": "^22.0.0",
     "@vitest/coverage-v8": "^3.2.4",
