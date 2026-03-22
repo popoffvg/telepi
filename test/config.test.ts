@@ -18,6 +18,7 @@ describe("loadConfig", () => {
     delete process.env.PI_MODEL;
     delete process.env.PI_SESSION_PATH;
     delete process.env.TOOL_VERBOSITY;
+    delete process.env.PI_SKILLS;
     delete process.env.container;
   });
 
@@ -45,6 +46,7 @@ describe("loadConfig", () => {
       piSessionPath: "/tmp/session.jsonl",
       piModel: "anthropic/claude-sonnet-4-5",
       toolVerbosity: "all",
+      piSkills: "none",
     });
   });
 
@@ -163,5 +165,63 @@ describe("loadConfig", () => {
     const config = loadConfig();
 
     expect(config.workspace).toBe("/workspace");
+  });
+
+  it("defaults piSkills to 'none' when PI_SKILLS is unset", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+
+    expect(loadConfig().piSkills).toBe("none");
+  });
+
+  it("parses PI_SKILLS=all", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+    process.env.PI_SKILLS = "all";
+
+    expect(loadConfig().piSkills).toBe("all");
+  });
+
+  it("parses PI_SKILLS=none explicitly", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+    process.env.PI_SKILLS = "none";
+
+    expect(loadConfig().piSkills).toBe("none");
+  });
+
+  it("parses PI_SKILLS as comma-separated allowlist", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+    process.env.PI_SKILLS = "browser-tools, frontend-design";
+
+    expect(loadConfig().piSkills).toEqual(["browser-tools", "frontend-design"]);
+  });
+
+  it("parses PI_SKILLS with a single skill name", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+    process.env.PI_SKILLS = "browser-tools";
+
+    expect(loadConfig().piSkills).toEqual(["browser-tools"]);
+  });
+
+  it("parses PI_SKILLS keywords case-insensitively", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+
+    process.env.PI_SKILLS = "ALL";
+    expect(loadConfig().piSkills).toBe("all");
+
+    process.env.PI_SKILLS = "None";
+    expect(loadConfig().piSkills).toBe("none");
+  });
+
+  it("treats comma-only PI_SKILLS as 'none'", () => {
+    process.env.TELEGRAM_BOT_TOKEN = "bot-token";
+    process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
+    process.env.PI_SKILLS = " , , ";
+
+    expect(loadConfig().piSkills).toBe("none");
   });
 });

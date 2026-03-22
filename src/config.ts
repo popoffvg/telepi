@@ -3,6 +3,15 @@ import path from "node:path";
 
 export type ToolVerbosity = "all" | "summary" | "errors-only" | "none";
 
+/**
+ * Controls which Pi skills are loaded into TelePi sessions.
+ *
+ * - "none"      — No skills loaded (default; safest for remote use)
+ * - "all"       — Load all discovered skills (same as Pi CLI)
+ * - string[]    — Allowlist: only load skills whose names are in the list
+ */
+export type SkillsMode = "none" | "all" | string[];
+
 export interface TelePiConfig {
   telegramBotToken: string;
   telegramAllowedUserIds: number[];
@@ -11,6 +20,7 @@ export interface TelePiConfig {
   piSessionPath?: string;
   piModel?: string;
   toolVerbosity: ToolVerbosity;
+  piSkills: SkillsMode;
 }
 
 export function loadConfig(): TelePiConfig {
@@ -22,6 +32,7 @@ export function loadConfig(): TelePiConfig {
   const piSessionPath = optionalString(process.env.PI_SESSION_PATH);
   const piModel = optionalString(process.env.PI_MODEL);
   const toolVerbosity = parseToolVerbosity(optionalString(process.env.TOOL_VERBOSITY));
+  const piSkills = parseSkillsMode(optionalString(process.env.PI_SKILLS));
 
   return {
     telegramBotToken,
@@ -31,6 +42,7 @@ export function loadConfig(): TelePiConfig {
     piSessionPath,
     piModel,
     toolVerbosity,
+    piSkills,
   };
 }
 
@@ -136,4 +148,29 @@ function parseToolVerbosity(raw: string | undefined): ToolVerbosity {
       );
       return "summary";
   }
+}
+
+/**
+ * Parse PI_SKILLS env var.
+ *
+ * - unset / empty / "none" → "none" (no skills, default)
+ * - "all"                  → "all"  (load all discovered skills)
+ * - "skill1,skill2"        → ["skill1", "skill2"] (allowlist)
+ */
+function parseSkillsMode(raw: string | undefined): SkillsMode {
+  if (!raw) {
+    return "none";
+  }
+
+  const lower = raw.toLowerCase();
+  if (lower === "none") {
+    return "none";
+  }
+
+  if (lower === "all") {
+    return "all";
+  }
+
+  const list = raw.split(",").map((s) => s.trim()).filter(Boolean);
+  return list.length === 0 ? "none" : list;
 }

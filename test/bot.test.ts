@@ -81,6 +81,7 @@ function createConfig(overrides: Partial<TelePiConfig> = {}): TelePiConfig {
     piSessionPath: undefined,
     piModel: undefined,
     toolVerbosity: "summary",
+    piSkills: "none",
     ...overrides,
   };
 }
