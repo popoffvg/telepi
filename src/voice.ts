@@ -1,3 +1,5 @@
+import { spawn } from "node:child_process";
+import { createRequire } from "node:module";
 import path from "node:path";
 import { readFile } from "node:fs/promises";
 
@@ -9,29 +11,48 @@ export interface TranscriptionResult {
 
 export type TranscriptionBackend = "parakeet" | "openai";
 
+// Minimal interface for the parakeet-coreml engine instance.
+interface ParakeetEngine {
+  initialize(): Promise<void>;
+  transcribe(samples: Float32Array): Promise<unknown>;
+}
+
+const PARAKEET_SPECIFIER = "parakeet-coreml";
+const FFMPEG_INSTALL_MESSAGE = "ffmpeg not found. Install it with: brew install ffmpeg";
 const NO_BACKEND_ERROR = `Voice messages require a transcription backend.
 
-Option 1: Install Parakeet for local transcription (free, private, ~600MB download):
-  npm install parakeet-node
+Option 1: Install Parakeet for local transcription (free, private, ~1.5GB download):
+  npm install parakeet-coreml
+Also requires ffmpeg: brew install ffmpeg
 
 Option 2: Set OPENAI_API_KEY for cloud transcription (~$0.006/min):
   Add OPENAI_API_KEY=sk-... to your .env file`;
 
-let _importModule: (specifier: string) => Promise<any> = (specifier) => import(specifier);
+const _require = createRequire(import.meta.url);
+let _importModule: (specifier: string) => Promise<unknown> = async (specifier) => _require(specifier);
+let _decodeAudio: (filePath: string) => Promise<Float32Array> = decodeAudioToSamples;
+let _engine: ParakeetEngine | null = null;
 
-export function _setImportHook(hook: (specifier: string) => Promise<any>): void {
+export function _setImportHook(hook: (specifier: string) => Promise<unknown>): void {
   _importModule = hook;
 }
 
+export function _setDecodeHook(hook: (filePath: string) => Promise<Float32Array>): void {
+  _decodeAudio = hook;
+}
+
 export function _resetImportHook(): void {
-  _importModule = (specifier) => import(specifier);
+  _importModule = async (specifier) => _require(specifier);
+  _decodeAudio = decodeAudioToSamples;
+  _engine = null;
 }
 
 export async function transcribeAudio(filePath: string): Promise<TranscriptionResult> {
   try {
-    return await transcribeWithParakeet(filePath);
+    const parakeetMod = await _importModule(PARAKEET_SPECIFIER);
+    return await transcribeWithParakeet(filePath, parakeetMod);
   } catch (error) {
-    if (!isModuleNotFoundError(error, "parakeet-node")) {
+    if (!isModuleNotFoundError(error, PARAKEET_SPECIFIER)) {
       throw error;
     }
   }
@@ -47,7 +68,7 @@ export async function getAvailableBackends(): Promise<TranscriptionBackend[]> {
   const backends: TranscriptionBackend[] = [];
 
   try {
-    await _importModule("parakeet-node");
+    await _importModule(PARAKEET_SPECIFIER);
     backends.push("parakeet");
   } catch {
     // Treat import failures as unavailable so /start can still work.
@@ -60,30 +81,49 @@ export async function getAvailableBackends(): Promise<TranscriptionBackend[]> {
   return backends;
 }
 
-async function transcribeWithParakeet(filePath: string): Promise<TranscriptionResult> {
+async function transcribeWithParakeet(filePath: string, parakeetMod: unknown): Promise<TranscriptionResult> {
   const startedAt = Date.now();
-  const parakeet = (await _importModule("parakeet-node")) as any;
-  const transcribe =
-    typeof parakeet?.transcribe === "function"
-      ? parakeet.transcribe.bind(parakeet)
-      : typeof parakeet?.default?.transcribe === "function"
-        ? parakeet.default.transcribe.bind(parakeet.default)
-        : undefined;
+  const samples = await _decodeAudio(filePath);
 
-  if (!transcribe) {
-    throw new Error("parakeet-node was loaded but does not expose a transcribe(filePath) function");
+  if (!_engine) {
+    const mod = parakeetMod as Record<string, unknown> | null;
+    const ParakeetAsrEngine =
+      (mod?.ParakeetAsrEngine as (new () => unknown) | undefined) ??
+      ((mod?.default as Record<string, unknown> | undefined)?.ParakeetAsrEngine as (new () => unknown) | undefined);
+
+    if (typeof ParakeetAsrEngine !== "function") {
+      throw new Error("parakeet-coreml was loaded but does not expose a ParakeetAsrEngine class");
+    }
+
+    const engine = new ParakeetAsrEngine() as Record<string, unknown>;
+
+    if (typeof engine.initialize !== "function") {
+      throw new Error("parakeet-coreml was loaded but the engine does not expose initialize()");
+    }
+
+    if (typeof engine.transcribe !== "function") {
+      throw new Error("parakeet-coreml was loaded but the engine does not expose transcribe(samples)");
+    }
+
+    await (engine.initialize as () => Promise<void>)();
+    _engine = engine as unknown as ParakeetEngine;
   }
 
-  const result = await transcribe(filePath);
+  const result = await _engine.transcribe(samples);
   const text = extractTranscribedText(result);
   if (text === undefined) {
-    throw new Error("parakeet-node returned an unsupported transcription result");
+    throw new Error("parakeet-coreml returned an unsupported transcription result");
   }
+
+  const durationMs =
+    typeof result === "object" && result !== null && typeof (result as { durationMs?: unknown }).durationMs === "number"
+      ? (result as { durationMs: number }).durationMs
+      : Date.now() - startedAt;
 
   return {
     text,
     backend: "parakeet",
-    durationMs: Date.now() - startedAt,
+    durationMs,
   };
 }
 
@@ -131,6 +171,66 @@ async function transcribeWithOpenAI(filePath: string): Promise<TranscriptionResu
     backend: "openai",
     durationMs: Date.now() - startedAt,
   };
+}
+
+function decodeAudioToSamples(filePath: string): Promise<Float32Array> {
+  return new Promise<Float32Array>((resolve, reject) => {
+    const stdoutChunks: Buffer[] = [];
+    const stderrChunks: Buffer[] = [];
+    let settled = false;
+
+    const ffmpeg = spawn("ffmpeg", ["-i", filePath, "-ar", "16000", "-ac", "1", "-f", "f32le", "pipe:1"], {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    const finish = (callback: () => void): void => {
+      if (settled) return;
+      settled = true;
+      callback();
+    };
+
+    ffmpeg.stdout.on("data", (chunk: Buffer | string) => {
+      stdoutChunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    });
+
+    ffmpeg.stderr.on("data", (chunk: Buffer | string) => {
+      stderrChunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    });
+
+    ffmpeg.once("error", (error) => {
+      finish(() => {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+          reject(new Error(FFMPEG_INSTALL_MESSAGE));
+          return;
+        }
+        reject(error);
+      });
+    });
+
+    ffmpeg.once("close", (code, signal) => {
+      finish(() => {
+        if (code !== 0) {
+          const stderr = Buffer.concat(stderrChunks).toString("utf8").trim();
+          const reason = stderr || (signal ? `signal ${signal}` : `exit code ${code ?? "unknown"}`);
+          reject(new Error(`ffmpeg failed to decode audio: ${reason}`));
+          return;
+        }
+
+        const buffer = Buffer.concat(stdoutChunks);
+        if (buffer.byteLength % Float32Array.BYTES_PER_ELEMENT !== 0) {
+          reject(new Error("ffmpeg returned invalid float32 PCM output"));
+          return;
+        }
+
+        const samples = new Float32Array(
+          buffer.buffer,
+          buffer.byteOffset,
+          buffer.byteLength / Float32Array.BYTES_PER_ELEMENT,
+        ).slice();
+        resolve(samples);
+      });
+    });
+  });
 }
 
 function hasOpenAIApiKey(): boolean {
