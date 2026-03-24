@@ -61,6 +61,87 @@ describe("voice transcription", () => {
     expect(result.durationMs).toBe(5);
   });
 
+  it("serializes concurrent parakeet calls and reuses one engine", async () => {
+    let initializeCount = 0;
+    let transcribeCount = 0;
+    let activeTranscribes = 0;
+    let maxConcurrentTranscribes = 0;
+    let releaseFirstTranscribe!: () => void;
+    let markFirstTranscribeActive!: () => void;
+    const firstTranscribeStarted = new Promise<void>((resolve) => {
+      releaseFirstTranscribe = resolve;
+    });
+    const firstTranscribeActive = new Promise<void>((resolve) => {
+      markFirstTranscribeActive = resolve;
+    });
+
+    _setDecodeHook(async () => new Float32Array(100));
+    _setImportHook(async () => ({
+      ParakeetAsrEngine: class {
+        async initialize(): Promise<void> {
+          initializeCount += 1;
+        }
+
+        async transcribe(): Promise<{ text: string; durationMs: number }> {
+          transcribeCount += 1;
+          activeTranscribes += 1;
+          maxConcurrentTranscribes = Math.max(maxConcurrentTranscribes, activeTranscribes);
+
+          if (transcribeCount === 1) {
+            markFirstTranscribeActive();
+            await firstTranscribeStarted;
+          }
+
+          activeTranscribes -= 1;
+          return { text: `transcript-${transcribeCount}`, durationMs: 5 };
+        }
+      },
+    }));
+
+    const first = transcribeAudio(audioPath);
+    const second = transcribeAudio(audioPath);
+    await firstTranscribeActive;
+    expect(maxConcurrentTranscribes).toBe(1);
+    expect(initializeCount).toBe(1);
+
+    releaseFirstTranscribe();
+    const [firstResult, secondResult] = await Promise.all([first, second]);
+
+    expect(firstResult.text).toBe("transcript-1");
+    expect(secondResult.text).toBe("transcript-2");
+    expect(initializeCount).toBe(1);
+    expect(maxConcurrentTranscribes).toBe(1);
+  });
+
+  it("releases the parakeet lock after a failed transcription", async () => {
+    let callCount = 0;
+
+    _setDecodeHook(async () => new Float32Array(100));
+    _setImportHook(async () => ({
+      ParakeetAsrEngine: class {
+        async initialize(): Promise<void> {}
+
+        async transcribe(): Promise<{ text: string; durationMs: number }> {
+          callCount += 1;
+          if (callCount === 1) {
+            throw new Error("native failure");
+          }
+          return { text: "recovered", durationMs: 5 };
+        }
+      },
+    }));
+
+    const first = transcribeAudio(audioPath);
+    const second = transcribeAudio(audioPath);
+
+    await expect(first).rejects.toThrow("native failure");
+    await expect(second).resolves.toMatchObject({
+      text: "recovered",
+      backend: "parakeet",
+      durationMs: 5,
+    });
+  });
+
   it("falls back to OpenAI when parakeet is unavailable", async () => {
     _setImportHook(async () => {
       const error = new Error("Cannot find package 'parakeet-coreml'") as Error & { code?: string };

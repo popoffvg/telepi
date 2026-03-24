@@ -32,6 +32,10 @@ const _require = createRequire(import.meta.url);
 let _importModule: (specifier: string) => Promise<unknown> = async (specifier) => _require(specifier);
 let _decodeAudio: (filePath: string) => Promise<Float32Array> = decodeAudioToSamples;
 let _engine: ParakeetEngine | null = null;
+// The native Parakeet/CoreML stack is not safe to initialize or drive concurrently.
+// Recent per-topic session work made overlapping voice notes possible, so we serialize
+// access to the shared engine process-wide to avoid native aborts without JS stack traces.
+let _parakeetMutex: Promise<void> = Promise.resolve();
 
 export function _setImportHook(hook: (specifier: string) => Promise<unknown>): void {
   _importModule = hook;
@@ -45,6 +49,7 @@ export function _resetImportHook(): void {
   _importModule = async (specifier) => _require(specifier);
   _decodeAudio = decodeAudioToSamples;
   _engine = null;
+  _parakeetMutex = Promise.resolve();
 }
 
 export async function transcribeAudio(filePath: string): Promise<TranscriptionResult> {
@@ -82,49 +87,73 @@ export async function getAvailableBackends(): Promise<TranscriptionBackend[]> {
 }
 
 async function transcribeWithParakeet(filePath: string, parakeetMod: unknown): Promise<TranscriptionResult> {
-  const startedAt = Date.now();
   const samples = await _decodeAudio(filePath);
 
-  if (!_engine) {
-    const mod = parakeetMod as Record<string, unknown> | null;
-    const ParakeetAsrEngine =
-      (mod?.ParakeetAsrEngine as (new () => unknown) | undefined) ??
-      ((mod?.default as Record<string, unknown> | undefined)?.ParakeetAsrEngine as (new () => unknown) | undefined);
-
-    if (typeof ParakeetAsrEngine !== "function") {
-      throw new Error("parakeet-coreml was loaded but does not expose a ParakeetAsrEngine class");
+  return withParakeetLock(async () => {
+    const startedAt = Date.now();
+    const engine = await getParakeetEngine(parakeetMod);
+    const result = await engine.transcribe(samples);
+    const text = extractTranscribedText(result);
+    if (text === undefined) {
+      throw new Error("parakeet-coreml returned an unsupported transcription result");
     }
 
-    const engine = new ParakeetAsrEngine() as Record<string, unknown>;
+    const durationMs =
+      typeof result === "object" && result !== null && typeof (result as { durationMs?: unknown }).durationMs === "number"
+        ? (result as { durationMs: number }).durationMs
+        : Date.now() - startedAt;
 
-    if (typeof engine.initialize !== "function") {
-      throw new Error("parakeet-coreml was loaded but the engine does not expose initialize()");
-    }
+    return {
+      text,
+      backend: "parakeet",
+      durationMs,
+    };
+  });
+}
 
-    if (typeof engine.transcribe !== "function") {
-      throw new Error("parakeet-coreml was loaded but the engine does not expose transcribe(samples)");
-    }
-
-    await (engine.initialize as () => Promise<void>)();
-    _engine = engine as unknown as ParakeetEngine;
+async function getParakeetEngine(parakeetMod: unknown): Promise<ParakeetEngine> {
+  if (_engine) {
+    return _engine;
   }
 
-  const result = await _engine.transcribe(samples);
-  const text = extractTranscribedText(result);
-  if (text === undefined) {
-    throw new Error("parakeet-coreml returned an unsupported transcription result");
+  const mod = parakeetMod as Record<string, unknown> | null;
+  const ParakeetAsrEngine =
+    (mod?.ParakeetAsrEngine as (new () => unknown) | undefined) ??
+    ((mod?.default as Record<string, unknown> | undefined)?.ParakeetAsrEngine as (new () => unknown) | undefined);
+
+  if (typeof ParakeetAsrEngine !== "function") {
+    throw new Error("parakeet-coreml was loaded but does not expose a ParakeetAsrEngine class");
   }
 
-  const durationMs =
-    typeof result === "object" && result !== null && typeof (result as { durationMs?: unknown }).durationMs === "number"
-      ? (result as { durationMs: number }).durationMs
-      : Date.now() - startedAt;
+  const engine = new ParakeetAsrEngine() as Record<string, unknown>;
 
-  return {
-    text,
-    backend: "parakeet",
-    durationMs,
-  };
+  if (typeof engine.initialize !== "function") {
+    throw new Error("parakeet-coreml was loaded but the engine does not expose initialize()");
+  }
+
+  if (typeof engine.transcribe !== "function") {
+    throw new Error("parakeet-coreml was loaded but the engine does not expose transcribe(samples)");
+  }
+
+  await (engine.initialize as () => Promise<void>)();
+  _engine = engine as unknown as ParakeetEngine;
+  return _engine;
+}
+
+async function withParakeetLock<T>(task: () => Promise<T>): Promise<T> {
+  const previous = _parakeetMutex;
+  let release!: () => void;
+  _parakeetMutex = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+
+  await previous.catch(() => {});
+
+  try {
+    return await task();
+  } finally {
+    release();
+  }
 }
 
 async function transcribeWithOpenAI(filePath: string): Promise<TranscriptionResult> {
