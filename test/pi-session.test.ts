@@ -42,6 +42,8 @@ const mockState = vi.hoisted(() => {
       sessionFile: options.sessionFile ?? `/tmp/session-${sessionCounter}.jsonl`,
       sessionName: options.sessionName,
       model: options.model ?? models[0],
+      thinkingLevel: options.thinkingLevel ?? "medium",
+      scopedModels: options.scopedModels ?? [],
       isStreaming: false,
       agent: {
         state: {
@@ -78,6 +80,9 @@ const mockState = vi.hoisted(() => {
       setModel: vi.fn().mockImplementation(async (model) => {
         session.model = model;
       }),
+      setThinkingLevel: vi.fn().mockImplementation((thinkingLevel) => {
+        session.thinkingLevel = thinkingLevel;
+      }),
       subscribe: vi.fn().mockImplementation((callback) => {
         sessionSubscribers.set(session, callback);
         return () => {
@@ -96,6 +101,8 @@ const mockState = vi.hoisted(() => {
   const createAgentSession = vi.fn().mockImplementation(async (options: any) => ({
     session: createSession({
       model: options.model,
+      thinkingLevel: options.thinkingLevel,
+      scopedModels: options.scopedModels,
       sessionFile: options.sessionManager?.sessionPath,
     }),
     modelFallbackMessage: options.model ? undefined : "fallback-model",
@@ -125,6 +132,15 @@ const mockState = vi.hoisted(() => {
     listAll: vi.fn().mockResolvedValue(defaultSessions()),
   };
 
+  const SettingsManager = {
+    create: vi.fn().mockImplementation(() => ({
+      getEnabledModels: vi.fn().mockReturnValue(undefined),
+      getDefaultProvider: vi.fn().mockReturnValue(undefined),
+      getDefaultModel: vi.fn().mockReturnValue(undefined),
+      drainErrors: vi.fn().mockReturnValue([]),
+    })),
+  };
+
   return {
     models,
     createdSessions,
@@ -134,6 +150,7 @@ const mockState = vi.hoisted(() => {
     AuthStorage,
     ModelRegistry,
     SessionManager,
+    SettingsManager,
     getSubscriber: (session: object) => sessionSubscribers.get(session),
     reset: () => {
       sessionCounter = 0;
@@ -147,6 +164,7 @@ const mockState = vi.hoisted(() => {
       SessionManager.open.mockClear();
       SessionManager.listAll.mockReset();
       SessionManager.listAll.mockResolvedValue(defaultSessions());
+      SettingsManager.create.mockClear();
     },
   };
 });
@@ -157,6 +175,7 @@ vi.mock("@mariozechner/pi-coding-agent", () => ({
   AuthStorage: mockState.AuthStorage,
   ModelRegistry: mockState.ModelRegistry,
   SessionManager: mockState.SessionManager,
+  SettingsManager: mockState.SettingsManager,
 }));
 
 import { getPiSessionContextKey, PiSessionRegistry, PiSessionService } from "../src/pi-session.js";
@@ -182,12 +201,14 @@ describe("PiSessionService", () => {
 
     expect(mockState.AuthStorage.create).toHaveBeenCalledTimes(1);
     expect(mockState.ModelRegistry).toHaveBeenCalledTimes(1);
+    expect(mockState.SettingsManager.create).toHaveBeenCalledWith("/workspace/base");
     expect(mockState.createCodingTools).toHaveBeenCalledWith("/workspace/base");
     expect(mockState.createAgentSession).toHaveBeenCalledWith(
       expect.objectContaining({
         cwd: "/workspace/base",
         tools: ["mock-tool"],
         model: undefined,
+        scopedModels: [],
       }),
     );
 
@@ -403,14 +424,133 @@ describe("PiSessionService", () => {
         id: "claude-sonnet-4-5",
         name: "Claude Sonnet",
         current: true,
+        thinkingLevel: undefined,
       },
       {
         provider: "openai",
         id: "gpt-4o",
         name: "GPT-4o",
         current: false,
+        thinkingLevel: undefined,
       },
     ]);
+  });
+
+  it("lists only scoped models when the session has a model scope", async () => {
+    const service = await PiSessionService.create(createConfig());
+    const currentSession = mockState.createdSessions[0]?.session;
+
+    currentSession.scopedModels = [{ model: mockState.models[1], thinkingLevel: "high" }];
+
+    await expect(service.listModels()).resolves.toEqual([
+      {
+        provider: "openai",
+        id: "gpt-4o",
+        name: "GPT-4o",
+        current: false,
+        thinkingLevel: "high",
+      },
+    ]);
+  });
+
+  it("can list all models even when a scope is active", async () => {
+    const service = await PiSessionService.create(createConfig());
+    const currentSession = mockState.createdSessions[0]?.session;
+
+    currentSession.scopedModels = [{ model: mockState.models[1], thinkingLevel: "high" }];
+
+    await expect(service.listModels(true)).resolves.toEqual([
+      {
+        provider: "anthropic",
+        id: "claude-sonnet-4-5",
+        name: "Claude Sonnet",
+        current: true,
+        thinkingLevel: undefined,
+      },
+      {
+        provider: "openai",
+        id: "gpt-4o",
+        name: "GPT-4o",
+        current: false,
+        thinkingLevel: "high",
+      },
+    ]);
+  });
+
+  it("derives scoped models from pi settings when enabled models are configured", async () => {
+    mockState.SettingsManager.create.mockReturnValueOnce({
+      getEnabledModels: vi.fn().mockReturnValue(["openai/gpt-4o"]),
+      getDefaultProvider: vi.fn().mockReturnValue(undefined),
+      getDefaultModel: vi.fn().mockReturnValue(undefined),
+      drainErrors: vi.fn().mockReturnValue([]),
+    });
+
+    await PiSessionService.create(createConfig());
+
+    expect(mockState.createAgentSession).toHaveBeenCalledWith(
+      expect.objectContaining({
+        scopedModels: [{ model: mockState.models[1] }],
+      }),
+    );
+  });
+
+  it("starts a new session on the preferred scoped default model", async () => {
+    mockState.SettingsManager.create.mockReturnValueOnce({
+      getEnabledModels: vi.fn().mockReturnValue(["anthropic/claude-sonnet-4-5", "openai/gpt-4o:high"]),
+      getDefaultProvider: vi.fn().mockReturnValue("openai"),
+      getDefaultModel: vi.fn().mockReturnValue("gpt-4o"),
+      drainErrors: vi.fn().mockReturnValue([]),
+    });
+
+    await PiSessionService.create(createConfig());
+
+    expect(mockState.createAgentSession).toHaveBeenCalledWith(
+      expect.objectContaining({
+        model: mockState.models[1],
+        thinkingLevel: "high",
+        scopedModels: [
+          { model: mockState.models[0] },
+          { model: mockState.models[1], thinkingLevel: "high" },
+        ],
+      }),
+    );
+  });
+
+  it("falls back to the first scoped model when no scoped default is saved", async () => {
+    mockState.SettingsManager.create.mockReturnValueOnce({
+      getEnabledModels: vi.fn().mockReturnValue(["openai/gpt-4o:high"]),
+      getDefaultProvider: vi.fn().mockReturnValue(undefined),
+      getDefaultModel: vi.fn().mockReturnValue(undefined),
+      drainErrors: vi.fn().mockReturnValue([]),
+    });
+
+    await PiSessionService.create(createConfig());
+
+    expect(mockState.createAgentSession).toHaveBeenCalledWith(
+      expect.objectContaining({
+        model: mockState.models[1],
+        thinkingLevel: "high",
+      }),
+    );
+  });
+
+  it("does not override the model when opening an existing session file", async () => {
+    mockState.SettingsManager.create.mockReturnValueOnce({
+      getEnabledModels: vi.fn().mockReturnValue(["openai/gpt-4o:high"]),
+      getDefaultProvider: vi.fn().mockReturnValue(undefined),
+      getDefaultModel: vi.fn().mockReturnValue(undefined),
+      drainErrors: vi.fn().mockReturnValue([]),
+    });
+
+    await PiSessionService.create(createConfig({ piSessionPath: "/etc/hosts" }));
+
+    expect(mockState.createAgentSession).toHaveBeenCalledWith(
+      expect.objectContaining({
+        model: undefined,
+        thinkingLevel: undefined,
+        scopedModels: [{ model: mockState.models[1], thinkingLevel: "high" }],
+      }),
+    );
   });
 
   it("switches models via the underlying session", async () => {
@@ -423,6 +563,20 @@ describe("PiSessionService", () => {
       id: "gpt-4o",
       name: "GPT-4o",
     });
+    expect(currentSession.setThinkingLevel).not.toHaveBeenCalled();
+  });
+
+  it("applies a scoped thinking-level override when switching models", async () => {
+    const service = await PiSessionService.create(createConfig());
+    const currentSession = mockState.createdSessions[0]?.session;
+
+    await expect(service.setModel("openai", "gpt-4o", "high")).resolves.toBe("openai/gpt-4o");
+    expect(currentSession.setModel).toHaveBeenCalledWith({
+      provider: "openai",
+      id: "gpt-4o",
+      name: "GPT-4o",
+    });
+    expect(currentSession.setThinkingLevel).toHaveBeenCalledWith("high");
   });
 
   it("delegates tree access, navigation, and labels", async () => {
@@ -613,6 +767,7 @@ describe("PiSessionService", () => {
     const first = registry.getOrCreate({ chatId: 7, messageThreadId: 1 });
     const second = registry.getOrCreate({ chatId: 7, messageThreadId: 1 });
 
+    await Promise.resolve();
     expect(mockState.createAgentSession).toHaveBeenCalledTimes(1);
 
     resolveCreate();
@@ -658,6 +813,7 @@ describe("PiSessionService", () => {
     });
 
     const pending = registry.getOrCreate({ chatId: 11, messageThreadId: 4 });
+    await Promise.resolve();
     registry.remove({ chatId: 11, messageThreadId: 4 });
     resolveCreate();
 

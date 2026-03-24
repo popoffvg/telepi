@@ -13,6 +13,7 @@ import {
   type PiSessionContext,
   getPiSessionContextKey,
   type PiSessionInfo,
+  type PiSessionModelOption,
   type PiSessionRegistry,
   type PiSessionService,
 } from "./pi-session.js";
@@ -141,8 +142,9 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
   const pendingSessionButtons = new Map<ContextKey, KeyboardItem[]>();
   const pendingWorkspacePicks = new Map<ContextKey, string[]>();
   const pendingWorkspaceButtons = new Map<ContextKey, KeyboardItem[]>();
-  const pendingModelPicks = new Map<ContextKey, Array<{ provider: string; id: string }>>();
+  const pendingModelPicks = new Map<ContextKey, PiSessionModelOption[]>();
   const pendingModelButtons = new Map<ContextKey, KeyboardItem[]>();
+  const pendingModelExtraButtons = new Map<ContextKey, KeyboardItem[]>();
   const pendingTreeNavs = new Map<ContextKey, string>();
   const pendingTreeButtons = new Map<ContextKey, KeyboardItem[]>();
   const pendingTreeFilterButtons = new Map<ContextKey, KeyboardItem[]>();
@@ -183,6 +185,7 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
     pendingWorkspaceButtons.delete(contextKey);
     pendingModelPicks.delete(contextKey);
     pendingModelButtons.delete(contextKey);
+    pendingModelExtraButtons.delete(contextKey);
     pendingTreeNavs.delete(contextKey);
     pendingTreeButtons.delete(contextKey);
     pendingTreeFilterButtons.delete(contextKey);
@@ -1002,13 +1005,74 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
     }
   });
 
+  const renderModelPicker = async (
+    ctx: Context,
+    target: PiSessionContext,
+    piSession: PiSessionService,
+    options?: { showAll?: boolean; messageId?: number },
+  ): Promise<void> => {
+    const contextKey = getContextKey(target);
+    const showAll = options?.showAll ?? false;
+    const messageId = options?.messageId;
+    const models = await piSession.listModels(showAll);
+
+    if (models.length === 0) {
+      const message = "No models available.";
+      if (messageId) {
+        await safeEditMessage(bot, target, messageId, escapeHTML(message), { fallbackText: message });
+      } else {
+        await safeReply(ctx, escapeHTML(message), { fallbackText: message }, target);
+      }
+      return;
+    }
+
+    pendingModelPicks.set(contextKey, models);
+
+    const modelButtons = models.map((model, index) => {
+      const modelRef = `${model.provider}/${model.id}`;
+      const nameSuffix = model.name && model.name !== model.id ? ` · ${model.name}` : "";
+      const thinkingSuffix = model.thinkingLevel ? ` : ${model.thinkingLevel}` : "";
+      return {
+        label: `${model.current ? "✅ " : ""}${modelRef}${nameSuffix}${thinkingSuffix}`,
+        callbackData: `model_${index}`,
+      };
+    });
+    pendingModelButtons.set(contextKey, modelButtons);
+
+    let extraButtons: KeyboardItem[] = [];
+    if (!showAll) {
+      const allModels = await piSession.listModels(true);
+      if (allModels.length > models.length) {
+        extraButtons = [{ label: "Show all models", callbackData: "model_show_all" }];
+      }
+    }
+    pendingModelExtraButtons.set(contextKey, extraButtons);
+
+    const info = piSession.getInfo();
+    const currentModelText = info.model ? `Current: ${info.model}` : "No model selected";
+    const scopeHint = extraButtons.length > 0 ? "Showing the current Pi model scope." : undefined;
+    const html = ["<b>Select a model</b>", escapeHTML(currentModelText), scopeHint ? `<i>${escapeHTML(scopeHint)}</i>` : undefined]
+      .filter((line): line is string => line !== undefined)
+      .join("\n");
+    const fallbackText = ["Select a model", currentModelText, scopeHint]
+      .filter((line): line is string => line !== undefined)
+      .join("\n");
+    const replyMarkup = buildKeyboard(modelButtons, 0, "model", extraButtons);
+
+    if (messageId) {
+      await safeEditMessage(bot, target, messageId, html, { fallbackText, replyMarkup });
+      return;
+    }
+
+    await safeReply(ctx, html, { fallbackText, replyMarkup }, target);
+  };
+
   bot.command("model", async (ctx) => {
     const target = getTelegramTarget(ctx);
     if (!target) {
       return;
     }
 
-    const contextKey = getContextKey(target);
     const piSession = await getOrCreateSession(target);
 
     if (!piSession.hasActiveSession()) {
@@ -1024,32 +1088,7 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
       }
     }
 
-    const models = await piSession.listModels();
-    if (models.length === 0) {
-      await safeReply(ctx, escapeHTML("No models available."), {
-        fallbackText: "No models available.",
-      }, target);
-      return;
-    }
-
-    pendingModelPicks.set(
-      contextKey,
-      models.map((model) => ({ provider: model.provider, id: model.id })),
-    );
-
-    const modelButtons = models.map((model, index) => ({
-      label: `${model.current ? "✅ " : ""}${model.name}`,
-      callbackData: `model_${index}`,
-    }));
-    pendingModelButtons.set(contextKey, modelButtons);
-
-    const info = piSession.getInfo();
-    const currentModelText = info.model ? `Current: ${info.model}` : "No model selected";
-
-    await safeReply(ctx, `<b>Select a model</b>\n${escapeHTML(currentModelText)}`, {
-      fallbackText: `Select a model\n${currentModelText}`,
-      replyMarkup: buildKeyboard(modelButtons, 0, "model"),
-    }, target);
+    await renderModelPicker(ctx, target, piSession);
   });
 
   bot.command("tree", async (ctx) => {
@@ -1279,7 +1318,7 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
 
   handlePageCallback(/^switch_page_(\d+)$/, "switch", pendingSessionButtons, "Expired, run /sessions again");
   handlePageCallback(/^newws_page_(\d+)$/, "newws", pendingWorkspaceButtons, "Expired, run /new again");
-  handlePageCallback(/^model_page_(\d+)$/, "model", pendingModelButtons, "Expired, run /model again");
+  handlePageCallback(/^model_page_(\d+)$/, "model", pendingModelButtons, "Expired, run /model again", pendingModelExtraButtons);
   handlePageCallback(
     /^tree_page_(\d+)$/,
     "tree",
@@ -1413,6 +1452,31 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
     }
   });
 
+  bot.callbackQuery("model_show_all", async (ctx) => {
+    const target = getTelegramTarget(ctx);
+    const messageId = ctx.callbackQuery.message?.message_id;
+
+    if (!target || !messageId) {
+      return;
+    }
+
+    const contextKey = getContextKey(target);
+    const piSession = getExistingSession(target);
+    const models = pendingModelPicks.get(contextKey);
+    if (!models || models.length === 0 || !piSession) {
+      await ctx.answerCallbackQuery({ text: "Expired, run /model again" });
+      return;
+    }
+
+    if (isBusy(target)) {
+      await ctx.answerCallbackQuery({ text: "Wait for the current prompt to finish" });
+      return;
+    }
+
+    await ctx.answerCallbackQuery({ text: "Loading all models..." });
+    await renderModelPicker(ctx, target, piSession, { showAll: true, messageId });
+  });
+
   bot.callbackQuery(/^model_(\d+)$/, async (ctx) => {
     const target = getTelegramTarget(ctx);
     const messageId = ctx.callbackQuery.message?.message_id;
@@ -1438,10 +1502,11 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
     await ctx.answerCallbackQuery({ text: "Switching model..." });
     pendingModelPicks.delete(contextKey);
     pendingModelButtons.delete(contextKey);
+    pendingModelExtraButtons.delete(contextKey);
 
     switchingContexts.add(contextKey);
     try {
-      const modelName = await piSession.setModel(models[index].provider, models[index].id);
+      const modelName = await piSession.setModel(models[index].provider, models[index].id, models[index].thinkingLevel);
       const html = `<b>Model switched to:</b> <code>${escapeHTML(modelName)}</code>`;
       const plainText = `Model switched to: ${modelName}`;
 

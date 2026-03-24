@@ -7,12 +7,18 @@ import {
   createCodingTools,
   ModelRegistry,
   SessionManager,
+  SettingsManager,
   type AgentSession,
   type SessionEntry,
 } from "@mariozechner/pi-coding-agent";
+import type { ThinkingLevel } from "@mariozechner/pi-agent-core";
 import type { Api, Model } from "@mariozechner/pi-ai";
 
 import type { TelePiConfig } from "./config.js";
+import {
+  resolveInitialScopedModelSelection,
+  resolveScopedModels,
+} from "./model-scope.js";
 
 /**
  * Default timeout (seconds) for bash commands in TelePi sessions.
@@ -39,6 +45,14 @@ export interface PiSessionInfo {
   sessionName?: string;
   modelFallbackMessage?: string;
   model?: string;
+}
+
+export interface PiSessionModelOption {
+  provider: string;
+  id: string;
+  name: string;
+  current: boolean;
+  thinkingLevel?: ThinkingLevel;
 }
 
 export interface PiSessionContext {
@@ -93,41 +107,47 @@ export async function createPiSession(
   overrideWorkspace?: string,
 ): Promise<PiSessionHandle> {
   const workspace = overrideWorkspace ?? config.workspace;
-  const sessionManager = createSessionManager(config, workspace, overrideSessionPath);
-  const authStorage = AuthStorage.create();
-  const modelRegistry = new ModelRegistry(authStorage);
-  const model = resolveModelOverride(modelRegistry, config.piModel);
-
-  const { session, modelFallbackMessage } = await createAgentSession({
-    cwd: workspace,
-    authStorage,
-    modelRegistry,
-    model,
-    sessionManager,
-    tools: createCodingTools(workspace),
+  const sessionPath = overrideSessionPath ?? config.piSessionPath;
+  return createPiSessionHandle(config, workspace, createSessionManager(config, workspace, overrideSessionPath), {
+    hasExistingSession: Boolean(sessionPath && existsSync(resolveSessionPathForRuntime(sessionPath))),
   });
-  patchBashTimeout(session);
-
-  return {
-    session,
-    modelRegistry,
-    modelFallbackMessage,
-    dispose: () => session.dispose(),
-  };
 }
 
 async function createNewPiSession(config: TelePiConfig, workspace: string): Promise<PiSessionHandle> {
-  const sessionManager = SessionManager.create(workspace);
+  return createPiSessionHandle(config, workspace, SessionManager.create(workspace), {
+    hasExistingSession: false,
+  });
+}
+
+async function createPiSessionHandle(
+  config: TelePiConfig,
+  workspace: string,
+  sessionManager: SessionManager,
+  options: { hasExistingSession: boolean },
+): Promise<PiSessionHandle> {
   const authStorage = AuthStorage.create();
   const modelRegistry = new ModelRegistry(authStorage);
-  const model = resolveModelOverride(modelRegistry, config.piModel);
+  const settingsManager = SettingsManager.create(workspace);
+  drainSettingsWarnings(settingsManager);
+  const configuredModel = resolveModelOverride(modelRegistry, config.piModel);
+  const scopedModels = await resolveScopedModels(settingsManager, modelRegistry);
+  const { model, thinkingLevel } = resolveInitialScopedModelSelection({
+    configuredModel,
+    scopedModels,
+    settingsManager,
+    modelRegistry,
+    hasExistingSession: options.hasExistingSession,
+  });
 
   const { session, modelFallbackMessage } = await createAgentSession({
     cwd: workspace,
     authStorage,
     modelRegistry,
     model,
+    thinkingLevel,
+    scopedModels,
     sessionManager,
+    settingsManager,
     tools: createCodingTools(workspace),
   });
   patchBashTimeout(session);
@@ -301,11 +321,22 @@ export class PiSessionService {
     return { info: this.getInfo(), created };
   }
 
-  async listModels(): Promise<Array<{ provider: string; id: string; name: string; current: boolean }>> {
+  async listModels(showAll = false): Promise<PiSessionModelOption[]> {
     const session = this.getSession();
     const currentModel = session.model;
-    const modelRegistry = this.getModelRegistry();
-    const available = modelRegistry.getAvailable();
+    const availableModels = this.getModelRegistry().getAvailable();
+    const availableKeys = new Set(availableModels.map((model) => `${model.provider}/${model.id}`));
+    const scopedThinkingLevels = new Map(
+      session.scopedModels.map((scoped) => [
+        `${scoped.model.provider}/${scoped.model.id}`,
+        scoped.thinkingLevel,
+      ]),
+    );
+    const available = showAll || session.scopedModels.length === 0
+      ? availableModels
+      : session.scopedModels
+          .map((scoped) => scoped.model)
+          .filter((model) => availableKeys.has(`${model.provider}/${model.id}`));
 
     return available.map((model) => ({
       provider: model.provider,
@@ -314,16 +345,21 @@ export class PiSessionService {
       current: currentModel
         ? model.provider === currentModel.provider && model.id === currentModel.id
         : false,
+      thinkingLevel: scopedThinkingLevels.get(`${model.provider}/${model.id}`),
     }));
   }
 
-  async setModel(provider: string, modelId: string): Promise<string> {
+  async setModel(provider: string, modelId: string, thinkingLevel?: ThinkingLevel): Promise<string> {
+    const session = this.getSession();
     const modelRegistry = this.getModelRegistry();
     const model = modelRegistry.find(provider, modelId);
     if (!model) {
       throw new Error(`Model not found: ${provider}/${modelId}`);
     }
-    await this.getSession().setModel(model);
+    await session.setModel(model);
+    if (thinkingLevel !== undefined) {
+      session.setThinkingLevel(thinkingLevel);
+    }
     return `${model.provider}/${model.id}`;
   }
 
@@ -551,6 +587,13 @@ export class PiSessionRegistry {
     const nextGeneration = (this.generations.get(key) ?? 0) + 1;
     this.generations.set(key, nextGeneration);
     return nextGeneration;
+  }
+}
+
+function drainSettingsWarnings(settingsManager: SettingsManager): void {
+  const errors = settingsManager.drainErrors?.() ?? [];
+  for (const error of errors) {
+    console.warn(`Pi settings warning (${error.scope}): ${error.error.message}`);
   }
 }
 

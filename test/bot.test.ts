@@ -459,6 +459,11 @@ function getReplyMarkupData(api: ReturnType<typeof setupBot>["api"], callIndex =
   return markup?.inline_keyboard?.flat().map((button: any) => button.callback_data) ?? [];
 }
 
+function getReplyMarkupTexts(api: ReturnType<typeof setupBot>["api"], callIndex = 0): string[] {
+  const markup = api.sendMessage.mock.calls[callIndex]?.[2]?.reply_markup;
+  return markup?.inline_keyboard?.flat().map((button: any) => button.text) ?? [];
+}
+
 function getReplyMarkupButtons(
   api: ReturnType<typeof setupBot>["api"],
   callIndex = 0,
@@ -467,12 +472,27 @@ function getReplyMarkupButtons(
   return markup?.inline_keyboard?.flat() ?? [];
 }
 
+function getEditedReplyMarkupData(api: ReturnType<typeof setupBot>["api"], callIndex = 0): string[] {
+  const markup = api.editMessageText.mock.calls[callIndex]?.[3]?.reply_markup;
+  return markup?.inline_keyboard?.flat().map((button: any) => button.callback_data) ?? [];
+}
+
+function getEditedReplyMarkupTexts(api: ReturnType<typeof setupBot>["api"], callIndex = 0): string[] {
+  const markup = api.editMessageText.mock.calls[callIndex]?.[3]?.reply_markup;
+  return markup?.inline_keyboard?.flat().map((button: any) => button.text) ?? [];
+}
+
 function getEditedReplyMarkupButtons(
   api: ReturnType<typeof setupBot>["api"],
   callIndex = 0,
 ): Array<{ text: string; callback_data: string }> {
-  const markup = api.editMessageReplyMarkup.mock.calls[callIndex]?.[2]?.reply_markup;
-  return markup?.inline_keyboard?.flat() ?? [];
+  const replyMarkupFromText = api.editMessageText.mock.calls[callIndex]?.[3]?.reply_markup;
+  if (replyMarkupFromText) {
+    return replyMarkupFromText.inline_keyboard?.flat() ?? [];
+  }
+
+  const replyMarkupFromMarkup = api.editMessageReplyMarkup.mock.calls[callIndex]?.[2]?.reply_markup;
+  return replyMarkupFromMarkup?.inline_keyboard?.flat() ?? [];
 }
 
 function generateMockSessions(count: number) {
@@ -1069,24 +1089,138 @@ describe("createBot", () => {
     await pending;
   });
 
-  it("shows the model picker and handles model selection callbacks", async () => {
-    const { bot, pi, api } = setupBot();
+  it("shows scoped models by default, can expand to all models, and handles model selection", async () => {
+    const scopedModels = [
+      {
+        provider: "github-copilot",
+        id: "codex",
+        name: "Codex",
+        current: true,
+        thinkingLevel: "high",
+      },
+    ];
+    const allModels = [
+      {
+        provider: "openai",
+        id: "codex",
+        name: "Codex",
+        current: false,
+      },
+      ...scopedModels,
+    ];
+    const listModels = vi.fn().mockImplementation((showAll?: boolean) =>
+      Promise.resolve(showAll ? allModels : scopedModels),
+    );
+
+    const { bot, pi, api } = setupBot({
+      piSessionOverrides: {
+        listModels,
+        setModel: vi.fn().mockResolvedValue("openai/codex"),
+      },
+    });
 
     await bot.handleUpdate(createTestUpdate({ message: { text: "/model" } }));
     expect(api.sendMessage.mock.calls[0]?.[1]).toContain("Select a model");
-    expect(getReplyMarkupData(api)).toEqual(["model_0", "model_1"]);
+    expect(api.sendMessage.mock.calls[0]?.[1]).toContain("Showing the current Pi model scope.");
+    expect(getReplyMarkupData(api)).toEqual(["model_0", "model_show_all"]);
+    expect(getReplyMarkupTexts(api)).toEqual([
+      "✅ github-copilot/codex · Codex : high",
+      "Show all models",
+    ]);
+    expect(listModels).toHaveBeenNthCalledWith(1, false);
+    expect(listModels).toHaveBeenNthCalledWith(2, true);
 
-    await bot.handleUpdate(createCallbackUpdate("model_1"));
+    await bot.handleUpdate(createCallbackUpdate("model_show_all"));
+    expect(api.answerCallbackQuery).toHaveBeenCalledWith("cb_1", { text: "Loading all models..." });
+    expect(getEditedReplyMarkupData(api)).toEqual(["model_0", "model_1"]);
+    expect(getEditedReplyMarkupTexts(api)).toEqual([
+      "openai/codex · Codex",
+      "✅ github-copilot/codex · Codex : high",
+    ]);
+
+    await bot.handleUpdate(createCallbackUpdate("model_0"));
     expect(api.answerCallbackQuery).toHaveBeenCalledWith("cb_1", { text: "Switching model..." });
-    expect(pi.service.setModel).toHaveBeenCalledWith("openai", "gpt-4o");
+    expect(pi.service.setModel).toHaveBeenCalledWith("openai", "codex", undefined);
     expect(api.editMessageText).toHaveBeenCalled();
+  });
+
+  it("applies the scoped thinking-level override when selecting a scoped model", async () => {
+    const { bot, pi } = setupBot({
+      piSessionOverrides: {
+        listModels: vi.fn().mockResolvedValue([
+          {
+            provider: "github-copilot",
+            id: "codex",
+            name: "Codex",
+            current: true,
+            thinkingLevel: "high",
+          },
+        ]),
+        setModel: vi.fn().mockResolvedValue("github-copilot/codex"),
+      },
+    });
+
+    await bot.handleUpdate(createTestUpdate({ message: { text: "/model" } }));
+    await bot.handleUpdate(createCallbackUpdate("model_0"));
+
+    expect(pi.service.setModel).toHaveBeenCalledWith("github-copilot", "codex", "high");
+  });
+
+  it("keeps the show-all button while paging through scoped models", async () => {
+    const scopedModels = Array.from({ length: 7 }, (_, index) => ({
+      provider: "github-copilot",
+      id: `codex-${index}`,
+      name: `Codex ${index}`,
+      current: index === 0,
+    }));
+    const allModels = [
+      ...Array.from({ length: 2 }, (_, index) => ({
+        provider: "openai",
+        id: `gpt-${index}`,
+        name: `GPT ${index}`,
+        current: false,
+      })),
+      ...scopedModels,
+    ];
+    const listModels = vi.fn().mockImplementation((showAll?: boolean) =>
+      Promise.resolve(showAll ? allModels : scopedModels),
+    );
+
+    const { bot, api } = setupBot({
+      piSessionOverrides: {
+        listModels,
+      },
+    });
+
+    await bot.handleUpdate(createTestUpdate({ message: { text: "/model" } }));
+    expect(getReplyMarkupData(api)).toEqual([
+      "model_0",
+      "model_1",
+      "model_2",
+      "model_3",
+      "model_4",
+      "model_5",
+      "noop_page",
+      "model_page_1",
+      "model_show_all",
+    ]);
+
+    await bot.handleUpdate(createCallbackUpdate("model_page_1"));
+    expect(getEditedReplyMarkupButtons(api).map((button) => button.callback_data)).toEqual([
+      "model_6",
+      "model_page_0",
+      "noop_page",
+      "model_show_all",
+    ]);
   });
 
   it("paginates model pickers across all available models", async () => {
     const models = generateMockModels(21);
     const { bot, pi, api } = setupBot({
       piSessionOverrides: {
-        listModels: vi.fn().mockResolvedValue(models),
+        listModels: vi.fn().mockImplementation((showAll?: boolean) =>
+          Promise.resolve(showAll ? models : models),
+        ),
       },
     });
 
@@ -1112,7 +1246,7 @@ describe("createBot", () => {
     ]);
 
     await bot.handleUpdate(createCallbackUpdate("model_20"));
-    expect(pi.service.setModel).toHaveBeenCalledWith("provider20", "model-20");
+    expect(pi.service.setModel).toHaveBeenCalledWith("provider20", "model-20", undefined);
   });
 
   it("handles /tree command variants and missing sessions", async () => {
@@ -1591,6 +1725,12 @@ describe("createBot", () => {
 
     api.answerCallbackQuery.mockClear();
     await bot.handleUpdate(createCallbackUpdate("model_page_1"));
+    expect(api.answerCallbackQuery).toHaveBeenCalledWith("cb_1", {
+      text: "Expired, run /model again",
+    });
+
+    api.answerCallbackQuery.mockClear();
+    await bot.handleUpdate(createCallbackUpdate("model_show_all"));
     expect(api.answerCallbackQuery).toHaveBeenCalledWith("cb_1", {
       text: "Expired, run /model again",
     });
