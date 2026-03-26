@@ -1,0 +1,55 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Verify tag matches package.json version
+        run: |
+          node --input-type=module <<'EOF'
+          import { readFileSync } from "node:fs";
+
+          const pkg = JSON.parse(readFileSync("package.json", "utf8"));
+          const tag = process.env.GITHUB_REF_NAME;
+          const expectedTag = `v${pkg.version}`;
+
+          if (tag !== expectedTag) {
+            console.error(`Tag ${tag} does not match package.json version ${pkg.version}. Expected ${expectedTag}.`);
+            process.exit(1);
+          }
+
+          console.log(`Verified release tag ${tag}.`);
+          EOF
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run release CI
+        run: npm run ci:release
+
+      - name: Publish GitHub Release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/*.tar.gz
+            artifacts/*.sha256
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}

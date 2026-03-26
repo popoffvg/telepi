@@ -4,9 +4,13 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "clean": "rm -rf dist artifacts",
     "dev": "tsx src/index.ts",
     "build": "tsc",
+    "build:clean": "npm run clean && npm run build",
     "start": "node dist/index.js",
+    "package:release": "npm run build:clean && node scripts/package-release.mjs",
+    "ci:release": "npm test && npm run package:release",
     "test": "vitest run",
     "test:coverage": "vitest run --coverage"
   },
