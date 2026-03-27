@@ -469,3 +469,25 @@ npm run test:coverage  # Run tests with coverage report
 npm run package:release  # Create artifacts/telepi-vX.Y.Z.tar.gz + checksum
 npm run ci:release     # Test + clean build + package release artifact
 ```
+
+## Release Automation
+
+GitHub Actions publishes npm and creates the GitHub Release automatically on tag pushes matching `v*.*.*`.
+
+Maintainer flow:
+
+```bash
+npm version patch   # or minor / major
+git push origin main --follow-tags
+```
+
+The release workflow then:
+- verifies the pushed tag matches `package.json`
+- runs `npm run ci:release`
+- publishes `@futurelab-studio/telepi` to npm
+- creates a GitHub Release with the packaged tarball and checksum
+
+Notes:
+- prerelease tags like `v0.2.0-beta.1` are published to npm with the `next` dist-tag and marked as GitHub prereleases
+- configure a repository secret named `NPM_TOKEN` with publish rights for `@futurelab-studio/telepi`
+- the npm token must support automated publishing (2FA bypass / automation-capable token)

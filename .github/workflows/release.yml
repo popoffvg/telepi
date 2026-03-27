@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write
 
 jobs:
   release:
@@ -21,6 +22,7 @@ jobs:
         with:
           node-version: 22
           cache: npm
+          registry-url: https://registry.npmjs.org
 
       - name: Verify tag matches package.json version
         run: |
@@ -44,6 +46,22 @@ jobs:
 
       - name: Run release CI
         run: npm run ci:release
+
+      - name: Publish package to npm
+        shell: bash
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [[ -z "${NODE_AUTH_TOKEN}" ]]; then
+            echo "NPM_TOKEN secret is not configured. Add a publish-capable npm token in GitHub repository secrets."
+            exit 1
+          fi
+
+          if [[ "${GITHUB_REF_NAME}" == *-* ]]; then
+            npm publish --access public --tag next --provenance
+          else
+            npm publish --access public --provenance
+          fi
 
       - name: Publish GitHub Release assets
         uses: softprops/action-gh-release@v2
