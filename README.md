@@ -28,7 +28,7 @@ This is the main install path for TelePi.
 
 1. Install TelePi globally:
    ```bash
-   npm install -g @benedict2310/telepi
+   npm install -g @futurelab-studio/telepi
    ```
 2. Run the installer:
    ```bash

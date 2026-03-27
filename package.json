@@ -1,5 +1,5 @@
 {
-  "name": "@benedict2310/telepi",
+  "name": "@futurelab-studio/telepi",
   "version": "0.1.0",
   "description": "Telegram bridge for the Pi coding agent",
   "license": "MIT",
@@ -28,14 +28,15 @@
   "type": "module",
   "main": "./dist/index.js",
   "bin": {
-    "telepi": "./dist/cli.js"
+    "telepi": "dist/cli.js"
   },
   "files": [
     "dist",
     "extensions/telepi-handoff.ts",
     "launchd/com.telepi.plist",
     "README.md",
-    ".env.example"
+    ".env.example",
+    "LICENSE"
   ],
   "scripts": {
     "clean": "rm -rf dist artifacts",
