@@ -5,40 +5,42 @@ import { startBot } from "./index.js";
 const HELP_TEXT = `TelePi CLI
 
 Usage:
-  telepi                Start the bot
-  telepi start          Start the bot
-  telepi setup          Install/update the macOS launchd service and Pi extension
-  telepi status         Show installed-mode status
-  telepi version        Print the TelePi version
-  telepi help           Show this help
+  telepi                              Start the bot
+  telepi start                        Start the bot
+  telepi setup                        Interactive macOS setup (TTY only)
+  telepi setup <bot_token> <userids> <workspace>
+                                      Fast macOS setup without prompts
+  telepi status                       Show installed-mode status
+  telepi version                      Print the TelePi version
+  telepi help                         Show this help
 `;
 
 async function main(): Promise<void> {
   const [command, ...rest] = process.argv.slice(2);
 
-  if (rest.length > 0) {
-    throw new Error(`Unexpected arguments: ${rest.join(" ")}`);
-  }
-
   switch (command) {
     case undefined:
     case "start":
+      ensureNoArguments(command ?? "start", rest);
       await startBot();
       return;
     case "setup":
-      runSetupCommand();
+      await runSetupCommand(rest);
       return;
     case "status":
+      ensureNoArguments(command, rest);
       runStatusCommand();
       return;
     case "version":
     case "--version":
     case "-v":
+      ensureNoArguments("version", rest);
       console.log(resolveTelePiInstallContext(import.meta.url).version);
       return;
     case "help":
     case "--help":
     case "-h":
+      ensureNoArguments("help", rest);
       console.log(HELP_TEXT);
       return;
     default:
@@ -46,11 +48,31 @@ async function main(): Promise<void> {
   }
 }
 
-function runSetupCommand(): void {
-  const result = setupTelePi(import.meta.url);
+function ensureNoArguments(command: string, args: string[]): void {
+  if (args.length > 0) {
+    throw new Error(`Unexpected arguments for ${command}: ${args.join(" ")}`);
+  }
+}
+
+async function runSetupCommand(args: string[]): Promise<void> {
+  if (args.length !== 0 && args.length !== 3) {
+    throw new Error("Usage: telepi setup [<bot_token> <userids> <workspace>]");
+  }
+
+  const [telegramBotToken, telegramAllowedUserIds, workspace] = args;
+  const result = await setupTelePi(import.meta.url, {
+    telegramBotToken,
+    telegramAllowedUserIds,
+    workspace,
+  });
+  const configState = result.configCreated
+    ? "created"
+    : result.configUpdated
+      ? "updated"
+      : "unchanged";
 
   console.log(`TelePi ${result.context.version}`);
-  console.log(`Config: ${result.context.configPath} (${result.configCreated ? "created" : "present"})`);
+  console.log(`Config: ${result.context.configPath} (${configState})`);
   console.log(
     `LaunchAgent: ${result.context.launchAgentPath} (${result.launchAgentUpdated ? "updated" : "unchanged"})`,
   );
@@ -98,7 +120,7 @@ try {
 } catch (error) {
   const message = error instanceof Error ? error.message : String(error);
   console.error(`telepi: ${message}`);
-  if (message.startsWith("Unknown command:") || message.startsWith("Unexpected arguments:")) {
+  if (message.startsWith("Unknown command:") || message.startsWith("Unexpected arguments") || message.startsWith("Usage: telepi setup")) {
     console.error("Run `telepi help` for usage.");
   }
   process.exit(1);

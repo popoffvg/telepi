@@ -166,7 +166,7 @@ function optionalString(value: string | undefined): string | undefined {
   return trimmed ? trimmed : undefined;
 }
 
-function parseAllowedUserIds(raw: string): number[] {
+export function parseAllowedUserIds(raw: string): number[] {
   const ids = raw
     .split(",")
     .map((value) => value.trim())
