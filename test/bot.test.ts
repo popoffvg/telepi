@@ -99,6 +99,7 @@ function makeContextKey(chatId: number | string = ALLOWED_CHAT_ID, messageThread
 
 function createMockPiSession(overrides: Partial<PiSessionService> = {}) {
   let callbacks: PiSessionCallbacks | undefined;
+  let extensionBindings: any;
 
   const defaultInfo: PiSessionInfo = {
     sessionId: "test-id",
@@ -239,7 +240,16 @@ function createMockPiSession(overrides: Partial<PiSessionService> = {}) {
       return { id: "s1", path: reference, cwd: "/workspace/A", matchType: "path" };
     }),
     resolveWorkspaceForSession: vi.fn().mockResolvedValue("/workspace/A"),
+    listSlashCommands: vi.fn().mockResolvedValue([]),
+    bindExtensions: vi.fn().mockImplementation(async (bindings: any) => {
+      extensionBindings = bindings;
+    }),
     prompt: vi.fn().mockResolvedValue(undefined),
+    getSession: vi.fn().mockReturnValue({
+      agent: { waitForIdle: vi.fn().mockResolvedValue(undefined) },
+    }),
+    fork: vi.fn().mockResolvedValue({ cancelled: false }),
+    reload: vi.fn().mockResolvedValue(undefined),
     subscribe: vi.fn().mockImplementation((nextCallbacks: PiSessionCallbacks) => {
       callbacks = nextCallbacks;
       return () => {
@@ -256,6 +266,7 @@ function createMockPiSession(overrides: Partial<PiSessionService> = {}) {
   return {
     service: session as unknown as PiSessionService,
     getCallbacks: () => callbacks,
+    getExtensionBindings: () => extensionBindings,
     emitTextDelta: (delta: string) => callbacks?.onTextDelta(delta),
     emitToolStart: (toolName: string, toolCallId: string) => callbacks?.onToolStart(toolName, toolCallId),
     emitToolUpdate: (toolCallId: string, partialResult: string) =>
@@ -374,9 +385,16 @@ function setupBot(options: SetupOptions = {}) {
       case "sendChatAction":
         await api.sendChatAction(payload.chat_id, payload.action, payload.message_thread_id);
         return { ok: true, result: true };
-      case "setMyCommands":
-        await api.setMyCommands(payload.commands);
+      case "setMyCommands": {
+        const other = payload.scope || payload.language_code
+          ? {
+              scope: payload.scope,
+              language_code: payload.language_code,
+            }
+          : undefined;
+        await api.setMyCommands(payload.commands, other);
         return { ok: true, result: true };
+      }
       case "answerCallbackQuery":
         await api.answerCallbackQuery(payload.callback_query_id, {
           text: payload.text,
@@ -517,6 +535,23 @@ function getEditedReplyMarkupButtons(
 
   const replyMarkupFromMarkup = api.editMessageReplyMarkup.mock.calls[callIndex]?.[2]?.reply_markup;
   return replyMarkupFromMarkup?.inline_keyboard?.flat() ?? [];
+}
+
+function getSetMyCommandsCall(api: ReturnType<typeof setupBot>["api"], callIndex = 0): {
+  commands: Array<{ command: string; description: string }>;
+  scope?: { type: string; chat_id?: number | string };
+  language_code?: string;
+} | undefined {
+  const [commands, other] = api.setMyCommands.mock.calls[callIndex] ?? [];
+  if (!commands) {
+    return undefined;
+  }
+
+  return {
+    commands,
+    scope: other?.scope,
+    language_code: other?.language_code,
+  };
 }
 
 function generateMockSessions(count: number) {
@@ -1480,7 +1515,7 @@ describe("createBot", () => {
     expect(mode.api.editMessageText.mock.calls[0]?.[2]).toContain("Filter: user messages only.");
   });
 
-  it("processes plain text messages, subscribes to Pi events, and ignores slash commands", async () => {
+  it("processes plain text messages and subscribes to Pi events", async () => {
     const { bot, pi, api } = setupBot({
       configOverrides: { toolVerbosity: "all" },
     });
@@ -1505,9 +1540,382 @@ describe("createBot", () => {
     expect(
       api.editMessageText.mock.calls.some((call) => String(call[2]).includes("Hello world")),
     ).toBe(true);
+  });
+
+  it("bridges discovered Pi slash commands into the prompt flow", async () => {
+    const { bot, pi } = setupBot({
+      piSessionOverrides: {
+        listSlashCommands: vi.fn().mockResolvedValue([
+          { name: "compact", description: "Compact context", source: "extension", path: "/ext/compact.ts" },
+        ]),
+      },
+    });
+
+    await bot.handleUpdate(createTestUpdate({ message: { text: "/compact focus recent work" } }));
+
+    expect(pi.service.listSlashCommands).toHaveBeenCalledTimes(1);
+    expect(pi.service.prompt).toHaveBeenCalledWith("/compact focus recent work");
+  });
+
+  it("normalizes bot-addressed Pi slash commands before bridging them", async () => {
+    const { bot, pi } = setupBot({
+      piSessionOverrides: {
+        listSlashCommands: vi.fn().mockResolvedValue([
+          { name: "compact", description: "Compact context", source: "extension", path: "/ext/compact.ts" },
+        ]),
+      },
+    });
+
+    await bot.handleUpdate(createTestUpdate({ message: { text: "/compact@telepi_test_bot focus recent work" } }));
+
+    expect(pi.service.prompt).toHaveBeenCalledWith("/compact focus recent work");
+  });
+
+  it("ignores slash commands addressed to another bot", async () => {
+    const { bot, pi, api } = setupBot({
+      piSessionOverrides: {
+        listSlashCommands: vi.fn().mockResolvedValue([
+          { name: "compact", description: "Compact context", source: "extension", path: "/ext/compact.ts" },
+        ]),
+      },
+    });
+
+    await bot.handleUpdate(createTestUpdate({ message: { text: "/compact@another_bot focus recent work" } }));
+
+    expect(pi.service.prompt).not.toHaveBeenCalled();
+    expect(api.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("does not bridge unknown slash commands and shows a helpful reply", async () => {
+    const { bot, pi, api } = setupBot({
+      piSessionOverrides: {
+        listSlashCommands: vi.fn().mockResolvedValue([]),
+      },
+    });
 
     await bot.handleUpdate(createTestUpdate({ message: { text: "/ignored" } }));
+
+    expect(pi.service.listSlashCommands).toHaveBeenCalledTimes(1);
+    expect(pi.service.prompt).not.toHaveBeenCalled();
+    expect(api.sendMessage.mock.calls.some((call) => String(call[1]).includes("Unknown command"))).toBe(true);
+  });
+
+  it("shows /commands as a paginated picker with TelePi and Pi filters", async () => {
+    const { bot, pi, api } = setupBot({
+      piSessionOverrides: {
+        listSlashCommands: vi.fn().mockResolvedValue([
+          { name: "compact", description: "Compact context", source: "extension", path: "/ext/compact.ts" },
+          { name: "review", description: "Review staged changes", source: "prompt", path: "/prompts/review.md" },
+          { name: "skill:browser-tools", description: "Browser automation", source: "skill", path: "/skills/browser.md" },
+        ]),
+      },
+    });
+
+    await bot.handleUpdate(createTestUpdate({ message: { text: "/commands" } }));
+
+    expect(pi.service.listSlashCommands).toHaveBeenCalledTimes(1);
+    expect(api.sendMessage.mock.calls.some((call) => String(call[1]).includes("Command picker"))).toBe(true);
+    expect(getReplyMarkupData(api)).toContain("cmd_page_1");
+    expect(getReplyMarkupData(api)).toContain("cmd_filter_all");
+    expect(getReplyMarkupData(api)).toContain("cmd_filter_telepi");
+    expect(getReplyMarkupData(api)).toContain("cmd_filter_pi");
+
+    await bot.handleUpdate(createCallbackUpdate("cmd_page_2"));
+
+    expect(String(api.editMessageText.mock.calls[0]?.[2])).toContain("/compact");
+    expect(getEditedReplyMarkupTexts(api, 0)).toContain("🧩 /compact");
+    expect(getEditedReplyMarkupTexts(api, 0)).toContain("📝 /review");
+    expect(getEditedReplyMarkupTexts(api, 0)).toContain("🧰 /skill:browser-tools");
+
+    await bot.handleUpdate(createCallbackUpdate("cmd_filter_pi"));
+
+    expect(String(api.editMessageText.mock.calls[1]?.[2])).toContain("/compact");
+    expect(getEditedReplyMarkupTexts(api, 1)).toContain("🧩 /compact");
+    expect(getEditedReplyMarkupTexts(api, 1)).toContain("📝 /review");
+    expect(getEditedReplyMarkupTexts(api, 1)).toContain("🧰 /skill:browser-tools");
+    expect(getEditedReplyMarkupData(api, 1)).toContain("cmd_filter_all");
+    expect(getEditedReplyMarkupData(api, 1)).toContain("cmd_filter_telepi");
+    expect(getEditedReplyMarkupData(api, 1)).toContain("cmd_filter_pi");
+  });
+
+  it("runs TelePi commands from the /commands picker", async () => {
+    const { bot, api } = setupBot({
+      piSessionOverrides: {
+        listSlashCommands: vi.fn().mockResolvedValue([]),
+      },
+    });
+
+    await bot.handleUpdate(createTestUpdate({ message: { text: "/commands" } }));
+    const helpButton = getReplyMarkupButtons(api).find((button) => button.text.includes("/help"));
+
+    expect(helpButton).toBeDefined();
+
+    await bot.handleUpdate(createCallbackUpdate(helpButton!.callback_data));
+
+    expect(api.sendMessage.mock.calls.some((call) => String(call[1]).includes("Each Telegram chat/topic has its own Pi session and retry history."))).toBe(true);
+  });
+
+  it("runs Pi commands from the /commands picker", async () => {
+    const { bot, pi, api } = setupBot({
+      piSessionOverrides: {
+        listSlashCommands: vi.fn().mockResolvedValue([
+          { name: "compact", description: "Compact context", source: "extension", path: "/ext/compact.ts" },
+        ]),
+      },
+    });
+
+    await bot.handleUpdate(createTestUpdate({ message: { text: "/commands" } }));
+    await bot.handleUpdate(createCallbackUpdate("cmd_page_2"));
+    const compactButton = getEditedReplyMarkupButtons(api, 0).find((button) => button.text.includes("/compact"));
+
+    expect(compactButton).toBeDefined();
+
+    await bot.handleUpdate(createCallbackUpdate(compactButton!.callback_data));
+
+    expect(pi.service.prompt).toHaveBeenCalledWith("/compact");
+  });
+
+  it("keeps the /commands picker active when a Pi command is tapped while busy", async () => {
+    const { bot, pi, api } = setupBot({
+      piSessionOverrides: {
+        isStreaming: vi.fn().mockReturnValueOnce(true).mockReturnValue(false),
+        listSlashCommands: vi.fn().mockResolvedValue([
+          { name: "compact", description: "Compact context", source: "extension", path: "/ext/compact.ts" },
+        ]),
+      },
+    });
+
+    await bot.handleUpdate(createTestUpdate({ message: { text: "/commands" } }));
+    await bot.handleUpdate(createCallbackUpdate("cmd_page_2"));
+    const compactButton = getEditedReplyMarkupButtons(api, 0).find((button) => button.text.includes("/compact"));
+
+    expect(compactButton).toBeDefined();
+
+    await bot.handleUpdate(createCallbackUpdate(compactButton!.callback_data));
+    expect(api.answerCallbackQuery).toHaveBeenCalledWith("cb_1", { text: "Wait for the current prompt to finish" });
+    expect(pi.service.prompt).not.toHaveBeenCalled();
+
+    await bot.handleUpdate(createCallbackUpdate(compactButton!.callback_data));
+    expect(pi.service.prompt).toHaveBeenCalledWith("/compact");
+  });
+
+  it("shows an empty-state Pi filter when no Pi commands are discovered", async () => {
+    const { bot, api } = setupBot({
+      piSessionOverrides: {
+        listSlashCommands: vi.fn().mockResolvedValue([]),
+      },
+    });
+
+    await bot.handleUpdate(createTestUpdate({ message: { text: "/commands" } }));
+    await bot.handleUpdate(createCallbackUpdate("cmd_filter_pi"));
+
+    expect(String(api.editMessageText.mock.calls[0]?.[2])).toContain("No Pi commands found in this session.");
+    expect(getEditedReplyMarkupData(api, 0)).toContain("cmd_filter_all");
+    expect(getEditedReplyMarkupData(api, 0)).toContain("cmd_filter_telepi");
+    expect(getEditedReplyMarkupData(api, 0)).toContain("cmd_filter_pi");
+  });
+
+  it("surfaces /commands discovery failures", async () => {
+    const { bot, api } = setupBot({
+      piSessionOverrides: {
+        listSlashCommands: vi.fn().mockRejectedValue(new Error("extensions unavailable")),
+      },
+    });
+
+    await bot.handleUpdate(createTestUpdate({ message: { text: "/commands" } }));
+
+    expect(api.sendMessage.mock.calls.some((call) => String(call[1]).includes("Failed to load commands"))).toBe(true);
+    expect(api.sendMessage.mock.calls.some((call) => String(call[1]).includes("extensions unavailable"))).toBe(true);
+  });
+
+  it("syncs chat-scoped Telegram commands for registerable Pi slash commands", async () => {
+    const { bot, api } = setupBot({
+      piSessionOverrides: {
+        listSlashCommands: vi.fn().mockResolvedValue([
+          { name: "compact", description: "Compact context", source: "extension", path: "/ext/compact.ts" },
+          { name: "review", description: "Review staged changes", source: "prompt", path: "/prompts/review.md" },
+          { name: "skill:browser-tools", description: "Browser automation", source: "skill", path: "/skills/browser.md" },
+          { name: "switch", description: "Should not override TelePi switch", source: "extension", path: "/ext/switch.ts" },
+        ]),
+      },
+    });
+
+    await bot.handleUpdate(createTestUpdate({ message: { text: "/commands" } }));
+
+    const scoped = getSetMyCommandsCall(api, 0);
+    expect(scoped?.scope).toEqual({ type: "chat", chat_id: ALLOWED_CHAT_ID });
+    expect(scoped?.commands.some((command) => command.command === "compact")).toBe(true);
+    expect(scoped?.commands.some((command) => command.command === "review")).toBe(true);
+    expect(scoped?.commands.some((command) => command.command === "skill:browser-tools")).toBe(false);
+    expect(scoped?.commands.some((command) => command.command === "switch" && command.description.startsWith("Pi:"))).toBe(false);
+  });
+
+  it("avoids redundant scoped Telegram command sync when the command set is unchanged", async () => {
+    const { bot, api } = setupBot({
+      piSessionOverrides: {
+        listSlashCommands: vi.fn().mockResolvedValue([
+          { name: "compact", description: "Compact context", source: "extension", path: "/ext/compact.ts" },
+        ]),
+      },
+    });
+
+    await bot.handleUpdate(createTestUpdate({ message: { text: "/commands" } }));
+    await bot.handleUpdate(createTestUpdate({ message: { text: "/commands" } }));
+
+    expect(api.setMyCommands).toHaveBeenCalledTimes(1);
+  });
+
+  it("replaces chat-scoped Telegram commands when the discovered Pi commands change", async () => {
+    const listSlashCommands = vi.fn()
+      .mockResolvedValueOnce([
+        { name: "compact", description: "Compact context", source: "extension", path: "/ext/compact.ts" },
+      ])
+      .mockResolvedValueOnce([]);
+    const { bot, api } = setupBot({
+      piSessionOverrides: {
+        listSlashCommands,
+      },
+    });
+
+    await bot.handleUpdate(createTestUpdate({ message: { text: "/commands" } }));
+    await bot.handleUpdate(createTestUpdate({ message: { text: "/commands" } }));
+
+    expect(api.setMyCommands).toHaveBeenCalledTimes(2);
+    expect(getSetMyCommandsCall(api, 0)?.commands.some((command) => command.command === "compact")).toBe(true);
+    expect(getSetMyCommandsCall(api, 1)?.commands.some((command) => command.command === "compact")).toBe(false);
+  });
+
+  it("surfaces extension command notifications in Telegram", async () => {
+    const { bot, pi, api } = setupBot({
+      piSessionOverrides: {
+        listSlashCommands: vi.fn().mockResolvedValue([
+          { name: "compact", description: "Compact context", source: "extension", path: "/ext/compact.ts" },
+        ]),
+      },
+    });
+
+    const promptMock = pi.service.prompt as ReturnType<typeof vi.fn>;
+    promptMock.mockImplementation(async () => {
+      pi.getExtensionBindings()?.uiContext?.notify("No conversation to compact", "error");
+    });
+
+    await bot.handleUpdate(createTestUpdate({ message: { text: "/compact" } }));
+    await nextTick();
+
+    expect(pi.service.bindExtensions).toHaveBeenCalledTimes(1);
+    expect(api.sendMessage.mock.calls.some((call) => String(call[1]).includes("No conversation to compact"))).toBe(true);
+  });
+
+  it("surfaces extension command errors in Telegram", async () => {
+    const { bot, pi, api } = setupBot({
+      piSessionOverrides: {
+        listSlashCommands: vi.fn().mockResolvedValue([
+          { name: "compact", description: "Compact context", source: "extension", path: "/ext/compact.ts" },
+        ]),
+      },
+    });
+
+    const promptMock = pi.service.prompt as ReturnType<typeof vi.fn>;
+    promptMock.mockImplementation(async () => {
+      pi.getExtensionBindings()?.onError?.({
+        extensionPath: "command:compact",
+        event: "command",
+        error: "boom",
+      });
+    });
+
+    await bot.handleUpdate(createTestUpdate({ message: { text: "/compact" } }));
+    await nextTick();
+
+    expect(pi.service.bindExtensions).toHaveBeenCalledTimes(1);
+    expect(api.sendMessage.mock.calls.some((call) => String(call[1]).includes("/compact failed"))).toBe(true);
+    expect(api.sendMessage.mock.calls.some((call) => String(call[1]).includes("boom"))).toBe(true);
+  });
+
+  it("supports extension select dialogs through Telegram callbacks", async () => {
+    const { bot, pi, api } = setupBot({
+      piSessionOverrides: {
+        listSlashCommands: vi.fn().mockResolvedValue([
+          { name: "pick", description: "Pick an option", source: "extension", path: "/ext/pick.ts" },
+        ]),
+      },
+    });
+
+    const promptMock = pi.service.prompt as ReturnType<typeof vi.fn>;
+    promptMock.mockImplementation(async () => {
+      const choice = await pi.getExtensionBindings()?.uiContext?.select("Pick one", ["Alpha", "Beta"]);
+      pi.emitTextDelta(`picked ${choice}`);
+      pi.emitAgentEnd();
+    });
+
+    const pending = bot.handleUpdate(createTestUpdate({ message: { text: "/pick" } }));
+    await nextTick();
+
+    expect(api.sendMessage.mock.calls.some((call) => String(call[1]).includes("Pick one"))).toBe(true);
+    const selectCallback = getReplyMarkupData(api, 0).find((data) => /^ui_sel_[a-z0-9]+_1$/.test(data ?? ""));
+    expect(selectCallback).toBeTruthy();
+
+    await bot.handleUpdate(createCallbackUpdate(selectCallback!));
+    await pending;
+
+    expect(api.sendMessage.mock.calls.some((call) => String(call[1]).includes("picked Beta"))).toBe(true);
+  });
+
+  it("supports extension confirm dialogs through Telegram callbacks", async () => {
+    const { bot, pi, api } = setupBot({
+      piSessionOverrides: {
+        listSlashCommands: vi.fn().mockResolvedValue([
+          { name: "confirm", description: "Confirm action", source: "extension", path: "/ext/confirm.ts" },
+        ]),
+      },
+    });
+
+    const promptMock = pi.service.prompt as ReturnType<typeof vi.fn>;
+    promptMock.mockImplementation(async () => {
+      const confirmed = await pi.getExtensionBindings()?.uiContext?.confirm("Confirm deploy", "Ship it?");
+      pi.emitTextDelta(`confirmed ${confirmed}`);
+      pi.emitAgentEnd();
+    });
+
+    const pending = bot.handleUpdate(createTestUpdate({ message: { text: "/confirm" } }));
+    await nextTick();
+
+    expect(api.sendMessage.mock.calls.some((call) => String(call[1]).includes("Confirm deploy"))).toBe(true);
+    const confirmCallback = getReplyMarkupData(api, 0).find((data) => data?.endsWith("_yes"));
+    expect(confirmCallback).toBeTruthy();
+
+    await bot.handleUpdate(createCallbackUpdate(confirmCallback!));
+    await pending;
+
+    expect(api.sendMessage.mock.calls.some((call) => String(call[1]).includes("confirmed true"))).toBe(true);
+  });
+
+  it("supports extension input dialogs through Telegram replies", async () => {
+    const { bot, pi, api } = setupBot({
+      piSessionOverrides: {
+        listSlashCommands: vi.fn().mockResolvedValue([
+          { name: "ask", description: "Ask for input", source: "extension", path: "/ext/ask.ts" },
+        ]),
+      },
+    });
+
+    const promptMock = pi.service.prompt as ReturnType<typeof vi.fn>;
+    promptMock.mockImplementation(async () => {
+      const value = await pi.getExtensionBindings()?.uiContext?.input("Name", "Your name");
+      pi.emitTextDelta(`hello ${value}`);
+      pi.emitAgentEnd();
+    });
+
+    const pending = bot.handleUpdate(createTestUpdate({ message: { text: "/ask" } }));
+    await nextTick();
+
+    expect(api.sendMessage.mock.calls.some((call) => String(call[1]).includes("Name"))).toBe(true);
+
+    await bot.handleUpdate(createTestUpdate({ message: { text: "Bene" } }));
+    await pending;
+
     expect(pi.service.prompt).toHaveBeenCalledTimes(1);
+    expect(api.sendMessage.mock.calls.some((call) => String(call[1]).includes("hello Bene"))).toBe(true);
   });
 
   it("transcribes voice messages and feeds the transcript into the prompt flow", async () => {
@@ -1950,6 +2358,7 @@ describe("createBot", () => {
     expect(api.setMyCommands).toHaveBeenCalledWith([
       { command: "start", description: "Welcome and session info" },
       { command: "help", description: "Show commands and usage tips" },
+      { command: "commands", description: "Browse TelePi and Pi commands" },
       { command: "new", description: "Start a new session" },
       { command: "retry", description: "Retry the last prompt in this chat/topic" },
       { command: "handback", description: "Hand session back to Pi CLI" },
@@ -1960,7 +2369,7 @@ describe("createBot", () => {
       { command: "tree", description: "View and navigate the session tree" },
       { command: "branch", description: "Navigate to a tree entry (/branch <id>)" },
       { command: "label", description: "Label an entry (/label [name] or /label <id> <name>)" },
-    ]);
+    ], undefined);
   });
 
   it("blocks commands when piSession.isStreaming() returns true", async () => {

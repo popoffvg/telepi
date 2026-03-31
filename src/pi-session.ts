@@ -10,6 +10,7 @@ import {
   SettingsManager,
   type AgentSession,
   type SessionEntry,
+  type SlashCommandInfo,
 } from "@mariozechner/pi-coding-agent";
 import type { ThinkingLevel } from "@mariozechner/pi-agent-core";
 import type { Api, Model } from "@mariozechner/pi-ai";
@@ -72,6 +73,7 @@ export interface ResolvedSessionReference {
 interface PiSessionHandle {
   session: AgentSession;
   modelRegistry: ModelRegistry;
+  getSlashCommands: () => SlashCommandInfo[];
   modelFallbackMessage?: string;
   dispose: () => void;
 }
@@ -153,7 +155,7 @@ async function createPiSessionHandle(
     hasExistingSession: options.hasExistingSession,
   });
 
-  const { session, modelFallbackMessage } = await createAgentSession({
+  const { session, extensionsResult, modelFallbackMessage } = await createAgentSession({
     cwd: workspace,
     authStorage,
     modelRegistry,
@@ -169,6 +171,7 @@ async function createPiSessionHandle(
   return {
     session,
     modelRegistry,
+    getSlashCommands: () => extensionsResult.runtime.getCommands?.() ?? [],
     modelFallbackMessage,
     dispose: () => session.dispose(),
   };
@@ -271,6 +274,28 @@ export class PiSessionService {
 
   async prompt(text: string): Promise<void> {
     await promptSession(this.getSession(), text);
+  }
+
+  async bindExtensions(bindings: Parameters<AgentSession["bindExtensions"]>[0]): Promise<void> {
+    await this.getSession().bindExtensions(bindings);
+  }
+
+  async listSlashCommands(): Promise<SlashCommandInfo[]> {
+    const commands = this.getHandle().getSlashCommands();
+    const deduped = new Map<string, SlashCommandInfo>();
+
+    for (const command of commands) {
+      const name = command.name.replace(/^\/+/, "").trim();
+      if (!name || deduped.has(name)) {
+        continue;
+      }
+      deduped.set(name, {
+        ...command,
+        name,
+      });
+    }
+
+    return [...deduped.values()].sort((left, right) => left.name.localeCompare(right.name));
   }
 
   async abort(): Promise<void> {
@@ -554,9 +579,18 @@ export class PiSessionService {
 
   async navigateTree(
     targetId: string,
-    options?: { summarize?: boolean },
+    options?: { summarize?: boolean; customInstructions?: string; replaceInstructions?: boolean; label?: string },
   ): Promise<{ editorText?: string; cancelled: boolean }> {
     return this.getSession().navigateTree(targetId, options);
+  }
+
+  async fork(entryId: string): Promise<{ cancelled: boolean }> {
+    const result = await this.getSession().fork(entryId);
+    return { cancelled: result.cancelled };
+  }
+
+  async reload(): Promise<void> {
+    await this.getSession().reload();
   }
 
   setLabel(targetId: string, label: string): void {

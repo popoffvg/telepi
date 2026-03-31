@@ -24,6 +24,9 @@ describe("handoff extension helpers", () => {
       ...originalEnv,
       HOME: homeDir,
     };
+    delete process.env.TELEPI_HANDOFF_MODE;
+    delete process.env.TELEPI_DIR;
+    delete process.env.TELEPI_LAUNCHD_LABEL;
     Object.defineProperty(process, "platform", { value: "darwin", configurable: true });
   });
 

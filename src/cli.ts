@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+import { fileURLToPath, pathToFileURL } from "node:url";
+
 import { getTelePiStatus, resolveTelePiInstallContext, setupTelePi } from "./install.js";
 import { startBot } from "./index.js";
 
@@ -15,8 +17,8 @@ Usage:
   telepi help                         Show this help
 `;
 
-async function main(): Promise<void> {
-  const [command, ...rest] = process.argv.slice(2);
+export async function main(argv: string[] = process.argv.slice(2)): Promise<void> {
+  const [command, ...rest] = argv;
 
   switch (command) {
     case undefined:
@@ -48,13 +50,13 @@ async function main(): Promise<void> {
   }
 }
 
-function ensureNoArguments(command: string, args: string[]): void {
+export function ensureNoArguments(command: string, args: string[]): void {
   if (args.length > 0) {
     throw new Error(`Unexpected arguments for ${command}: ${args.join(" ")}`);
   }
 }
 
-async function runSetupCommand(args: string[]): Promise<void> {
+export async function runSetupCommand(args: string[]): Promise<void> {
   if (args.length !== 0 && args.length !== 3) {
     throw new Error("Usage: telepi setup [<bot_token> <userids> <workspace>]");
   }
@@ -88,7 +90,7 @@ async function runSetupCommand(args: string[]): Promise<void> {
   }
 }
 
-function runStatusCommand(): void {
+export function runStatusCommand(): void {
   const status = getTelePiStatus(import.meta.url);
   const configSourceLabels: Record<typeof status.configSource, string> = {
     "launchd-env": "launchd TELEPI_CONFIG",
@@ -115,13 +117,23 @@ function runStatusCommand(): void {
   console.log(`Extension: ${extensionSummary}`);
 }
 
-try {
-  await main();
-} catch (error) {
-  const message = error instanceof Error ? error.message : String(error);
-  console.error(`telepi: ${message}`);
-  if (message.startsWith("Unknown command:") || message.startsWith("Unexpected arguments") || message.startsWith("Usage: telepi setup")) {
-    console.error("Run `telepi help` for usage.");
+async function runCli(): Promise<void> {
+  try {
+    await main();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`telepi: ${message}`);
+    if (message.startsWith("Unknown command:") || message.startsWith("Unexpected arguments") || message.startsWith("Usage: telepi setup")) {
+      console.error("Run `telepi help` for usage.");
+    }
+    process.exit(1);
   }
-  process.exit(1);
+}
+
+const invokedAsScript = process.argv[1]
+  ? pathToFileURL(fileURLToPath(pathToFileURL(process.argv[1]).href)).href === import.meta.url
+  : false;
+
+if (invokedAsScript) {
+  await runCli();
 }

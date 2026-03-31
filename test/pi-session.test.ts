@@ -16,6 +16,10 @@ const mockState = vi.hoisted(() => {
   const createdSessions: Array<{ session: any; options: any }> = [];
   const modelRegistryInstances: any[] = [];
   const sessionSubscribers = new WeakMap<object, (event: any) => void>();
+  let slashCommands = [
+    { name: "deploy", description: "Deploy app", source: "extension", path: "/ext/deploy.ts" },
+    { name: "review", description: "Review staged changes", source: "prompt", path: "/prompts/review.md" },
+  ];
 
   const defaultSessions = () => [
     {
@@ -61,8 +65,11 @@ const mockState = vi.hoisted(() => {
         setTools: vi.fn(),
       },
       prompt: vi.fn().mockResolvedValue(undefined),
+      bindExtensions: vi.fn().mockResolvedValue(undefined),
       abort: vi.fn().mockResolvedValue(undefined),
       newSession: vi.fn().mockResolvedValue(true),
+      fork: vi.fn().mockResolvedValue({ cancelled: false, selectedText: "" }),
+      reload: vi.fn().mockResolvedValue(undefined),
       navigateTree: vi.fn().mockResolvedValue({ cancelled: false }),
       sessionManager: {
         getTree: vi.fn().mockReturnValue([]),
@@ -109,6 +116,11 @@ const mockState = vi.hoisted(() => {
       scopedModels: options.scopedModels,
       sessionFile: options.sessionManager?.sessionPath,
     }),
+    extensionsResult: {
+      runtime: {
+        getCommands: vi.fn().mockImplementation(() => slashCommands),
+      },
+    },
     modelFallbackMessage: options.model ? undefined : "fallback-model",
   }));
 
@@ -179,6 +191,13 @@ const mockState = vi.hoisted(() => {
       SessionManager.listAll.mockReset();
       SessionManager.listAll.mockResolvedValue(defaultSessions());
       SettingsManager.create.mockClear();
+      slashCommands = [
+        { name: "deploy", description: "Deploy app", source: "extension", path: "/ext/deploy.ts" },
+        { name: "review", description: "Review staged changes", source: "prompt", path: "/prompts/review.md" },
+      ];
+    },
+    setSlashCommands: (commands: Array<{ name: string; description?: string; source: string; path?: string }>) => {
+      slashCommands = commands;
     },
   };
 });
@@ -234,6 +253,53 @@ describe("PiSessionService", () => {
       modelFallbackMessage: "fallback-model",
       model: "anthropic/claude-sonnet-4-5",
     });
+  });
+
+  it("binds extension hooks through the underlying session", async () => {
+    const service = await PiSessionService.create(createConfig());
+    const currentSession = mockState.createdSessions[0]?.session;
+    const bindings = {
+      onError: vi.fn(),
+      uiContext: { notify: vi.fn() },
+    } as any;
+
+    await service.bindExtensions(bindings);
+
+    expect(currentSession.bindExtensions).toHaveBeenCalledWith(bindings);
+  });
+
+  it("lists discovered slash commands from the Pi session runtime", async () => {
+    mockState.setSlashCommands([
+      { name: "skill:browser-tools", description: "Browser automation", source: "skill", path: "/skills/browser.md" },
+      { name: "/review", description: "Review staged changes", source: "prompt", path: "/prompts/review.md" },
+      { name: "deploy", description: "Deploy app", source: "extension", path: "/ext/deploy.ts" },
+      { name: "deploy", description: "Duplicate deploy", source: "extension", path: "/ext/deploy-2.ts" },
+    ]);
+
+    const service = await PiSessionService.create(createConfig());
+
+    await expect(service.listSlashCommands()).resolves.toEqual([
+      { name: "deploy", description: "Deploy app", source: "extension", path: "/ext/deploy.ts" },
+      { name: "review", description: "Review staged changes", source: "prompt", path: "/prompts/review.md" },
+      { name: "skill:browser-tools", description: "Browser automation", source: "skill", path: "/skills/browser.md" },
+    ]);
+  });
+
+  it("returns an empty slash-command list when runtime discovery is unavailable", async () => {
+    const originalImpl = mockState.createAgentSession.getMockImplementation();
+    mockState.createAgentSession.mockImplementationOnce(async (options: any) => {
+      const result = await (originalImpl as any)(options);
+      return {
+        ...result,
+        extensionsResult: {
+          runtime: {},
+        },
+      };
+    });
+
+    const service = await PiSessionService.create(createConfig());
+
+    await expect(service.listSlashCommands()).resolves.toEqual([]);
   });
 
   it("resolves PI_MODEL overrides during creation", async () => {
@@ -988,6 +1054,12 @@ describe("PiSessionService", () => {
       cancelled: false,
     });
     expect(currentSession.navigateTree).toHaveBeenCalledWith("known-id", { summarize: true });
+
+    await expect(service.fork("known-id")).resolves.toEqual({ cancelled: false });
+    expect(currentSession.fork).toHaveBeenCalledWith("known-id");
+
+    await expect(service.reload()).resolves.toBeUndefined();
+    expect(currentSession.reload).toHaveBeenCalledTimes(1);
 
     service.setLabel("known-id", "saved");
     expect(currentSession.sessionManager.appendLabelChange).toHaveBeenCalledWith("known-id", "saved");

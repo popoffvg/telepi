@@ -5,6 +5,7 @@ import path from "node:path";
 
 import { InlineKeyboard, Bot, type Context } from "grammy";
 import { autoRetry } from "@grammyjs/auto-retry";
+import type { SlashCommandInfo } from "@mariozechner/pi-coding-agent";
 
 import type { TelePiConfig, ToolVerbosity } from "./config.js";
 import { toFriendlyError, formatError } from "./errors.js";
@@ -24,6 +25,7 @@ import {
   truncateText,
   type TreeFilterMode,
 } from "./tree.js";
+import { createTelegramUIContext } from "./telegram-ui-context.js";
 import { getVoiceBackendStatus, transcribeAudio } from "./voice.js";
 
 const TELEGRAM_MESSAGE_LIMIT = 4000;
@@ -34,6 +36,28 @@ const STREAMING_PREVIEW_LIMIT = 3800;
 const FORMATTED_CHUNK_TARGET = 3000;
 const KEYBOARD_PAGE_SIZE = 6;
 const NOOP_PAGE_CALLBACK_DATA = "noop_page";
+const EXTENSION_UI_TIMEOUT_MS = 60_000;
+
+const TELEPI_BOT_COMMANDS = [
+  { command: "start", description: "Welcome and session info" },
+  { command: "help", description: "Show commands and usage tips" },
+  { command: "commands", description: "Browse TelePi and Pi commands" },
+  { command: "new", description: "Start a new session" },
+  { command: "retry", description: "Retry the last prompt in this chat/topic" },
+  { command: "handback", description: "Hand session back to Pi CLI" },
+  { command: "abort", description: "Cancel current operation" },
+  { command: "session", description: "Current session details" },
+  { command: "sessions", description: "List and switch sessions (or /sessions <path|id>)" },
+  { command: "model", description: "Switch AI model" },
+  { command: "tree", description: "View and navigate the session tree" },
+  { command: "branch", description: "Navigate to a tree entry (/branch <id>)" },
+  { command: "label", description: "Label an entry (/label [name] or /label <id> <name>)" },
+] as const;
+
+const TELEPI_LOCAL_COMMAND_NAMES = new Set<string>([
+  ...TELEPI_BOT_COMMANDS.map((command) => command.command),
+  "switch",
+]);
 
 type TelegramChatId = number | string;
 type TelegramParseMode = "HTML";
@@ -70,6 +94,202 @@ type RenderedText = {
 type RenderedChunk = RenderedText & {
   sourceText: string;
 };
+
+type NormalizedSlashCommand = {
+  name: string;
+  text: string;
+};
+
+type CommandPickerFilter = "all" | "telepi" | "pi";
+
+type CommandPickerEntry =
+  | {
+      id: number;
+      kind: "telepi";
+      command: string;
+      description: string;
+      label: string;
+      commandText: string;
+    }
+  | {
+      id: number;
+      kind: "pi";
+      name: string;
+      description: string;
+      label: string;
+      commandText: string;
+      source: string;
+    };
+
+type PendingCommandPicker = {
+  messageId: number;
+  entries: CommandPickerEntry[];
+  filter: CommandPickerFilter;
+  page: number;
+};
+
+type PendingExtensionDialog =
+  | {
+      kind: "select";
+      dialogId: string;
+      messageId: number;
+      title: string;
+      options: string[];
+      resolve: (value: string | undefined) => void;
+      timeoutId?: NodeJS.Timeout;
+      abortCleanup?: () => void;
+    }
+  | {
+      kind: "confirm";
+      dialogId: string;
+      messageId: number;
+      title: string;
+      message: string;
+      resolve: (value: boolean) => void;
+      timeoutId?: NodeJS.Timeout;
+      abortCleanup?: () => void;
+    }
+  | {
+      kind: "input";
+      dialogId: string;
+      messageId: number;
+      title: string;
+      placeholder?: string;
+      resolve: (value: string | undefined) => void;
+      timeoutId?: NodeJS.Timeout;
+      abortCleanup?: () => void;
+    };
+
+function normalizeSlashCommand(text: string, botUsername?: string): NormalizedSlashCommand | undefined {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith("/")) {
+    return undefined;
+  }
+
+  const spaceIndex = trimmed.indexOf(" ");
+  const rawCommand = (spaceIndex === -1 ? trimmed : trimmed.slice(0, spaceIndex)).slice(1);
+  const args = spaceIndex === -1 ? "" : trimmed.slice(spaceIndex + 1).trim();
+  const atIndex = rawCommand.indexOf("@");
+  const rawName = atIndex === -1 ? rawCommand : rawCommand.slice(0, atIndex);
+  const addressedBot = atIndex === -1 ? undefined : rawCommand.slice(atIndex + 1);
+
+  if (!rawName) {
+    return undefined;
+  }
+
+  if (addressedBot && botUsername && addressedBot.toLowerCase() !== botUsername.toLowerCase()) {
+    return undefined;
+  }
+
+  return {
+    name: rawName,
+    text: args ? `/${rawName} ${args}` : `/${rawName}`,
+  };
+}
+
+function getPiSlashCommandLabel(command: SlashCommandInfo): string {
+  switch (command.source) {
+    case "prompt":
+      return `📝 /${command.name}`;
+    case "skill":
+      return `🧰 /${command.name}`;
+    case "extension":
+      return `🧩 /${command.name}`;
+    default:
+      return `⚡ /${command.name}`;
+  }
+}
+
+function getCommandPickerFilterName(filter: CommandPickerFilter): string {
+  switch (filter) {
+    case "telepi":
+      return "TelePi";
+    case "pi":
+      return "Pi";
+    case "all":
+    default:
+      return "All";
+  }
+}
+
+function getCommandPickerCounts(entries: CommandPickerEntry[]): Record<CommandPickerFilter, number> {
+  return {
+    all: entries.length,
+    telepi: entries.filter((entry) => entry.kind === "telepi").length,
+    pi: entries.filter((entry) => entry.kind === "pi").length,
+  };
+}
+
+function filterCommandPickerEntries(
+  entries: CommandPickerEntry[],
+  filter: CommandPickerFilter,
+): CommandPickerEntry[] {
+  if (filter === "all") {
+    return entries;
+  }
+
+  return entries.filter((entry) => entry.kind === filter);
+}
+
+function buildCommandPickerEntries(slashCommands: SlashCommandInfo[]): CommandPickerEntry[] {
+  const telepiEntries = TELEPI_BOT_COMMANDS
+    .filter((command) => command.command !== "commands")
+    .map((command, index) => ({
+      id: index,
+      kind: "telepi" as const,
+      command: command.command,
+      description: command.description,
+      label: `📱 /${command.command}`,
+      commandText: `/${command.command}`,
+    }));
+
+  const piEntries = slashCommands.map((command, index) => ({
+    id: telepiEntries.length + index,
+    kind: "pi" as const,
+    name: command.name,
+    description: command.description ?? command.source,
+    label: getPiSlashCommandLabel(command),
+    commandText: `/${command.name}`,
+    source: command.source,
+  }));
+
+  return [...telepiEntries, ...piEntries];
+}
+
+function isTelegramNativeCommandName(name: string): boolean {
+  return /^[a-z0-9_]{1,32}$/.test(name);
+}
+
+function buildChatScopedCommands(slashCommands: SlashCommandInfo[]): Array<{ command: string; description: string }> {
+  const commands: Array<{ command: string; description: string }> = TELEPI_BOT_COMMANDS.map((command) => ({
+    command: command.command,
+    description: command.description,
+  }));
+  const seen = new Set(TELEPI_LOCAL_COMMAND_NAMES);
+
+  for (const slashCommand of slashCommands) {
+    const name = slashCommand.name.replace(/^\/+/, "").trim().toLowerCase();
+    if (!isTelegramNativeCommandName(name) || seen.has(name)) {
+      continue;
+    }
+
+    seen.add(name);
+    commands.push({
+      command: name,
+      description: trimLine(`Pi: ${slashCommand.description ?? slashCommand.source}`, 256),
+    });
+  }
+
+  if (commands.length > 100) {
+    console.warn(`Telegram supports at most 100 commands per scope; truncating ${commands.length} commands to 100.`);
+  }
+
+  return commands.slice(0, 100);
+}
+
+function buildChatScopedCommandSignature(commands: Array<{ command: string; description: string }>): string {
+  return JSON.stringify(commands);
+}
 
 function paginateKeyboard(items: KeyboardItem[], page: number, prefix: string): PaginatedKeyboard {
   const totalPages = Math.max(1, Math.ceil(items.length / KEYBOARD_PAGE_SIZE));
@@ -149,7 +369,11 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
   const pendingTreeButtons = new Map<ContextKey, KeyboardItem[]>();
   const pendingTreeFilterButtons = new Map<ContextKey, KeyboardItem[]>();
   const pendingBranchButtons = new Map<ContextKey, KeyboardItem[]>();
+  const pendingCommandPickers = new Map<ContextKey, PendingCommandPicker>();
+  const pendingExtensionDialogs = new Map<ContextKey, PendingExtensionDialog>();
   const lastPromptStates = new Map<ContextKey, LastPromptState>();
+  const chatScopedCommandSignatures = new Map<TelegramChatId, string>();
+  let extensionDialogCounter = 0;
 
   const getContextKey = (target: PiSessionContext): ContextKey => getPiSessionContextKey(target);
   const getExistingSession = (target: PiSessionContext): PiSessionService | undefined => sessionRegistry.get(target);
@@ -164,6 +388,40 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
   ): InlineKeyboard => {
     const { keyboard } = paginateKeyboard(items, page, prefix);
     return appendKeyboardItems(keyboard, extraItems);
+  };
+
+  const syncChatScopedCommands = async (
+    target: PiSessionContext,
+    slashCommands: SlashCommandInfo[],
+  ): Promise<void> => {
+    const commands = buildChatScopedCommands(slashCommands);
+    const signature = buildChatScopedCommandSignature(commands);
+    const previousSignature = chatScopedCommandSignatures.get(target.chatId);
+    if (signature === previousSignature) {
+      return;
+    }
+
+    // Telegram command scopes are chat-scoped, not topic-scoped, so messageThreadId
+    // is intentionally ignored here. In forum chats, the most recently synced topic wins.
+    await bot.api.setMyCommands(commands, {
+      scope: {
+        type: "chat",
+        chat_id: target.chatId,
+      },
+    });
+    chatScopedCommandSignatures.set(target.chatId, signature);
+  };
+
+  const refreshChatScopedCommands = async (
+    target: PiSessionContext,
+    piSession: PiSessionService,
+  ): Promise<void> => {
+    try {
+      const slashCommands = await piSession.listSlashCommands();
+      await syncChatScopedCommands(target, slashCommands);
+    } catch (error) {
+      console.error("Failed to sync chat-scoped Telegram commands", error);
+    }
   };
 
   const setPendingTreeKeyboard = (contextKey: ContextKey, buttons: KeyboardItem[]): InlineKeyboard => {
@@ -190,10 +448,83 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
     pendingTreeButtons.delete(contextKey);
     pendingTreeFilterButtons.delete(contextKey);
     pendingBranchButtons.delete(contextKey);
+    pendingCommandPickers.delete(contextKey);
   };
 
   const clearContextPromptMemory = (contextKey: ContextKey): void => {
     lastPromptStates.delete(contextKey);
+  };
+
+  const clearPendingExtensionDialog = (contextKey: ContextKey): PendingExtensionDialog | undefined => {
+    const pendingDialog = pendingExtensionDialogs.get(contextKey);
+    if (!pendingDialog) {
+      return undefined;
+    }
+
+    pendingExtensionDialogs.delete(contextKey);
+    if (pendingDialog.timeoutId) {
+      clearTimeout(pendingDialog.timeoutId);
+    }
+    pendingDialog.abortCleanup?.();
+    return pendingDialog;
+  };
+
+  const resolvePendingExtensionDialogCancelled = (pendingDialog: PendingExtensionDialog): void => {
+    switch (pendingDialog.kind) {
+      case "confirm":
+        pendingDialog.resolve(false);
+        return;
+      case "select":
+      case "input":
+        pendingDialog.resolve(undefined);
+        return;
+    }
+  };
+
+  const finalizePendingExtensionDialog = async (
+    target: PiSessionContext,
+    pendingDialog: PendingExtensionDialog | undefined,
+    html: string,
+    fallbackText: string,
+  ): Promise<void> => {
+    if (!pendingDialog) {
+      return;
+    }
+
+    await safeEditMessage(bot, target, pendingDialog.messageId, html, {
+      fallbackText,
+      replyMarkup: undefined,
+    });
+  };
+
+  const nextExtensionDialogId = (): string => {
+    extensionDialogCounter += 1;
+    return extensionDialogCounter.toString(36);
+  };
+
+  const createDialogTimeout = (
+    contextKey: ContextKey,
+    target: PiSessionContext,
+    pendingDialog: PendingExtensionDialog,
+    onTimeout: () => void,
+    timeoutMs?: number,
+  ): NodeJS.Timeout | undefined => {
+    const delay = timeoutMs ?? EXTENSION_UI_TIMEOUT_MS;
+    return setTimeout(() => {
+      if (pendingExtensionDialogs.get(contextKey)?.dialogId !== pendingDialog.dialogId) {
+        return;
+      }
+      clearPendingExtensionDialog(contextKey);
+      void finalizePendingExtensionDialog(
+        target,
+        pendingDialog,
+        escapeHTML("Dialog timed out."),
+        "Dialog timed out.",
+      ).catch((error) => {
+        console.error("Failed to finalize timed-out extension dialog", error);
+      });
+      onTimeout();
+    }, delay);
   };
 
   const isBusy = (target: PiSessionContext): boolean => {
@@ -208,9 +539,16 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
   };
 
   const sendBusyReply = async (ctx: Context): Promise<void> => {
-    await safeReply(ctx, escapeHTML("Still working on previous message..."), {
-      fallbackText: "Still working on previous message...",
-    });
+    const target = getTelegramTarget(ctx);
+    const pendingDialog = target ? pendingExtensionDialogs.get(getContextKey(target)) : undefined;
+    const message = pendingDialog?.kind === "input"
+      ? "Please answer the pending prompt above or use /abort."
+      : pendingDialog
+        ? "Please answer the pending dialog above."
+        : "Still working on previous message...";
+    await safeReply(ctx, escapeHTML(message), {
+      fallbackText: message,
+    }, target);
   };
 
   const collectLabelsMap = (piSession: PiSessionService): Map<string, string> => {
@@ -229,6 +567,142 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
     }
 
     return labels;
+  };
+
+  const openSelectDialog = async (
+    target: PiSessionContext,
+    title: string,
+    options: string[],
+    dialogOptions?: { signal?: AbortSignal; timeout?: number },
+  ): Promise<string | undefined> => {
+    const contextKey = getContextKey(target);
+    if (pendingExtensionDialogs.has(contextKey)) {
+      throw new Error("TelePi already has a pending extension dialog for this chat/topic.");
+    }
+
+    const dialogId = nextExtensionDialogId();
+    const keyboard = new InlineKeyboard();
+    for (const [index, option] of options.entries()) {
+      keyboard.text(trimLine(option, 48), `ui_sel_${dialogId}_${index}`).row();
+    }
+    keyboard.text("Cancel", `ui_x_${dialogId}`).row();
+
+    const message = await sendTextMessage(bot.api, target, `<b>${escapeHTML(title)}</b>`, {
+      parseMode: "HTML",
+      fallbackText: title,
+      replyMarkup: keyboard,
+    });
+
+    return await new Promise<string | undefined>((resolve) => {
+      const pendingDialog: PendingExtensionDialog = {
+        kind: "select",
+        dialogId,
+        messageId: message.message_id,
+        title,
+        options,
+        resolve,
+      };
+      if (dialogOptions?.signal) {
+        const onAbort = () => {
+          clearPendingExtensionDialog(contextKey);
+          void finalizePendingExtensionDialog(target, pendingDialog, escapeHTML("Dialog cancelled."), "Dialog cancelled.");
+          resolve(undefined);
+        };
+        dialogOptions.signal.addEventListener("abort", onAbort, { once: true });
+        pendingDialog.abortCleanup = () => dialogOptions.signal?.removeEventListener("abort", onAbort);
+      }
+      pendingDialog.timeoutId = createDialogTimeout(contextKey, target, pendingDialog, () => resolve(undefined), dialogOptions?.timeout);
+      pendingExtensionDialogs.set(contextKey, pendingDialog);
+    });
+  };
+
+  const openConfirmDialog = async (
+    target: PiSessionContext,
+    title: string,
+    message: string,
+    dialogOptions?: { signal?: AbortSignal; timeout?: number },
+  ): Promise<boolean> => {
+    const contextKey = getContextKey(target);
+    if (pendingExtensionDialogs.has(contextKey)) {
+      throw new Error("TelePi already has a pending extension dialog for this chat/topic.");
+    }
+
+    const dialogId = nextExtensionDialogId();
+    const telegramMessage = await sendTextMessage(bot.api, target, `<b>${escapeHTML(title)}</b>\n${escapeHTML(message)}`, {
+      parseMode: "HTML",
+      fallbackText: `${title}\n${message}`,
+      replyMarkup: new InlineKeyboard()
+        .text("Yes", `ui_cfm_${dialogId}_yes`)
+        .text("No", `ui_cfm_${dialogId}_no`)
+        .row(),
+    });
+
+    return await new Promise<boolean>((resolve) => {
+      const pendingDialog: PendingExtensionDialog = {
+        kind: "confirm",
+        dialogId,
+        messageId: telegramMessage.message_id,
+        title,
+        message,
+        resolve,
+      };
+      if (dialogOptions?.signal) {
+        const onAbort = () => {
+          clearPendingExtensionDialog(contextKey);
+          void finalizePendingExtensionDialog(target, pendingDialog, escapeHTML("Dialog cancelled."), "Dialog cancelled.");
+          resolve(false);
+        };
+        dialogOptions.signal.addEventListener("abort", onAbort, { once: true });
+        pendingDialog.abortCleanup = () => dialogOptions.signal?.removeEventListener("abort", onAbort);
+      }
+      pendingDialog.timeoutId = createDialogTimeout(contextKey, target, pendingDialog, () => resolve(false), dialogOptions?.timeout);
+      pendingExtensionDialogs.set(contextKey, pendingDialog);
+    });
+  };
+
+  const openInputDialog = async (
+    target: PiSessionContext,
+    title: string,
+    placeholder?: string,
+    dialogOptions?: { signal?: AbortSignal; timeout?: number },
+  ): Promise<string | undefined> => {
+    const contextKey = getContextKey(target);
+    if (pendingExtensionDialogs.has(contextKey)) {
+      throw new Error("TelePi already has a pending extension dialog for this chat/topic.");
+    }
+
+    const dialogId = nextExtensionDialogId();
+    const fallbackText = placeholder ? `${title}\n${placeholder}` : title;
+    const telegramMessage = await sendTextMessage(bot.api, target, [
+      `<b>${escapeHTML(title)}</b>`,
+      placeholder ? `<i>${escapeHTML(placeholder)}</i>` : undefined,
+    ].filter((line): line is string => Boolean(line)).join("\n"), {
+      parseMode: "HTML",
+      fallbackText,
+      replyMarkup: new InlineKeyboard().text("Cancel", `ui_x_${dialogId}`).row(),
+    });
+
+    return await new Promise<string | undefined>((resolve) => {
+      const pendingDialog: PendingExtensionDialog = {
+        kind: "input",
+        dialogId,
+        messageId: telegramMessage.message_id,
+        title,
+        placeholder,
+        resolve,
+      };
+      if (dialogOptions?.signal) {
+        const onAbort = () => {
+          clearPendingExtensionDialog(contextKey);
+          void finalizePendingExtensionDialog(target, pendingDialog, escapeHTML("Input cancelled."), "Input cancelled.");
+          resolve(undefined);
+        };
+        dialogOptions.signal.addEventListener("abort", onAbort, { once: true });
+        pendingDialog.abortCleanup = () => dialogOptions.signal?.removeEventListener("abort", onAbort);
+      }
+      pendingDialog.timeoutId = createDialogTimeout(contextKey, target, pendingDialog, () => resolve(undefined), dialogOptions?.timeout);
+      pendingExtensionDialogs.set(contextKey, pendingDialog);
+    });
   };
 
   const ensureActiveSession = async (ctx: Context, target: PiSessionContext): Promise<PiSessionService | undefined> => {
@@ -307,6 +781,7 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
     ctx: Context,
     target: PiSessionContext,
     userText: string,
+    preloadedSlashCommands?: SlashCommandInfo[],
   ): Promise<void> => {
     const contextKey = getContextKey(target);
     if (isBusy(target)) {
@@ -321,6 +796,14 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
       const piSession = await ensureActiveSession(ctx, target);
       if (!piSession) {
         return;
+      }
+
+      if (preloadedSlashCommands) {
+        void syncChatScopedCommands(target, preloadedSlashCommands).catch((error) => {
+          console.error("Failed to sync chat-scoped Telegram commands", error);
+        });
+      } else {
+        void refreshChatScopedCommands(target, piSession);
       }
 
       const abortKeyboard = new InlineKeyboard().text("⏹ Abort", "pi_abort");
@@ -533,6 +1016,53 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
         await deliverRenderedChunks(splitMarkdownForTelegram(finalText));
       };
 
+      await piSession.bindExtensions({
+        commandContextActions: {
+          waitForIdle: async () => {
+            await piSession.getSession().agent.waitForIdle();
+          },
+          newSession: async () => {
+            const result = await piSession.newSession();
+            return { cancelled: !result.created };
+          },
+          fork: async (entryId) => piSession.fork(entryId),
+          navigateTree: async (targetId, options) => {
+            const result = await piSession.navigateTree(targetId, options);
+            return { cancelled: result.cancelled };
+          },
+          switchSession: async (sessionPath) => {
+            await piSession.switchSession(sessionPath);
+            return { cancelled: false };
+          },
+          reload: async () => {
+            await piSession.reload();
+          },
+        },
+        uiContext: createTelegramUIContext({
+          notify: (message, type) => {
+            const rendered = renderExtensionNotice(message, type);
+            void sendTextMessage(bot.api, target, rendered.text, {
+              parseMode: rendered.parseMode,
+              fallbackText: rendered.fallbackText,
+            }).catch((error) => {
+              console.error("Failed to send extension notification", error);
+            });
+          },
+          select: (title, options, dialogOptions) => openSelectDialog(target, title, options, dialogOptions),
+          confirm: (title, message, dialogOptions) => openConfirmDialog(target, title, message, dialogOptions),
+          input: (title, placeholder, dialogOptions) => openInputDialog(target, title, placeholder, dialogOptions),
+        }),
+        onError: (error) => {
+          const rendered = renderExtensionError(error.extensionPath, error.event, error.error);
+          void sendTextMessage(bot.api, target, rendered.text, {
+            parseMode: rendered.parseMode,
+            fallbackText: rendered.fallbackText,
+          }).catch((sendError) => {
+            console.error("Failed to send extension error", sendError);
+          });
+        },
+      });
+
       const unsubscribe = piSession.subscribe({
         onTextDelta: (delta) => {
           accumulatedText += delta;
@@ -679,13 +1209,172 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
     }
   };
 
-  bot.command("start", async (ctx) => {
-    const target = getTelegramTarget(ctx);
-    if (!target) {
+  const renderCommandPickerState = (picker: PendingCommandPicker): RenderedText & {
+    replyMarkup: InlineKeyboard;
+    page: number;
+    filteredEntries: CommandPickerEntry[];
+  } => {
+    const filteredEntries = filterCommandPickerEntries(picker.entries, picker.filter);
+    const totalPages = Math.max(1, Math.ceil(filteredEntries.length / KEYBOARD_PAGE_SIZE));
+    const page = Math.max(0, Math.min(picker.page, totalPages - 1));
+    const pageEntries = filteredEntries.slice(page * KEYBOARD_PAGE_SIZE, (page + 1) * KEYBOARD_PAGE_SIZE);
+    const counts = getCommandPickerCounts(picker.entries);
+
+    const keyboard = new InlineKeyboard();
+    for (const entry of pageEntries) {
+      keyboard.text(trimLine(entry.label, 48), `cmd_pick_${entry.id}`).row();
+    }
+
+    if (totalPages > 1) {
+      if (page > 0) {
+        keyboard.text("◀️ Prev", `cmd_page_${page - 1}`);
+      }
+      keyboard.text(`${page + 1}/${totalPages}`, NOOP_PAGE_CALLBACK_DATA);
+      if (page < totalPages - 1) {
+        keyboard.text("Next ▶️", `cmd_page_${page + 1}`);
+      }
+      keyboard.row();
+    }
+
+    const filterButtons: Array<{ filter: CommandPickerFilter; icon: string }> = [
+      { filter: "all", icon: "🧭" },
+      { filter: "telepi", icon: "📱" },
+      { filter: "pi", icon: "⚡" },
+    ];
+    for (const button of filterButtons) {
+      const active = picker.filter === button.filter;
+      const label = `${active ? "✅ " : ""}${button.icon} ${getCommandPickerFilterName(button.filter)} ${counts[button.filter]}`;
+      keyboard.text(label, `cmd_filter_${button.filter}`);
+    }
+    keyboard.row();
+
+    const summary = filteredEntries.length === 0
+      ? `No ${getCommandPickerFilterName(picker.filter)} commands available.`
+      : `Showing ${page * KEYBOARD_PAGE_SIZE + 1}-${page * KEYBOARD_PAGE_SIZE + pageEntries.length} of ${filteredEntries.length} ${getCommandPickerFilterName(picker.filter)} commands.`;
+
+    const plainLines = [
+      "Command picker",
+      `Filter: ${getCommandPickerFilterName(picker.filter)}`,
+      `Page: ${page + 1}/${totalPages}`,
+      summary,
+      "",
+      ...(pageEntries.length > 0
+        ? pageEntries.map((entry) => {
+          const detail = entry.kind === "pi" ? `${entry.description} [${entry.source}]` : entry.description;
+          return `${entry.label.replace(/^[^/]+\s*/, "") } — ${detail}`;
+        })
+        : [picker.filter === "pi" ? "No Pi commands found in this session." : "No commands found for this filter."]),
+      "",
+      "Tap a button below to run a command.",
+    ];
+
+    const htmlLines = [
+      "<b>Command picker</b>",
+      `<i>Filter:</i> <b>${escapeHTML(getCommandPickerFilterName(picker.filter))}</b>`,
+      `<i>Page:</i> ${page + 1}/${totalPages}`,
+      `<i>${escapeHTML(summary)}</i>`,
+      "",
+      ...(pageEntries.length > 0
+        ? pageEntries.map((entry) => entry.kind === "pi"
+          ? `${escapeHTML(entry.label)} — ${escapeHTML(entry.description)} <i>(${escapeHTML(entry.source)})</i>`
+          : `${escapeHTML(entry.label)} — ${escapeHTML(entry.description)}`)
+        : [picker.filter === "pi" ? "<i>No Pi commands found in this session.</i>" : "<i>No commands found for this filter.</i>"]),
+      "",
+      "Tap a button below to run a command.",
+    ];
+
+    return {
+      text: htmlLines.join("\n"),
+      fallbackText: plainLines.join("\n"),
+      parseMode: "HTML",
+      replyMarkup: keyboard,
+      page,
+      filteredEntries,
+    };
+  };
+
+  const openCommandPicker = async (
+    ctx: Context,
+    target: PiSessionContext,
+    options?: { messageId?: number; filter?: CommandPickerFilter; page?: number },
+  ): Promise<void> => {
+    const contextKey = getContextKey(target);
+    const piSession = await getOrCreateSession(target);
+
+    let slashCommands: SlashCommandInfo[];
+    try {
+      slashCommands = await piSession.listSlashCommands();
+    } catch (error) {
+      const failure = renderPrefixedError("Failed to load commands", error);
+      if (options?.messageId) {
+        await safeEditMessage(bot, target, options.messageId, failure.text, {
+          fallbackText: failure.fallbackText,
+          parseMode: failure.parseMode,
+        });
+      } else {
+        await safeReply(ctx, failure.text, {
+          fallbackText: failure.fallbackText,
+          parseMode: failure.parseMode,
+        }, target);
+      }
       return;
     }
 
+    try {
+      await syncChatScopedCommands(target, slashCommands);
+    } catch (error) {
+      console.error("Failed to sync chat-scoped Telegram commands", error);
+    }
+
+    const picker: PendingCommandPicker = {
+      messageId: options?.messageId ?? 0,
+      entries: buildCommandPickerEntries(slashCommands),
+      filter: options?.filter ?? "all",
+      page: options?.page ?? 0,
+    };
+    const rendered = renderCommandPickerState(picker);
+    picker.page = rendered.page;
+
+    if (options?.messageId) {
+      await safeEditMessage(bot, target, options.messageId, rendered.text, {
+        fallbackText: rendered.fallbackText,
+        parseMode: rendered.parseMode,
+        replyMarkup: rendered.replyMarkup,
+      });
+      picker.messageId = options.messageId;
+      pendingCommandPickers.set(contextKey, picker);
+      return;
+    }
+
+    const message = await sendTextMessage(ctx.api, target, rendered.text, {
+      fallbackText: rendered.fallbackText,
+      parseMode: rendered.parseMode,
+      replyMarkup: rendered.replyMarkup,
+    });
+    picker.messageId = message.message_id;
+    pendingCommandPickers.set(contextKey, picker);
+  };
+
+  const getPendingCommandPicker = (
+    target: PiSessionContext,
+    messageId?: number,
+  ): { contextKey: ContextKey; picker: PendingCommandPicker } | undefined => {
+    if (!messageId) {
+      return undefined;
+    }
+
+    const contextKey = getContextKey(target);
+    const picker = pendingCommandPickers.get(contextKey);
+    if (!picker || picker.messageId !== messageId) {
+      return undefined;
+    }
+
+    return { contextKey, picker };
+  };
+
+  const handleStartCommand = async (ctx: Context, target: PiSessionContext): Promise<void> => {
     const piSession = await getOrCreateSession(target);
+    await refreshChatScopedCommands(target, piSession);
     const info = piSession.getInfo();
     let voiceStatus: { backends: string[]; warning?: string } = { backends: [] };
     try {
@@ -719,24 +1408,25 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
     ].join("\n");
 
     await safeReply(ctx, html, { fallbackText: plainText }, target);
-  });
+  };
 
-  bot.command("help", async (ctx) => {
-    const target = getTelegramTarget(ctx);
-    if (!target) {
-      return;
-    }
-
+  const handleHelpCommand = async (ctx: Context, target: PiSessionContext): Promise<void> => {
     const info = sessionRegistry.getInfo(target);
     await safeReply(ctx, renderHelpHTML(info), {
       fallbackText: renderHelpPlain(info),
     }, target);
-  });
+  };
 
-  bot.command("abort", async (ctx) => {
-    const target = getTelegramTarget(ctx);
-    if (!target) {
-      return;
+  const handleCommandsCommand = async (ctx: Context, target: PiSessionContext): Promise<void> => {
+    await openCommandPicker(ctx, target);
+  };
+
+  const handleAbortCommand = async (ctx: Context, target: PiSessionContext): Promise<void> => {
+    const contextKey = getContextKey(target);
+    const pendingDialog = clearPendingExtensionDialog(contextKey);
+    if (pendingDialog) {
+      resolvePendingExtensionDialogCancelled(pendingDialog);
+      await finalizePendingExtensionDialog(target, pendingDialog, escapeHTML("Dialog cancelled."), "Dialog cancelled.");
     }
 
     const piSession = getExistingSession(target);
@@ -759,26 +1449,20 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
         parseMode: failure.parseMode,
       }, target);
     }
-  });
+  };
 
-  bot.command("session", async (ctx) => {
-    const target = getTelegramTarget(ctx);
-    if (!target) {
-      return;
-    }
-
+  const handleSessionCommand = async (ctx: Context, target: PiSessionContext): Promise<void> => {
     const info = sessionRegistry.getInfo(target);
     await safeReply(ctx, renderSessionInfoHTML(info), {
       fallbackText: renderSessionInfoPlain(info),
     }, target);
-  });
+  };
 
-  bot.command(["sessions", "switch"], async (ctx) => {
-    const target = getTelegramTarget(ctx);
-    if (!target) {
-      return;
-    }
-
+  const handleSessionsCommand = async (
+    ctx: Context,
+    target: PiSessionContext,
+    commandText?: string,
+  ): Promise<void> => {
     const contextKey = getContextKey(target);
 
     if (isBusy(target)) {
@@ -789,13 +1473,14 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
     }
 
     const piSession = await getOrCreateSession(target);
-    const rawText = ctx.message?.text ?? "";
+    const rawText = commandText ?? ctx.message?.text ?? "";
     const sessionReference = rawText.replace(/^\/(?:sessions|switch)(?:@\w+)?\s*/, "").trim();
     if (sessionReference) {
       switchingContexts.add(contextKey);
       try {
         const resolvedSession = await piSession.resolveSessionReference(sessionReference);
         const info = await piSession.switchSession(resolvedSession.path, resolvedSession.cwd);
+        await refreshChatScopedCommands(target, piSession);
         clearContextPickers(contextKey);
         clearContextPromptMemory(contextKey);
         const workspaceNotePlain = resolvedSession.workspaceWarning
@@ -849,14 +1534,9 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
       fallbackText: plainText,
       replyMarkup: keyboard,
     }, target);
-  });
+  };
 
-  bot.command("new", async (ctx) => {
-    const target = getTelegramTarget(ctx);
-    if (!target) {
-      return;
-    }
-
+  const handleNewCommand = async (ctx: Context, target: PiSessionContext): Promise<void> => {
     const contextKey = getContextKey(target);
 
     if (isBusy(target)) {
@@ -879,6 +1559,7 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
           return;
         }
 
+        await refreshChatScopedCommands(target, piSession);
         clearContextPickers(contextKey);
         clearContextPromptMemory(contextKey);
         const plainText = `New session created.\n\n${renderSessionInfoPlain(info)}`;
@@ -910,14 +1591,9 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
       fallbackText: "Select workspace for new session:",
       replyMarkup: buildKeyboard(workspaceButtons, 0, "newws"),
     }, target);
-  });
+  };
 
-  bot.command("handback", async (ctx) => {
-    const target = getTelegramTarget(ctx);
-    if (!target) {
-      return;
-    }
-
+  const handleHandbackCommand = async (ctx: Context, target: PiSessionContext): Promise<void> => {
     const contextKey = getContextKey(target);
     const piSession = getExistingSession(target);
 
@@ -940,6 +1616,12 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
       clearContextPickers(contextKey);
       clearContextPromptMemory(contextKey);
       sessionRegistry.remove(target);
+      chatScopedCommandSignatures.delete(target.chatId);
+      try {
+        await syncChatScopedCommands(target, []);
+      } catch (error) {
+        console.error("Failed to reset chat-scoped Telegram commands", error);
+      }
 
       if (!sessionFile) {
         await safeReply(ctx, escapeHTML("Session was in-memory. No file to resume.\nUse /new to start a fresh session."), {
@@ -1009,7 +1691,7 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
         parseMode: failure.parseMode,
       }, target);
     }
-  });
+  };
 
   const renderModelPicker = async (
     ctx: Context,
@@ -1073,12 +1755,7 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
     await safeReply(ctx, html, { fallbackText, replyMarkup }, target);
   };
 
-  bot.command("model", async (ctx) => {
-    const target = getTelegramTarget(ctx);
-    if (!target) {
-      return;
-    }
-
+  const handleModelCommand = async (ctx: Context, target: PiSessionContext): Promise<void> => {
     const piSession = await getOrCreateSession(target);
 
     if (!piSession.hasActiveSession()) {
@@ -1094,15 +1771,15 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
       }
     }
 
+    await refreshChatScopedCommands(target, piSession);
     await renderModelPicker(ctx, target, piSession);
-  });
+  };
 
-  bot.command("tree", async (ctx) => {
-    const target = getTelegramTarget(ctx);
-    if (!target) {
-      return;
-    }
-
+  const handleTreeCommand = async (
+    ctx: Context,
+    target: PiSessionContext,
+    commandText?: string,
+  ): Promise<void> => {
     const contextKey = getContextKey(target);
     const piSession = getExistingSession(target);
 
@@ -1120,7 +1797,7 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
       return;
     }
 
-    const rawText = ctx.message?.text ?? "";
+    const rawText = commandText ?? ctx.message?.text ?? "";
     const arg = rawText.replace(/^\/tree(?:@\w+)?\s*/, "").trim().toLowerCase();
     let mode: TreeFilterMode = "default";
     if (arg === "all") {
@@ -1145,14 +1822,13 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
       fallbackText: stripHtml(result.text),
       replyMarkup: keyboard,
     }, target);
-  });
+  };
 
-  bot.command("branch", async (ctx) => {
-    const target = getTelegramTarget(ctx);
-    if (!target) {
-      return;
-    }
-
+  const handleBranchCommand = async (
+    ctx: Context,
+    target: PiSessionContext,
+    commandText?: string,
+  ): Promise<void> => {
     const contextKey = getContextKey(target);
     const piSession = getExistingSession(target);
 
@@ -1168,7 +1844,7 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
       return;
     }
 
-    const rawText = ctx.message?.text ?? "";
+    const rawText = commandText ?? ctx.message?.text ?? "";
     const entryId = rawText.replace(/^\/branch(?:@\w+)?\s*/, "").trim();
     if (!entryId) {
       await safeReply(ctx, escapeHTML("Usage: /branch <entry-id>\nUse /tree to see entry IDs."), {
@@ -1203,14 +1879,13 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
       fallbackText: stripHtml(confirmation.text),
       replyMarkup: buildKeyboard(confirmation.buttons, 0, "branch"),
     }, target);
-  });
+  };
 
-  bot.command("label", async (ctx) => {
-    const target = getTelegramTarget(ctx);
-    if (!target) {
-      return;
-    }
-
+  const handleLabelCommand = async (
+    ctx: Context,
+    target: PiSessionContext,
+    commandText?: string,
+  ): Promise<void> => {
     const piSession = getExistingSession(target);
 
     if (isBusy(target)) {
@@ -1225,7 +1900,7 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
       return;
     }
 
-    const rawText = ctx.message?.text ?? "";
+    const rawText = commandText ?? ctx.message?.text ?? "";
     const args = rawText.replace(/^\/label(?:@\w+)?\s*/, "").trim();
 
     if (!args) {
@@ -1288,14 +1963,9 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
       },
       target,
     );
-  });
+  };
 
-  bot.command("retry", async (ctx) => {
-    const target = getTelegramTarget(ctx);
-    if (!target) {
-      return;
-    }
-
+  const handleRetryCommand = async (ctx: Context, target: PiSessionContext): Promise<void> => {
     const contextKey = getContextKey(target);
     const lastPrompt = lastPromptStates.get(contextKey);
     if (!lastPrompt) {
@@ -1306,6 +1976,175 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
     }
 
     await handleUserPrompt(ctx, target, lastPrompt.text);
+  };
+
+  const runTelePiPickerCommand = async (
+    ctx: Context,
+    target: PiSessionContext,
+    command: string,
+  ): Promise<void> => {
+    switch (command) {
+      case "start":
+        await handleStartCommand(ctx, target);
+        return;
+      case "help":
+        await handleHelpCommand(ctx, target);
+        return;
+      case "abort":
+        await handleAbortCommand(ctx, target);
+        return;
+      case "session":
+        await handleSessionCommand(ctx, target);
+        return;
+      case "sessions":
+        await handleSessionsCommand(ctx, target, "/sessions");
+        return;
+      case "new":
+        await handleNewCommand(ctx, target);
+        return;
+      case "handback":
+        await handleHandbackCommand(ctx, target);
+        return;
+      case "model":
+        await handleModelCommand(ctx, target);
+        return;
+      case "tree":
+        await handleTreeCommand(ctx, target, "/tree");
+        return;
+      case "branch":
+        await safeReply(ctx, escapeHTML("Use /branch <entry-id> with an ID from /tree."), {
+          fallbackText: "Use /branch <entry-id> with an ID from /tree.",
+        }, target);
+        return;
+      case "label":
+        await handleLabelCommand(ctx, target, "/label");
+        return;
+      case "retry":
+        await handleRetryCommand(ctx, target);
+        return;
+      default:
+        await safeReply(ctx, escapeHTML(`Command not available from picker: /${command}`), {
+          fallbackText: `Command not available from picker: /${command}`,
+        }, target);
+        return;
+    }
+  };
+
+  bot.command("start", async (ctx) => {
+    const target = getTelegramTarget(ctx);
+    if (!target) {
+      return;
+    }
+
+    await handleStartCommand(ctx, target);
+  });
+
+  bot.command("help", async (ctx) => {
+    const target = getTelegramTarget(ctx);
+    if (!target) {
+      return;
+    }
+
+    await handleHelpCommand(ctx, target);
+  });
+
+  bot.command("commands", async (ctx) => {
+    const target = getTelegramTarget(ctx);
+    if (!target) {
+      return;
+    }
+
+    await handleCommandsCommand(ctx, target);
+  });
+
+  bot.command("abort", async (ctx) => {
+    const target = getTelegramTarget(ctx);
+    if (!target) {
+      return;
+    }
+
+    await handleAbortCommand(ctx, target);
+  });
+
+  bot.command("session", async (ctx) => {
+    const target = getTelegramTarget(ctx);
+    if (!target) {
+      return;
+    }
+
+    await handleSessionCommand(ctx, target);
+  });
+
+  bot.command(["sessions", "switch"], async (ctx) => {
+    const target = getTelegramTarget(ctx);
+    if (!target) {
+      return;
+    }
+
+    await handleSessionsCommand(ctx, target);
+  });
+
+  bot.command("new", async (ctx) => {
+    const target = getTelegramTarget(ctx);
+    if (!target) {
+      return;
+    }
+
+    await handleNewCommand(ctx, target);
+  });
+
+  bot.command("handback", async (ctx) => {
+    const target = getTelegramTarget(ctx);
+    if (!target) {
+      return;
+    }
+
+    await handleHandbackCommand(ctx, target);
+  });
+
+  bot.command("model", async (ctx) => {
+    const target = getTelegramTarget(ctx);
+    if (!target) {
+      return;
+    }
+
+    await handleModelCommand(ctx, target);
+  });
+
+  bot.command("tree", async (ctx) => {
+    const target = getTelegramTarget(ctx);
+    if (!target) {
+      return;
+    }
+
+    await handleTreeCommand(ctx, target);
+  });
+
+  bot.command("branch", async (ctx) => {
+    const target = getTelegramTarget(ctx);
+    if (!target) {
+      return;
+    }
+
+    await handleBranchCommand(ctx, target);
+  });
+
+  bot.command("label", async (ctx) => {
+    const target = getTelegramTarget(ctx);
+    if (!target) {
+      return;
+    }
+
+    await handleLabelCommand(ctx, target);
+  });
+
+  bot.command("retry", async (ctx) => {
+    const target = getTelegramTarget(ctx);
+    if (!target) {
+      return;
+    }
+
+    await handleRetryCommand(ctx, target);
   });
 
   bot.callbackQuery("pi_abort", async (ctx) => {
@@ -1322,6 +2161,80 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
     await ctx.answerCallbackQuery();
   });
 
+  bot.callbackQuery(/^ui_sel_([a-z0-9]+)_(\d+)$/, async (ctx) => {
+    const target = getTelegramTarget(ctx);
+    const dialogId = ctx.match?.[1];
+    const optionIndex = Number.parseInt(ctx.match?.[2] ?? "", 10);
+    if (!target || !dialogId || Number.isNaN(optionIndex)) {
+      return;
+    }
+
+    const contextKey = getContextKey(target);
+    const pendingDialog = pendingExtensionDialogs.get(contextKey);
+    if (!pendingDialog || pendingDialog.kind !== "select" || pendingDialog.dialogId !== dialogId || pendingDialog.messageId !== ctx.callbackQuery.message?.message_id) {
+      await ctx.answerCallbackQuery({ text: "Dialog expired" });
+      return;
+    }
+
+    const selected = pendingDialog.options[optionIndex];
+    if (!selected) {
+      await ctx.answerCallbackQuery({ text: "Option expired" });
+      return;
+    }
+
+    clearPendingExtensionDialog(contextKey);
+    await ctx.answerCallbackQuery({ text: `Selected ${trimLine(selected, 32)}` });
+    await finalizePendingExtensionDialog(target, pendingDialog, `<b>${escapeHTML(pendingDialog.title)}</b>\n<i>Selected:</i> ${escapeHTML(selected)}`, `${pendingDialog.title}\nSelected: ${selected}`);
+    pendingDialog.resolve(selected);
+  });
+
+  bot.callbackQuery(/^ui_cfm_([a-z0-9]+)_(yes|no)$/, async (ctx) => {
+    const target = getTelegramTarget(ctx);
+    const dialogId = ctx.match?.[1];
+    const answer = ctx.match?.[2];
+    if (!target || !dialogId || !answer) {
+      return;
+    }
+
+    const contextKey = getContextKey(target);
+    const pendingDialog = pendingExtensionDialogs.get(contextKey);
+    if (!pendingDialog || pendingDialog.kind !== "confirm" || pendingDialog.dialogId !== dialogId || pendingDialog.messageId !== ctx.callbackQuery.message?.message_id) {
+      await ctx.answerCallbackQuery({ text: "Dialog expired" });
+      return;
+    }
+
+    const confirmed = answer === "yes";
+    clearPendingExtensionDialog(contextKey);
+    await ctx.answerCallbackQuery({ text: confirmed ? "Confirmed" : "Cancelled" });
+    await finalizePendingExtensionDialog(
+      target,
+      pendingDialog,
+      `<b>${escapeHTML(pendingDialog.title)}</b>\n<i>${confirmed ? "Confirmed" : "Cancelled"}</i>`,
+      `${pendingDialog.title}\n${confirmed ? "Confirmed" : "Cancelled"}`,
+    );
+    pendingDialog.resolve(confirmed);
+  });
+
+  bot.callbackQuery(/^ui_x_([a-z0-9]+)$/, async (ctx) => {
+    const target = getTelegramTarget(ctx);
+    const dialogId = ctx.match?.[1];
+    if (!target || !dialogId) {
+      return;
+    }
+
+    const contextKey = getContextKey(target);
+    const pendingDialog = pendingExtensionDialogs.get(contextKey);
+    if (!pendingDialog || pendingDialog.dialogId !== dialogId || pendingDialog.messageId !== ctx.callbackQuery.message?.message_id) {
+      await ctx.answerCallbackQuery({ text: "Dialog expired" });
+      return;
+    }
+
+    clearPendingExtensionDialog(contextKey);
+    await ctx.answerCallbackQuery({ text: "Cancelled" });
+    resolvePendingExtensionDialogCancelled(pendingDialog);
+    await finalizePendingExtensionDialog(target, pendingDialog, escapeHTML("Dialog cancelled."), "Dialog cancelled.");
+  });
+
   handlePageCallback(/^switch_page_(\d+)$/, "switch", pendingSessionButtons, "Expired, run /sessions again");
   handlePageCallback(/^newws_page_(\d+)$/, "newws", pendingWorkspaceButtons, "Expired, run /new again");
   handlePageCallback(/^model_page_(\d+)$/, "model", pendingModelButtons, "Expired, run /model again", pendingModelExtraButtons);
@@ -1333,6 +2246,101 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
     pendingTreeFilterButtons,
   );
   handlePageCallback(/^branch_page_(\d+)$/, "branch", pendingBranchButtons, "Expired, run /branch again");
+
+  bot.callbackQuery(/^cmd_page_(\d+)$/, async (ctx) => {
+    const target = getTelegramTarget(ctx);
+    const messageId = ctx.callbackQuery.message?.message_id;
+    const page = Number.parseInt(ctx.match?.[1] ?? "", 10);
+
+    if (!target || !messageId || Number.isNaN(page)) {
+      return;
+    }
+
+    const activePicker = getPendingCommandPicker(target, messageId);
+    if (!activePicker) {
+      await ctx.answerCallbackQuery({ text: "Expired, run /commands again" });
+      return;
+    }
+
+    activePicker.picker.page = page;
+    const rendered = renderCommandPickerState(activePicker.picker);
+    activePicker.picker.page = rendered.page;
+    pendingCommandPickers.set(activePicker.contextKey, activePicker.picker);
+
+    await ctx.answerCallbackQuery();
+    await safeEditMessage(bot, target, messageId, rendered.text, {
+      fallbackText: rendered.fallbackText,
+      parseMode: rendered.parseMode,
+      replyMarkup: rendered.replyMarkup,
+    });
+  });
+
+  bot.callbackQuery(/^cmd_filter_(all|telepi|pi)$/, async (ctx) => {
+    const target = getTelegramTarget(ctx);
+    const messageId = ctx.callbackQuery.message?.message_id;
+    const filter = ctx.match?.[1] as CommandPickerFilter | undefined;
+
+    if (!target || !messageId || !filter) {
+      return;
+    }
+
+    const activePicker = getPendingCommandPicker(target, messageId);
+    if (!activePicker) {
+      await ctx.answerCallbackQuery({ text: "Expired, run /commands again" });
+      return;
+    }
+
+    activePicker.picker.filter = filter;
+    activePicker.picker.page = 0;
+    const rendered = renderCommandPickerState(activePicker.picker);
+    activePicker.picker.page = rendered.page;
+    pendingCommandPickers.set(activePicker.contextKey, activePicker.picker);
+
+    await ctx.answerCallbackQuery({ text: `Showing ${getCommandPickerFilterName(filter)} commands` });
+    await safeEditMessage(bot, target, messageId, rendered.text, {
+      fallbackText: rendered.fallbackText,
+      parseMode: rendered.parseMode,
+      replyMarkup: rendered.replyMarkup,
+    });
+  });
+
+  bot.callbackQuery(/^cmd_pick_(\d+)$/, async (ctx) => {
+    const target = getTelegramTarget(ctx);
+    const messageId = ctx.callbackQuery.message?.message_id;
+    const index = Number.parseInt(ctx.match?.[1] ?? "", 10);
+
+    if (!target || !messageId || Number.isNaN(index)) {
+      return;
+    }
+
+    const activePicker = getPendingCommandPicker(target, messageId);
+    if (!activePicker) {
+      await ctx.answerCallbackQuery({ text: "Expired, run /commands again" });
+      return;
+    }
+
+    const entry = activePicker.picker.entries.find((item) => item.id === index);
+    if (!entry) {
+      await ctx.answerCallbackQuery({ text: "Expired, run /commands again" });
+      return;
+    }
+
+    if (entry.kind === "pi") {
+      if (isBusy(target)) {
+        await ctx.answerCallbackQuery({ text: "Wait for the current prompt to finish" });
+        return;
+      }
+
+      pendingCommandPickers.delete(activePicker.contextKey);
+      await ctx.answerCallbackQuery({ text: `Running ${trimLine(entry.commandText, 32)}` });
+      await handleUserPrompt(ctx, target, entry.commandText);
+      return;
+    }
+
+    pendingCommandPickers.delete(activePicker.contextKey);
+    await ctx.answerCallbackQuery({ text: `Opening ${trimLine(entry.commandText, 32)}` });
+    await runTelePiPickerCommand(ctx, target, entry.command);
+  });
 
   bot.callbackQuery(/^switch_(\d+)$/, async (ctx) => {
     const target = getTelegramTarget(ctx);
@@ -1364,6 +2372,7 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
     try {
       const resolvedSession = await piSession.resolveSessionReference(sessions[index].path);
       const info = await piSession.switchSession(resolvedSession.path, resolvedSession.cwd);
+      await refreshChatScopedCommands(target, piSession);
       clearPendingTreeKeyboard(contextKey);
       clearContextPromptMemory(contextKey);
       const workspaceNotePlain = resolvedSession.workspaceWarning
@@ -1436,6 +2445,7 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
         return;
       }
 
+      await refreshChatScopedCommands(target, piSession);
       clearPendingTreeKeyboard(contextKey);
       clearContextPromptMemory(contextKey);
       const plainText = `New session created.\n\n${renderSessionInfoPlain(info)}`;
@@ -1815,12 +2825,59 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
 
   bot.on("message:text", async (ctx) => {
     const userText = ctx.message.text.trim();
-    if (!userText || userText.startsWith("/")) {
+    if (!userText) {
       return;
     }
 
     const target = getTelegramTarget(ctx);
     if (!target) {
+      return;
+    }
+
+    const contextKey = getContextKey(target);
+    const normalizedSlashCommand = normalizeSlashCommand(userText, bot.botInfo?.username);
+    if (normalizedSlashCommand && TELEPI_LOCAL_COMMAND_NAMES.has(normalizedSlashCommand.name)) {
+      return;
+    }
+    if (!normalizedSlashCommand && userText.startsWith("/")) {
+      return;
+    }
+
+    const pendingDialog = pendingExtensionDialogs.get(contextKey);
+    if (pendingDialog?.kind === "input") {
+      clearPendingExtensionDialog(contextKey);
+      await finalizePendingExtensionDialog(
+        target,
+        pendingDialog,
+        `<b>${escapeHTML(pendingDialog.title)}</b>\n<i>Received:</i> ${escapeHTML(userText)}`,
+        `${pendingDialog.title}\nReceived: ${userText}`,
+      );
+      pendingDialog.resolve(userText);
+      return;
+    }
+
+    if (pendingDialog) {
+      await safeReply(ctx, escapeHTML("Please answer the pending dialog above."), {
+        fallbackText: "Please answer the pending dialog above.",
+      }, target);
+      return;
+    }
+
+    if (normalizedSlashCommand) {
+      const piSession = await getOrCreateSession(target);
+      const slashCommands = await piSession.listSlashCommands();
+      void syncChatScopedCommands(target, slashCommands).catch((error) => {
+        console.error("Failed to sync chat-scoped Telegram commands", error);
+      });
+      const knownSlashCommands = new Set(slashCommands.map((command) => command.name));
+      if (!knownSlashCommands.has(normalizedSlashCommand.name)) {
+        await safeReply(ctx, escapeHTML("Unknown command. Use /commands to see available Pi slash commands."), {
+          fallbackText: "Unknown command. Use /commands to see available Pi slash commands.",
+        }, target);
+        return;
+      }
+
+      await handleUserPrompt(ctx, target, normalizedSlashCommand.text, slashCommands);
       return;
     }
 
@@ -1897,20 +2954,7 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
 }
 
 export async function registerCommands(bot: Bot<Context>): Promise<void> {
-  await bot.api.setMyCommands([
-    { command: "start", description: "Welcome and session info" },
-    { command: "help", description: "Show commands and usage tips" },
-    { command: "new", description: "Start a new session" },
-    { command: "retry", description: "Retry the last prompt in this chat/topic" },
-    { command: "handback", description: "Hand session back to Pi CLI" },
-    { command: "abort", description: "Cancel current operation" },
-    { command: "session", description: "Current session details" },
-    { command: "sessions", description: "List and switch sessions (or /sessions <path|id>)" },
-    { command: "model", description: "Switch AI model" },
-    { command: "tree", description: "View and navigate the session tree" },
-    { command: "branch", description: "Navigate to a tree entry (/branch <id>)" },
-    { command: "label", description: "Label an entry (/label [name] or /label <id> <name>)" },
-  ]);
+  await bot.api.setMyCommands([...TELEPI_BOT_COMMANDS]);
 }
 
 function renderHelpPlain(info: PiSessionInfo): string {
@@ -1918,6 +2962,7 @@ function renderHelpPlain(info: PiSessionInfo): string {
     "TelePi commands:",
     "/start — welcome message and session info",
     "/help — show this help",
+    "/commands — browse TelePi and Pi commands",
     "/new — start a new session",
     "/retry — resend the last prompt in this chat/topic",
     "/handback — hand the current session back to Pi CLI",
@@ -1943,6 +2988,7 @@ function renderHelpHTML(info: PiSessionInfo): string {
     "<b>TelePi commands</b>",
     "<code>/start</code> — welcome message and session info",
     "<code>/help</code> — show this help",
+    "<code>/commands</code> — browse TelePi and Pi commands",
     "<code>/new</code> — start a new session",
     "<code>/retry</code> — resend the last prompt in this chat/topic",
     "<code>/handback</code> — hand the current session back to Pi CLI",
@@ -2345,6 +3391,32 @@ function isAbortError(message: string): boolean {
 
 function renderFailedText(error: unknown): RenderedText {
   return renderPrefixedError("Failed", error);
+}
+
+function renderExtensionNotice(message: string, type: "info" | "warning" | "error" = "info"): RenderedText {
+  const prefix = type === "error" ? "❌" : type === "warning" ? "⚠️" : "ℹ️";
+  return {
+    text: `<b>${prefix}</b> ${escapeHTML(message)}`,
+    fallbackText: `${prefix} ${message}`,
+    parseMode: "HTML",
+  };
+}
+
+function renderExtensionError(extensionPath: string, event: string, error: string): RenderedText {
+  if (event === "command" && extensionPath.startsWith("command:")) {
+    const commandName = extensionPath.slice("command:".length);
+    return {
+      text: `<b>❌ /${escapeHTML(commandName)} failed:</b> ${escapeHTML(error)}`,
+      fallbackText: `❌ /${commandName} failed: ${error}`,
+      parseMode: "HTML",
+    };
+  }
+
+  return {
+    text: `<b>❌ Extension error:</b> ${escapeHTML(error)}`,
+    fallbackText: `❌ Extension error: ${error}`,
+    parseMode: "HTML",
+  };
 }
 
 function renderPrefixedError(prefix: string, error: unknown, multiline = false): RenderedText {
