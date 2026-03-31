@@ -86,6 +86,8 @@ Also note npm's current Trusted Publishing requirements:
 - **npm CLI `11.5.1+`**
 - **Node `22.14.0+`**
 
+This requirement matters in practice: TelePi initially had a correctly configured OIDC workflow, but publishes still failed with a misleading `E404 Not Found - PUT ... is not in this registry` error until the workflow explicitly upgraded npm on the runner.
+
 In practice, the workflow should explicitly upgrade npm after `actions/setup-node`, for example:
 
 ```yaml
@@ -155,6 +157,8 @@ The workflow will then:
 - run tests/build/package steps
 - publish to npm
 - publish the GitHub Release assets
+
+TelePi has verified this flow successfully with release `v0.2.1`.
 
 ## First-time checklist for another repo (example: TeleCodex)
 

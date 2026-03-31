@@ -12,7 +12,9 @@ TelePi is a Telegram bridge for the [Pi coding agent](https://github.com/badlogi
 - **Cross-workspace sessions**: Browse and switch between sessions from any project
 - **Model switching**: Change AI models on the fly via `/model`
 - **Workspace-aware `/new`**: Create sessions in any known project workspace
+- **Pi slash-command bridge**: Run discovered Pi prompt templates, skills, and extension commands from Telegram, browse them with the paginated `/commands` picker, and surface Telegram-compatible ones in the native slash-command menu
 - **Helpful recovery commands**: `/help` for quick usage guidance and `/retry` to resend the last prompt in the current chat/topic
+- **Extension dialog support**: Pi extension commands can now ask for Telegram-native selects, confirms, and text input mid-command
 - **Native Telegram UX**: Topic-safe inline keyboards, typing indicators, HTML-formatted responses, friendly user-facing errors, auto-retry on rate limits
 - **Security**: Telegram user allowlist, workspace-scoped tools, Docker support
 
@@ -116,6 +118,7 @@ node dist/cli.js start
 |---------|-------------|
 | `/start` | Welcome message, session info, and voice backend status |
 | `/help` | Quick command reference and usage tips |
+| `/commands` | Open a paginated picker for TelePi commands plus discovered Pi prompt templates, skills, and extension commands |
 | `/new` | Create a fresh session (shows workspace picker if multiple known) |
 | `/retry` | Re-send the last prompt in the current chat/topic |
 | `/handback` | Hand session back to Pi CLI (copies resume command to clipboard) |
@@ -129,6 +132,10 @@ node dist/cli.js start
 | `/label [args]` | Add or clear labels on entries for easy reference |
 
 Sessions, inline keyboards, and `/retry` state are isolated per Telegram chat/topic, so forum topics can be used independently without colliding with each other.
+
+`/commands` now opens a mobile-friendly inline picker with pagination plus `All`, `TelePi`, and `Pi` filters. Tapping a TelePi entry runs the built-in command immediately, and tapping a Pi entry forwards the slash command into the active Pi session. Telegram-compatible discovered Pi commands (for example `/review` or `/compact`) are also synced into Telegram's native slash-command interface for the current chat. Commands that Telegram cannot represent, such as `/skill:browser-tools`, stay available through the picker and by manual typing.
+
+Any non-TelePi slash command that matches the active Pi session's discovered commands is forwarded into Pi unchanged. That means Telegram can now trigger file-based prompt templates (for example `/review`), skills (`/skill:browser-tools`), and compatible extension commands. Interactive extension commands can also open Telegram-native select/confirm/input dialogs while the command is running.
 
 ## Voice Messages
 
@@ -415,6 +422,7 @@ TelePi/
 │   ├── install.ts                ← installed-mode setup/status helpers
 │   ├── model-scope.ts            ← model filtering and grouping
 │   ├── pi-session.ts             ← Pi SDK session wrapper
+│   ├── telegram-ui-context.ts    ← Pi extension UI adapter backed by Telegram dialogs
 │   ├── tree.ts                   ← session tree rendering & navigation
 │   └── voice.ts                  ← audio transcription (Parakeet CoreML / Sherpa-ONNX / OpenAI)
 ├── test/
@@ -424,6 +432,7 @@ TelePi/
 │   ├── format.test.ts            ← formatter unit tests
 │   ├── install.test.ts           ← install/setup unit tests
 │   ├── pi-session.test.ts        ← session service integration tests
+│   ├── telegram-ui-context.test.ts ← extension UI adapter unit tests
 │   ├── tree.test.ts              ← tree rendering unit tests
 │   ├── voice.decode.test.ts      ← ffmpeg audio decode tests
 │   └── voice.test.ts             ← voice transcription unit tests
@@ -509,4 +518,6 @@ Notes:
 - prerelease tags like `v0.2.0-beta.1` are published to npm with the `next` dist-tag and marked as GitHub prereleases
 - npm publishing uses Trusted Publishing from GitHub Actions; no `NPM_TOKEN` secret is required
 - the trusted publisher must be configured on npm for repo `benedict2310/TelePi` and workflow `.github/workflows/release.yml`
+- npm Trusted Publishing currently requires npm CLI `11.5.1+` and Node `22.14.0+`; TelePi's workflow upgrades npm explicitly because older npm versions can fail with misleading `E404 Not Found` publish errors even when OIDC is configured correctly
+- the workflow has been verified end-to-end with release `v0.2.1`
 - reusable setup details for this pattern live in `docs/npm-trusted-publishing.md`
