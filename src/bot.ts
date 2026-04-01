@@ -1,125 +1,84 @@
-import { randomUUID } from "node:crypto";
-import { unlink, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import path from "node:path";
+import { unlink } from "node:fs/promises";
 
 import { InlineKeyboard, Bot, type Context } from "grammy";
 import { autoRetry } from "@grammyjs/auto-retry";
 import type { SlashCommandInfo } from "@mariozechner/pi-coding-agent";
 
-import type { TelePiConfig, ToolVerbosity } from "./config.js";
-import { toFriendlyError, formatError } from "./errors.js";
-import { escapeHTML, formatTelegramHTML } from "./format.js";
+import type { TelePiConfig } from "./config.js";
+import { formatError } from "./errors.js";
+import { escapeHTML } from "./format.js";
+import {
+  getWorkspaceShortName,
+  isMessageNotModifiedError,
+  renderFailedText,
+  renderHelpHTML,
+  renderHelpPlain,
+  renderPrefixedError,
+  renderSessionInfoHTML,
+  renderSessionInfoPlain,
+  renderVoiceSupportHTML,
+  renderVoiceSupportPlain,
+  stripHtml,
+  trimLine,
+  type RenderedText,
+} from "./bot/message-rendering.js";
+import {
+  appendKeyboardItems,
+  paginateKeyboard,
+  splitTreeKeyboardItems,
+  type KeyboardItem,
+  KEYBOARD_PAGE_SIZE,
+  NOOP_PAGE_CALLBACK_DATA,
+} from "./bot/keyboard.js";
+import {
+  buildChatScopedCommands,
+  buildChatScopedCommandSignature,
+  buildCommandPickerEntries,
+  filterCommandPickerEntries,
+  getCommandPickerCounts,
+  getCommandPickerFilterName,
+  normalizeSlashCommand,
+  TELEPI_BOT_COMMANDS,
+  TELEPI_LOCAL_COMMAND_NAMES,
+  type CommandPickerEntry,
+  type CommandPickerFilter,
+} from "./bot/slash-command.js";
+import {
+  downloadTelegramFile,
+  getTelegramTarget,
+  safeEditMessage,
+  safeReply,
+  sendChatAction,
+  sendTextMessage,
+} from "./bot/telegram-transport.js";
+import { createExtensionDialogManager } from "./bot/extension-dialogs.js";
+import { createBotChatState } from "./bot/chat-state.js";
+import { createPromptHandler } from "./bot/prompt-handler.js";
+import { createBasicCommandHandlers } from "./bot/commands/basic.js";
+import { createSessionCommandHandlers } from "./bot/commands/sessions.js";
+import { createModelCommandHandlers } from "./bot/commands/model.js";
+import { createTreeCommandHandlers } from "./bot/commands/tree.js";
 import {
   type PiSessionContext,
   getPiSessionContextKey,
-  type PiSessionInfo,
   type PiSessionModelOption,
   type PiSessionRegistry,
   type PiSessionService,
 } from "./pi-session.js";
 import {
   renderBranchConfirmation,
-  renderLabels,
   renderTree,
   truncateText,
   type TreeFilterMode,
 } from "./tree.js";
-import { createTelegramUIContext } from "./telegram-ui-context.js";
 import { getVoiceBackendStatus, transcribeAudio } from "./voice.js";
 
-const TELEGRAM_MESSAGE_LIMIT = 4000;
 const EDIT_DEBOUNCE_MS = 1500;
 const TYPING_INTERVAL_MS = 4500;
-const TOOL_OUTPUT_PREVIEW_LIMIT = 500;
-const STREAMING_PREVIEW_LIMIT = 3800;
-const FORMATTED_CHUNK_TARGET = 3000;
-const KEYBOARD_PAGE_SIZE = 6;
-const NOOP_PAGE_CALLBACK_DATA = "noop_page";
 const EXTENSION_UI_TIMEOUT_MS = 60_000;
 
-const TELEPI_BOT_COMMANDS = [
-  { command: "start", description: "Welcome and session info" },
-  { command: "help", description: "Show commands and usage tips" },
-  { command: "commands", description: "Browse TelePi and Pi commands" },
-  { command: "new", description: "Start a new session" },
-  { command: "retry", description: "Retry the last prompt in this chat/topic" },
-  { command: "handback", description: "Hand session back to Pi CLI" },
-  { command: "abort", description: "Cancel current operation" },
-  { command: "session", description: "Current session details" },
-  { command: "sessions", description: "List and switch sessions (or /sessions <path|id>)" },
-  { command: "model", description: "Switch AI model" },
-  { command: "tree", description: "View and navigate the session tree" },
-  { command: "branch", description: "Navigate to a tree entry (/branch <id>)" },
-  { command: "label", description: "Label an entry (/label [name] or /label <id> <name>)" },
-] as const;
-
-const TELEPI_LOCAL_COMMAND_NAMES = new Set<string>([
-  ...TELEPI_BOT_COMMANDS.map((command) => command.command),
-  "switch",
-]);
-
 type TelegramChatId = number | string;
-type TelegramParseMode = "HTML";
-type KeyboardItem = { label: string; callbackData: string };
 type ContextKey = string;
-
-type LastPromptState = {
-  text: string;
-};
-
-interface PaginatedKeyboard {
-  keyboard: InlineKeyboard;
-}
-
-type ToolState = {
-  toolName: string;
-  partialResult: string;
-  messageId?: number;
-  finalStatus?: RenderedText;
-};
-
-type TextOptions = {
-  parseMode?: TelegramParseMode;
-  fallbackText?: string;
-  replyMarkup?: InlineKeyboard;
-};
-
-type RenderedText = {
-  text: string;
-  fallbackText: string;
-  parseMode?: TelegramParseMode;
-};
-
-type RenderedChunk = RenderedText & {
-  sourceText: string;
-};
-
-type NormalizedSlashCommand = {
-  name: string;
-  text: string;
-};
-
-type CommandPickerFilter = "all" | "telepi" | "pi";
-
-type CommandPickerEntry =
-  | {
-      id: number;
-      kind: "telepi";
-      command: string;
-      description: string;
-      label: string;
-      commandText: string;
-    }
-  | {
-      id: number;
-      kind: "pi";
-      name: string;
-      description: string;
-      label: string;
-      commandText: string;
-      source: string;
-    };
 
 type PendingCommandPicker = {
   messageId: number;
@@ -128,235 +87,11 @@ type PendingCommandPicker = {
   page: number;
 };
 
-type PendingExtensionDialog =
-  | {
-      kind: "select";
-      dialogId: string;
-      messageId: number;
-      title: string;
-      options: string[];
-      resolve: (value: string | undefined) => void;
-      timeoutId?: NodeJS.Timeout;
-      abortCleanup?: () => void;
-    }
-  | {
-      kind: "confirm";
-      dialogId: string;
-      messageId: number;
-      title: string;
-      message: string;
-      resolve: (value: boolean) => void;
-      timeoutId?: NodeJS.Timeout;
-      abortCleanup?: () => void;
-    }
-  | {
-      kind: "input";
-      dialogId: string;
-      messageId: number;
-      title: string;
-      placeholder?: string;
-      resolve: (value: string | undefined) => void;
-      timeoutId?: NodeJS.Timeout;
-      abortCleanup?: () => void;
-    };
-
-function normalizeSlashCommand(text: string, botUsername?: string): NormalizedSlashCommand | undefined {
-  const trimmed = text.trim();
-  if (!trimmed.startsWith("/")) {
-    return undefined;
-  }
-
-  const spaceIndex = trimmed.indexOf(" ");
-  const rawCommand = (spaceIndex === -1 ? trimmed : trimmed.slice(0, spaceIndex)).slice(1);
-  const args = spaceIndex === -1 ? "" : trimmed.slice(spaceIndex + 1).trim();
-  const atIndex = rawCommand.indexOf("@");
-  const rawName = atIndex === -1 ? rawCommand : rawCommand.slice(0, atIndex);
-  const addressedBot = atIndex === -1 ? undefined : rawCommand.slice(atIndex + 1);
-
-  if (!rawName) {
-    return undefined;
-  }
-
-  if (addressedBot && botUsername && addressedBot.toLowerCase() !== botUsername.toLowerCase()) {
-    return undefined;
-  }
-
-  return {
-    name: rawName,
-    text: args ? `/${rawName} ${args}` : `/${rawName}`,
-  };
-}
-
-function getPiSlashCommandLabel(command: SlashCommandInfo): string {
-  switch (command.source) {
-    case "prompt":
-      return `📝 /${command.name}`;
-    case "skill":
-      return `🧰 /${command.name}`;
-    case "extension":
-      return `🧩 /${command.name}`;
-    default:
-      return `⚡ /${command.name}`;
-  }
-}
-
-function getCommandPickerFilterName(filter: CommandPickerFilter): string {
-  switch (filter) {
-    case "telepi":
-      return "TelePi";
-    case "pi":
-      return "Pi";
-    case "all":
-    default:
-      return "All";
-  }
-}
-
-function getCommandPickerCounts(entries: CommandPickerEntry[]): Record<CommandPickerFilter, number> {
-  return {
-    all: entries.length,
-    telepi: entries.filter((entry) => entry.kind === "telepi").length,
-    pi: entries.filter((entry) => entry.kind === "pi").length,
-  };
-}
-
-function filterCommandPickerEntries(
-  entries: CommandPickerEntry[],
-  filter: CommandPickerFilter,
-): CommandPickerEntry[] {
-  if (filter === "all") {
-    return entries;
-  }
-
-  return entries.filter((entry) => entry.kind === filter);
-}
-
-function buildCommandPickerEntries(slashCommands: SlashCommandInfo[]): CommandPickerEntry[] {
-  const telepiEntries = TELEPI_BOT_COMMANDS
-    .filter((command) => command.command !== "commands")
-    .map((command, index) => ({
-      id: index,
-      kind: "telepi" as const,
-      command: command.command,
-      description: command.description,
-      label: `📱 /${command.command}`,
-      commandText: `/${command.command}`,
-    }));
-
-  const piEntries = slashCommands.map((command, index) => ({
-    id: telepiEntries.length + index,
-    kind: "pi" as const,
-    name: command.name,
-    description: command.description ?? command.source,
-    label: getPiSlashCommandLabel(command),
-    commandText: `/${command.name}`,
-    source: command.source,
-  }));
-
-  return [...telepiEntries, ...piEntries];
-}
-
-function isTelegramNativeCommandName(name: string): boolean {
-  return /^[a-z0-9_]{1,32}$/.test(name);
-}
-
-function buildChatScopedCommands(slashCommands: SlashCommandInfo[]): Array<{ command: string; description: string }> {
-  const commands: Array<{ command: string; description: string }> = TELEPI_BOT_COMMANDS.map((command) => ({
-    command: command.command,
-    description: command.description,
-  }));
-  const seen = new Set(TELEPI_LOCAL_COMMAND_NAMES);
-
-  for (const slashCommand of slashCommands) {
-    const name = slashCommand.name.replace(/^\/+/, "").trim().toLowerCase();
-    if (!isTelegramNativeCommandName(name) || seen.has(name)) {
-      continue;
-    }
-
-    seen.add(name);
-    commands.push({
-      command: name,
-      description: trimLine(`Pi: ${slashCommand.description ?? slashCommand.source}`, 256),
-    });
-  }
-
-  if (commands.length > 100) {
-    console.warn(`Telegram supports at most 100 commands per scope; truncating ${commands.length} commands to 100.`);
-  }
-
-  return commands.slice(0, 100);
-}
-
-function buildChatScopedCommandSignature(commands: Array<{ command: string; description: string }>): string {
-  return JSON.stringify(commands);
-}
-
-function paginateKeyboard(items: KeyboardItem[], page: number, prefix: string): PaginatedKeyboard {
-  const totalPages = Math.max(1, Math.ceil(items.length / KEYBOARD_PAGE_SIZE));
-  const safePage = Math.max(0, Math.min(page, totalPages - 1));
-  const start = safePage * KEYBOARD_PAGE_SIZE;
-  const pageItems = items.slice(start, start + KEYBOARD_PAGE_SIZE);
-
-  const keyboard = new InlineKeyboard();
-  for (const item of pageItems) {
-    keyboard.text(item.label, item.callbackData).row();
-  }
-
-  if (totalPages > 1) {
-    if (safePage > 0) {
-      keyboard.text("◀️ Prev", `${prefix}_page_${safePage - 1}`);
-    }
-    keyboard.text(`${safePage + 1}/${totalPages}`, NOOP_PAGE_CALLBACK_DATA);
-    if (safePage < totalPages - 1) {
-      keyboard.text("Next ▶️", `${prefix}_page_${safePage + 1}`);
-    }
-    keyboard.row();
-  }
-
-  return {
-    keyboard,
-  };
-}
-
-function appendKeyboardItems(keyboard: InlineKeyboard, items: KeyboardItem[]): InlineKeyboard {
-  for (const item of items) {
-    keyboard.text(item.label, item.callbackData).row();
-  }
-
-  return keyboard;
-}
-
-function splitTreeKeyboardItems(buttons: KeyboardItem[]): {
-  navButtons: KeyboardItem[];
-  filterButtons: KeyboardItem[];
-} {
-  const navButtons = buttons.filter((button) => button.callbackData.startsWith("tree_nav_"));
-  const filterButtons = buttons.filter((button) => !button.callbackData.startsWith("tree_nav_"));
-  return { navButtons, filterButtons };
-}
-
-function getTelegramTarget(ctx: Context): PiSessionContext | undefined {
-  const chatId = ctx.chat?.id;
-  if (chatId === undefined || chatId === null) {
-    return undefined;
-  }
-
-  const messageThreadId =
-    ctx.message?.message_thread_id ??
-    (ctx.callbackQuery?.message && "message_thread_id" in ctx.callbackQuery.message
-      ? ctx.callbackQuery.message.message_thread_id
-      : undefined);
-
-  return messageThreadId !== undefined ? { chatId, messageThreadId } : { chatId };
-}
-
 export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegistry): Bot<Context> {
   const bot = new Bot<Context>(config.telegramBotToken);
   bot.api.config.use(autoRetry({ maxRetryAttempts: 3, maxDelaySeconds: 10 }));
 
-  const processingContexts = new Set<ContextKey>();
-  const switchingContexts = new Set<ContextKey>();
-  const transcribingContexts = new Set<ContextKey>();
+  const chatState = createBotChatState();
 
   const pendingSessionPicks = new Map<ContextKey, Array<{ path: string; cwd: string }>>();
   const pendingSessionButtons = new Map<ContextKey, KeyboardItem[]>();
@@ -370,15 +105,19 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
   const pendingTreeFilterButtons = new Map<ContextKey, KeyboardItem[]>();
   const pendingBranchButtons = new Map<ContextKey, KeyboardItem[]>();
   const pendingCommandPickers = new Map<ContextKey, PendingCommandPicker>();
-  const pendingExtensionDialogs = new Map<ContextKey, PendingExtensionDialog>();
-  const lastPromptStates = new Map<ContextKey, LastPromptState>();
   const chatScopedCommandSignatures = new Map<TelegramChatId, string>();
-  let extensionDialogCounter = 0;
 
   const getContextKey = (target: PiSessionContext): ContextKey => getPiSessionContextKey(target);
   const getExistingSession = (target: PiSessionContext): PiSessionService | undefined => sessionRegistry.get(target);
   const getOrCreateSession = async (target: PiSessionContext): Promise<PiSessionService> =>
     sessionRegistry.getOrCreate(target);
+
+  const extensionDialogs = createExtensionDialogManager({
+    getContextKey,
+    sendTextMessage: (target, text, options) => sendTextMessage(bot.api, target, text, options),
+    editMessage: (target, messageId, text, options) => safeEditMessage(bot, target, messageId, text, options),
+    defaultTimeoutMs: EXTENSION_UI_TIMEOUT_MS,
+  });
 
   const buildKeyboard = (
     items: KeyboardItem[],
@@ -451,258 +190,26 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
     pendingCommandPickers.delete(contextKey);
   };
 
-  const clearContextPromptMemory = (contextKey: ContextKey): void => {
-    lastPromptStates.delete(contextKey);
-  };
-
-  const clearPendingExtensionDialog = (contextKey: ContextKey): PendingExtensionDialog | undefined => {
-    const pendingDialog = pendingExtensionDialogs.get(contextKey);
-    if (!pendingDialog) {
-      return undefined;
-    }
-
-    pendingExtensionDialogs.delete(contextKey);
-    if (pendingDialog.timeoutId) {
-      clearTimeout(pendingDialog.timeoutId);
-    }
-    pendingDialog.abortCleanup?.();
-    return pendingDialog;
-  };
-
-  const resolvePendingExtensionDialogCancelled = (pendingDialog: PendingExtensionDialog): void => {
-    switch (pendingDialog.kind) {
-      case "confirm":
-        pendingDialog.resolve(false);
-        return;
-      case "select":
-      case "input":
-        pendingDialog.resolve(undefined);
-        return;
-    }
-  };
-
-  const finalizePendingExtensionDialog = async (
-    target: PiSessionContext,
-    pendingDialog: PendingExtensionDialog | undefined,
-    html: string,
-    fallbackText: string,
-  ): Promise<void> => {
-    if (!pendingDialog) {
-      return;
-    }
-
-    await safeEditMessage(bot, target, pendingDialog.messageId, html, {
-      fallbackText,
-      replyMarkup: undefined,
-    });
-  };
-
-  const nextExtensionDialogId = (): string => {
-    extensionDialogCounter += 1;
-    return extensionDialogCounter.toString(36);
-  };
-
-  const createDialogTimeout = (
-    contextKey: ContextKey,
-    target: PiSessionContext,
-    pendingDialog: PendingExtensionDialog,
-    onTimeout: () => void,
-    timeoutMs?: number,
-  ): NodeJS.Timeout | undefined => {
-    const delay = timeoutMs ?? EXTENSION_UI_TIMEOUT_MS;
-    return setTimeout(() => {
-      if (pendingExtensionDialogs.get(contextKey)?.dialogId !== pendingDialog.dialogId) {
-        return;
-      }
-      clearPendingExtensionDialog(contextKey);
-      void finalizePendingExtensionDialog(
-        target,
-        pendingDialog,
-        escapeHTML("Dialog timed out."),
-        "Dialog timed out.",
-      ).catch((error) => {
-        console.error("Failed to finalize timed-out extension dialog", error);
-      });
-      onTimeout();
-    }, delay);
+  const clearContextPromptMemory = (target: PiSessionContext): void => {
+    chatState.clearPromptMemory(target);
   };
 
   const isBusy = (target: PiSessionContext): boolean => {
-    const contextKey = getContextKey(target);
     const piSession = getExistingSession(target);
-    return (
-      processingContexts.has(contextKey) ||
-      switchingContexts.has(contextKey) ||
-      transcribingContexts.has(contextKey) ||
-      piSession?.isStreaming() === true
-    );
+    return chatState.isLocallyBusy(target) || piSession?.isStreaming() === true;
   };
 
   const sendBusyReply = async (ctx: Context): Promise<void> => {
     const target = getTelegramTarget(ctx);
-    const pendingDialog = target ? pendingExtensionDialogs.get(getContextKey(target)) : undefined;
-    const message = pendingDialog?.kind === "input"
+    const pendingDialogKind = target ? extensionDialogs.getPendingKind(target) : undefined;
+    const message = pendingDialogKind === "input"
       ? "Please answer the pending prompt above or use /abort."
-      : pendingDialog
+      : pendingDialogKind
         ? "Please answer the pending dialog above."
         : "Still working on previous message...";
     await safeReply(ctx, escapeHTML(message), {
       fallbackText: message,
     }, target);
-  };
-
-  const collectLabelsMap = (piSession: PiSessionService): Map<string, string> => {
-    const labels = new Map<string, string>();
-    const walk = (node: { entry: { id: string }; children: any[]; label?: string }): void => {
-      if (node.label) {
-        labels.set(node.entry.id, node.label);
-      }
-      for (const child of node.children) {
-        walk(child);
-      }
-    };
-
-    for (const root of piSession.getTree()) {
-      walk(root);
-    }
-
-    return labels;
-  };
-
-  const openSelectDialog = async (
-    target: PiSessionContext,
-    title: string,
-    options: string[],
-    dialogOptions?: { signal?: AbortSignal; timeout?: number },
-  ): Promise<string | undefined> => {
-    const contextKey = getContextKey(target);
-    if (pendingExtensionDialogs.has(contextKey)) {
-      throw new Error("TelePi already has a pending extension dialog for this chat/topic.");
-    }
-
-    const dialogId = nextExtensionDialogId();
-    const keyboard = new InlineKeyboard();
-    for (const [index, option] of options.entries()) {
-      keyboard.text(trimLine(option, 48), `ui_sel_${dialogId}_${index}`).row();
-    }
-    keyboard.text("Cancel", `ui_x_${dialogId}`).row();
-
-    const message = await sendTextMessage(bot.api, target, `<b>${escapeHTML(title)}</b>`, {
-      parseMode: "HTML",
-      fallbackText: title,
-      replyMarkup: keyboard,
-    });
-
-    return await new Promise<string | undefined>((resolve) => {
-      const pendingDialog: PendingExtensionDialog = {
-        kind: "select",
-        dialogId,
-        messageId: message.message_id,
-        title,
-        options,
-        resolve,
-      };
-      if (dialogOptions?.signal) {
-        const onAbort = () => {
-          clearPendingExtensionDialog(contextKey);
-          void finalizePendingExtensionDialog(target, pendingDialog, escapeHTML("Dialog cancelled."), "Dialog cancelled.");
-          resolve(undefined);
-        };
-        dialogOptions.signal.addEventListener("abort", onAbort, { once: true });
-        pendingDialog.abortCleanup = () => dialogOptions.signal?.removeEventListener("abort", onAbort);
-      }
-      pendingDialog.timeoutId = createDialogTimeout(contextKey, target, pendingDialog, () => resolve(undefined), dialogOptions?.timeout);
-      pendingExtensionDialogs.set(contextKey, pendingDialog);
-    });
-  };
-
-  const openConfirmDialog = async (
-    target: PiSessionContext,
-    title: string,
-    message: string,
-    dialogOptions?: { signal?: AbortSignal; timeout?: number },
-  ): Promise<boolean> => {
-    const contextKey = getContextKey(target);
-    if (pendingExtensionDialogs.has(contextKey)) {
-      throw new Error("TelePi already has a pending extension dialog for this chat/topic.");
-    }
-
-    const dialogId = nextExtensionDialogId();
-    const telegramMessage = await sendTextMessage(bot.api, target, `<b>${escapeHTML(title)}</b>\n${escapeHTML(message)}`, {
-      parseMode: "HTML",
-      fallbackText: `${title}\n${message}`,
-      replyMarkup: new InlineKeyboard()
-        .text("Yes", `ui_cfm_${dialogId}_yes`)
-        .text("No", `ui_cfm_${dialogId}_no`)
-        .row(),
-    });
-
-    return await new Promise<boolean>((resolve) => {
-      const pendingDialog: PendingExtensionDialog = {
-        kind: "confirm",
-        dialogId,
-        messageId: telegramMessage.message_id,
-        title,
-        message,
-        resolve,
-      };
-      if (dialogOptions?.signal) {
-        const onAbort = () => {
-          clearPendingExtensionDialog(contextKey);
-          void finalizePendingExtensionDialog(target, pendingDialog, escapeHTML("Dialog cancelled."), "Dialog cancelled.");
-          resolve(false);
-        };
-        dialogOptions.signal.addEventListener("abort", onAbort, { once: true });
-        pendingDialog.abortCleanup = () => dialogOptions.signal?.removeEventListener("abort", onAbort);
-      }
-      pendingDialog.timeoutId = createDialogTimeout(contextKey, target, pendingDialog, () => resolve(false), dialogOptions?.timeout);
-      pendingExtensionDialogs.set(contextKey, pendingDialog);
-    });
-  };
-
-  const openInputDialog = async (
-    target: PiSessionContext,
-    title: string,
-    placeholder?: string,
-    dialogOptions?: { signal?: AbortSignal; timeout?: number },
-  ): Promise<string | undefined> => {
-    const contextKey = getContextKey(target);
-    if (pendingExtensionDialogs.has(contextKey)) {
-      throw new Error("TelePi already has a pending extension dialog for this chat/topic.");
-    }
-
-    const dialogId = nextExtensionDialogId();
-    const fallbackText = placeholder ? `${title}\n${placeholder}` : title;
-    const telegramMessage = await sendTextMessage(bot.api, target, [
-      `<b>${escapeHTML(title)}</b>`,
-      placeholder ? `<i>${escapeHTML(placeholder)}</i>` : undefined,
-    ].filter((line): line is string => Boolean(line)).join("\n"), {
-      parseMode: "HTML",
-      fallbackText,
-      replyMarkup: new InlineKeyboard().text("Cancel", `ui_x_${dialogId}`).row(),
-    });
-
-    return await new Promise<string | undefined>((resolve) => {
-      const pendingDialog: PendingExtensionDialog = {
-        kind: "input",
-        dialogId,
-        messageId: telegramMessage.message_id,
-        title,
-        placeholder,
-        resolve,
-      };
-      if (dialogOptions?.signal) {
-        const onAbort = () => {
-          clearPendingExtensionDialog(contextKey);
-          void finalizePendingExtensionDialog(target, pendingDialog, escapeHTML("Input cancelled."), "Input cancelled.");
-          resolve(undefined);
-        };
-        dialogOptions.signal.addEventListener("abort", onAbort, { once: true });
-        pendingDialog.abortCleanup = () => dialogOptions.signal?.removeEventListener("abort", onAbort);
-      }
-      pendingDialog.timeoutId = createDialogTimeout(contextKey, target, pendingDialog, () => resolve(undefined), dialogOptions?.timeout);
-      pendingExtensionDialogs.set(contextKey, pendingDialog);
-    });
   };
 
   const ensureActiveSession = async (ctx: Context, target: PiSessionContext): Promise<PiSessionService | undefined> => {
@@ -777,437 +284,20 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
     await next();
   });
 
-  const handleUserPrompt = async (
-    ctx: Context,
-    target: PiSessionContext,
-    userText: string,
-    preloadedSlashCommands?: SlashCommandInfo[],
-  ): Promise<void> => {
-    const contextKey = getContextKey(target);
-    if (isBusy(target)) {
-      await sendBusyReply(ctx);
-      return;
-    }
-
-    processingContexts.add(contextKey);
-    lastPromptStates.set(contextKey, { text: userText });
-
-    try {
-      const piSession = await ensureActiveSession(ctx, target);
-      if (!piSession) {
-        return;
-      }
-
-      if (preloadedSlashCommands) {
-        void syncChatScopedCommands(target, preloadedSlashCommands).catch((error) => {
-          console.error("Failed to sync chat-scoped Telegram commands", error);
-        });
-      } else {
-        void refreshChatScopedCommands(target, piSession);
-      }
-
-      const abortKeyboard = new InlineKeyboard().text("⏹ Abort", "pi_abort");
-      const toolVerbosity: ToolVerbosity = config.toolVerbosity;
-      const toolStates = new Map<string, ToolState>();
-      const toolCounts = new Map<string, number>();
-      let accumulatedText = "";
-      let responseMessageId: number | undefined;
-      let responseMessagePromise: Promise<void> | undefined;
-      let lastRenderedText = "";
-      let lastEditAt = 0;
-      let flushTimer: NodeJS.Timeout | undefined;
-      let isFlushing = false;
-      let flushPending = false;
-      let finalized = false;
-
-      const typingInterval = setInterval(() => {
-        void sendChatAction(bot.api, target, "typing").catch(() => {});
-      }, TYPING_INTERVAL_MS);
-      void sendChatAction(bot.api, target, "typing").catch(() => {});
-
-      const stopTyping = (): void => {
-        clearInterval(typingInterval);
-      };
-
-      const clearFlushTimer = (): void => {
-        if (flushTimer) {
-          clearTimeout(flushTimer);
-          flushTimer = undefined;
-        }
-      };
-
-      const renderPreview = (): RenderedChunk => {
-        const previewText = buildStreamingPreview(accumulatedText);
-        return renderMarkdownChunkWithinLimit(previewText);
-      };
-
-      const buildFinalResponseText = (text: string): string => {
-        if (toolVerbosity !== "summary") {
-          return text.trim();
-        }
-
-        const summaryLine = formatToolSummaryLine(toolCounts);
-        const trimmedText = text.trim();
-        if (!summaryLine) {
-          return trimmedText;
-        }
-
-        return trimmedText ? `${trimmedText}\n\n${summaryLine}` : summaryLine;
-      };
-
-      const ensureResponseMessage = async (): Promise<void> => {
-        if (responseMessageId) {
-          return;
-        }
-        if (responseMessagePromise) {
-          await responseMessagePromise;
-          return;
-        }
-
-        responseMessagePromise = (async () => {
-          stopTyping();
-          const preview = renderPreview();
-          const message = await sendTextMessage(bot.api, target, preview.text, {
-            parseMode: preview.parseMode,
-            fallbackText: preview.fallbackText,
-            replyMarkup: abortKeyboard,
-          });
-          responseMessageId = message.message_id;
-          lastRenderedText = preview.text;
-          lastEditAt = Date.now();
-        })();
-
-        try {
-          await responseMessagePromise;
-        } finally {
-          responseMessagePromise = undefined;
-        }
-      };
-
-      const flushResponse = async (force = false): Promise<void> => {
-        if (!accumulatedText) {
-          return;
-        }
-        if (!responseMessageId) {
-          await ensureResponseMessage();
-          return;
-        }
-        if (isFlushing) {
-          flushPending = true;
-          return;
-        }
-
-        const now = Date.now();
-        if (!force && now - lastEditAt < EDIT_DEBOUNCE_MS) {
-          return;
-        }
-
-        const nextText = renderPreview();
-        if (nextText.text === lastRenderedText) {
-          return;
-        }
-
-        isFlushing = true;
-        try {
-          await safeEditMessage(bot, target, responseMessageId, nextText.text, {
-            parseMode: nextText.parseMode,
-            fallbackText: nextText.fallbackText,
-            replyMarkup: abortKeyboard,
-          });
-          lastRenderedText = nextText.text;
-          lastEditAt = Date.now();
-        } finally {
-          isFlushing = false;
-          if (flushPending) {
-            flushPending = false;
-            scheduleFlush();
-          }
-        }
-      };
-
-      const scheduleFlush = (): void => {
-        if (flushTimer || finalized) {
-          return;
-        }
-
-        const delay = Math.max(0, EDIT_DEBOUNCE_MS - (Date.now() - lastEditAt));
-        flushTimer = setTimeout(() => {
-          flushTimer = undefined;
-          void flushResponse().catch((error) => {
-            console.error("Failed to update Telegram response message", error);
-          });
-        }, delay);
-      };
-
-      const removeAbortKeyboard = async (): Promise<void> => {
-        if (!responseMessageId) {
-          return;
-        }
-
-        try {
-          await bot.api.editMessageReplyMarkup(target.chatId, responseMessageId, {
-            reply_markup: new InlineKeyboard(),
-          });
-        } catch (error) {
-          if (!isMessageNotModifiedError(error)) {
-            console.error("Failed to clear Abort button", error);
-          }
-        }
-      };
-
-      const deliverRenderedChunks = async (chunks: RenderedChunk[]): Promise<void> => {
-        if (chunks.length === 0) {
-          return;
-        }
-
-        const [firstChunk, ...remainingChunks] = chunks;
-        if (responseMessageId) {
-          await safeEditMessage(bot, target, responseMessageId, firstChunk.text, {
-            parseMode: firstChunk.parseMode,
-            fallbackText: firstChunk.fallbackText,
-          });
-          await removeAbortKeyboard();
-        } else {
-          const message = await sendTextMessage(bot.api, target, firstChunk.text, {
-            parseMode: firstChunk.parseMode,
-            fallbackText: firstChunk.fallbackText,
-          });
-          responseMessageId = message.message_id;
-        }
-
-        for (const chunk of remainingChunks) {
-          await sendTextMessage(bot.api, target, chunk.text, {
-            parseMode: chunk.parseMode,
-            fallbackText: chunk.fallbackText,
-          });
-        }
-      };
-
-      const finalizeResponse = async (): Promise<void> => {
-        if (finalized) {
-          return;
-        }
-        finalized = true;
-
-        stopTyping();
-        clearFlushTimer();
-        if (responseMessagePromise) {
-          try {
-            await responseMessagePromise;
-          } catch {
-            // If the initial send failed, we will fall back to sending the final response below.
-          }
-        }
-
-        const finalText = buildFinalResponseText(accumulatedText);
-        if (!finalText) {
-          const html = "<b>✅ Done</b>";
-          const plainText = "✅ Done";
-
-          if (responseMessageId) {
-            await safeEditMessage(bot, target, responseMessageId, html, { fallbackText: plainText });
-            await removeAbortKeyboard();
-          } else {
-            await safeReply(ctx, html, { fallbackText: plainText }, target);
-          }
-          return;
-        }
-
-        await deliverRenderedChunks(splitMarkdownForTelegram(finalText));
-      };
-
-      await piSession.bindExtensions({
-        commandContextActions: {
-          waitForIdle: async () => {
-            await piSession.getSession().agent.waitForIdle();
-          },
-          newSession: async () => {
-            const result = await piSession.newSession();
-            return { cancelled: !result.created };
-          },
-          fork: async (entryId) => piSession.fork(entryId),
-          navigateTree: async (targetId, options) => {
-            const result = await piSession.navigateTree(targetId, options);
-            return { cancelled: result.cancelled };
-          },
-          switchSession: async (sessionPath) => {
-            await piSession.switchSession(sessionPath);
-            return { cancelled: false };
-          },
-          reload: async () => {
-            await piSession.reload();
-          },
-        },
-        uiContext: createTelegramUIContext({
-          notify: (message, type) => {
-            const rendered = renderExtensionNotice(message, type);
-            void sendTextMessage(bot.api, target, rendered.text, {
-              parseMode: rendered.parseMode,
-              fallbackText: rendered.fallbackText,
-            }).catch((error) => {
-              console.error("Failed to send extension notification", error);
-            });
-          },
-          select: (title, options, dialogOptions) => openSelectDialog(target, title, options, dialogOptions),
-          confirm: (title, message, dialogOptions) => openConfirmDialog(target, title, message, dialogOptions),
-          input: (title, placeholder, dialogOptions) => openInputDialog(target, title, placeholder, dialogOptions),
-        }),
-        onError: (error) => {
-          const rendered = renderExtensionError(error.extensionPath, error.event, error.error);
-          void sendTextMessage(bot.api, target, rendered.text, {
-            parseMode: rendered.parseMode,
-            fallbackText: rendered.fallbackText,
-          }).catch((sendError) => {
-            console.error("Failed to send extension error", sendError);
-          });
-        },
-      });
-
-      const unsubscribe = piSession.subscribe({
-        onTextDelta: (delta) => {
-          accumulatedText += delta;
-          if (!responseMessageId) {
-            void ensureResponseMessage()
-              .then(() => {
-                scheduleFlush();
-              })
-              .catch((error) => {
-                console.error("Failed to send initial Telegram response message", error);
-              });
-            return;
-          }
-
-          scheduleFlush();
-        },
-        onToolStart: (toolName, toolCallId) => {
-          if (toolVerbosity === "summary") {
-            toolCounts.set(toolName, (toolCounts.get(toolName) ?? 0) + 1);
-            return;
-          }
-
-          if (toolVerbosity === "none") {
-            return;
-          }
-
-          toolStates.set(toolCallId, { toolName, partialResult: "" });
-          if (toolVerbosity !== "all") {
-            return;
-          }
-
-          const messageText = renderToolStartMessage(toolName);
-
-          void (async () => {
-            const message = await sendTextMessage(bot.api, target, messageText.text, {
-              parseMode: messageText.parseMode,
-              fallbackText: messageText.fallbackText,
-            });
-            const state = toolStates.get(toolCallId);
-            if (!state) {
-              return;
-            }
-
-            state.messageId = message.message_id;
-            if (state.finalStatus) {
-              await safeEditMessage(bot, target, state.messageId, state.finalStatus.text, {
-                parseMode: state.finalStatus.parseMode,
-                fallbackText: state.finalStatus.fallbackText,
-              });
-            }
-          })().catch((error) => {
-            console.error(`Failed to send tool start message for ${toolName}`, error);
-          });
-        },
-        onToolUpdate: (toolCallId, partialResult) => {
-          if (toolVerbosity === "none" || toolVerbosity === "summary") {
-            return;
-          }
-
-          const state = toolStates.get(toolCallId);
-          if (!state || !partialResult) {
-            return;
-          }
-
-          state.partialResult = appendWithCap(state.partialResult, partialResult, TOOL_OUTPUT_PREVIEW_LIMIT);
-        },
-        onToolEnd: (toolCallId, isError) => {
-          if (toolVerbosity === "none" || toolVerbosity === "summary") {
-            return;
-          }
-
-          const state = toolStates.get(toolCallId);
-          if (!state) {
-            return;
-          }
-
-          state.finalStatus = renderToolEndMessage(state.toolName, state.partialResult, isError);
-          if (toolVerbosity === "errors-only") {
-            if (!isError) {
-              return;
-            }
-
-            void sendTextMessage(bot.api, target, state.finalStatus.text, {
-              parseMode: state.finalStatus.parseMode,
-              fallbackText: state.finalStatus.fallbackText,
-            }).catch((error) => {
-              console.error(`Failed to send tool error message for ${state.toolName}`, error);
-            });
-            return;
-          }
-
-          if (!state.messageId) {
-            return;
-          }
-
-          void safeEditMessage(bot, target, state.messageId, state.finalStatus.text, {
-            parseMode: state.finalStatus.parseMode,
-            fallbackText: state.finalStatus.fallbackText,
-          }).catch((error) => {
-            console.error(`Failed to update tool message for ${state.toolName}`, error);
-          });
-        },
-        onAgentEnd: () => {
-          void finalizeResponse().catch((error) => {
-            console.error("Failed to finalize Telegram response message", error);
-          });
-        },
-      });
-
-      try {
-        await piSession.prompt(userText);
-        await finalizeResponse();
-      } catch (error) {
-        stopTyping();
-        clearFlushTimer();
-        if (responseMessagePromise) {
-          try {
-            await responseMessagePromise;
-          } catch {
-            // Ignore; we will send an error message below.
-          }
-        }
-
-        if (finalized) {
-          console.error("Pi prompt error after finalization:", formatError(error));
-        } else {
-          finalized = true;
-
-          const combinedText = buildFinalResponseText(renderPromptFailure(accumulatedText, error));
-          const chunks = splitMarkdownForTelegram(combinedText);
-          try {
-            await deliverRenderedChunks(chunks);
-          } catch (telegramError) {
-            console.error("Failed to send error message to Telegram:", telegramError);
-          }
-        }
-      } finally {
-        stopTyping();
-        clearFlushTimer();
-        unsubscribe();
-      }
-    } finally {
-      processingContexts.delete(contextKey);
-    }
-  };
+  const handleUserPrompt = createPromptHandler({
+    bot,
+    toolVerbosity: config.toolVerbosity,
+    editDebounceMs: EDIT_DEBOUNCE_MS,
+    typingIntervalMs: TYPING_INTERVAL_MS,
+    isBusy,
+    beginProcessing: (target, promptText) => chatState.beginProcessing(target, promptText),
+    endProcessing: (target) => chatState.endProcessing(target),
+    ensureActiveSession,
+    syncChatScopedCommands,
+    refreshChatScopedCommands,
+    extensionDialogs,
+    sendBusyReply,
+  });
 
   const renderCommandPickerState = (picker: PendingCommandPicker): RenderedText & {
     replyMarkup: InlineKeyboard;
@@ -1372,611 +462,81 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
     return { contextKey, picker };
   };
 
-  const handleStartCommand = async (ctx: Context, target: PiSessionContext): Promise<void> => {
-    const piSession = await getOrCreateSession(target);
-    await refreshChatScopedCommands(target, piSession);
-    const info = piSession.getInfo();
-    let voiceStatus: { backends: string[]; warning?: string } = { backends: [] };
-    try {
-      voiceStatus = (await getVoiceBackendStatus()) ?? { backends: [] };
-    } catch {
-      // Keep /start working even if backend probing fails.
-    }
-    const voiceInfoPlain = renderVoiceSupportPlain(voiceStatus.backends, voiceStatus.warning);
-    const voiceInfoHTML = renderVoiceSupportHTML(voiceStatus.backends, voiceStatus.warning);
-    const plainText = [
-      "TelePi is ready.",
-      "",
-      "Each Telegram chat/topic gets its own Pi session.",
-      "Send any text message to continue the current Pi session from Telegram.",
-      "Send a voice message or audio file to transcribe it into a Pi prompt.",
-      "Use /help to see all commands. Use /retry to resend the last prompt in this chat/topic.",
-      voiceInfoPlain,
-      "",
-      renderSessionInfoPlain(info),
-    ].join("\n");
-    const html = [
-      "<b>TelePi is ready.</b>",
-      "",
-      "Each Telegram chat/topic gets its own Pi session.",
-      "Send any text message to continue the current Pi session from Telegram.",
-      "Send a voice message or audio file to transcribe it into a Pi prompt.",
-      "Use <code>/help</code> to see all commands. Use <code>/retry</code> to resend the last prompt in this chat/topic.",
-      voiceInfoHTML,
-      "",
-      renderSessionInfoHTML(info),
-    ].join("\n");
+  const basicCommandHandlers = createBasicCommandHandlers({
+    sessionRegistry,
+    getExistingSession,
+    getOrCreateSession,
+    refreshChatScopedCommands,
+    openCommandPicker,
+    handleUserPrompt,
+    getLastPrompt: (target) => chatState.getLastPrompt(target),
+    extensionDialogs,
+    getVoiceBackendStatus,
+    safeReply,
+  });
+  const {
+    handleStartCommand,
+    handleHelpCommand,
+    handleCommandsCommand,
+    handleAbortCommand,
+    handleSessionCommand,
+    handleRetryCommand,
+  } = basicCommandHandlers;
 
-    await safeReply(ctx, html, { fallbackText: plainText }, target);
-  };
-
-  const handleHelpCommand = async (ctx: Context, target: PiSessionContext): Promise<void> => {
-    const info = sessionRegistry.getInfo(target);
-    await safeReply(ctx, renderHelpHTML(info), {
-      fallbackText: renderHelpPlain(info),
-    }, target);
-  };
-
-  const handleCommandsCommand = async (ctx: Context, target: PiSessionContext): Promise<void> => {
-    await openCommandPicker(ctx, target);
-  };
-
-  const handleAbortCommand = async (ctx: Context, target: PiSessionContext): Promise<void> => {
-    const contextKey = getContextKey(target);
-    const pendingDialog = clearPendingExtensionDialog(contextKey);
-    if (pendingDialog) {
-      resolvePendingExtensionDialogCancelled(pendingDialog);
-      await finalizePendingExtensionDialog(target, pendingDialog, escapeHTML("Dialog cancelled."), "Dialog cancelled.");
-    }
-
-    const piSession = getExistingSession(target);
-    if (!piSession?.hasActiveSession()) {
-      await safeReply(ctx, escapeHTML("No active session to abort."), {
-        fallbackText: "No active session to abort.",
-      }, target);
-      return;
-    }
-
-    try {
-      await piSession.abort();
-      await safeReply(ctx, escapeHTML("Aborted current operation"), {
-        fallbackText: "Aborted current operation",
-      }, target);
-    } catch (error) {
-      const failure = renderFailedText(error);
-      await safeReply(ctx, failure.text, {
-        fallbackText: failure.fallbackText,
-        parseMode: failure.parseMode,
-      }, target);
-    }
-  };
-
-  const handleSessionCommand = async (ctx: Context, target: PiSessionContext): Promise<void> => {
-    const info = sessionRegistry.getInfo(target);
-    await safeReply(ctx, renderSessionInfoHTML(info), {
-      fallbackText: renderSessionInfoPlain(info),
-    }, target);
-  };
-
-  const handleSessionsCommand = async (
-    ctx: Context,
-    target: PiSessionContext,
-    commandText?: string,
-  ): Promise<void> => {
-    const contextKey = getContextKey(target);
-
-    if (isBusy(target)) {
-      await safeReply(ctx, escapeHTML("Cannot switch sessions while a prompt is running."), {
-        fallbackText: "Cannot switch sessions while a prompt is running.",
-      }, target);
-      return;
-    }
-
-    const piSession = await getOrCreateSession(target);
-    const rawText = commandText ?? ctx.message?.text ?? "";
-    const sessionReference = rawText.replace(/^\/(?:sessions|switch)(?:@\w+)?\s*/, "").trim();
-    if (sessionReference) {
-      switchingContexts.add(contextKey);
-      try {
-        const resolvedSession = await piSession.resolveSessionReference(sessionReference);
-        const info = await piSession.switchSession(resolvedSession.path, resolvedSession.cwd);
-        await refreshChatScopedCommands(target, piSession);
-        clearContextPickers(contextKey);
-        clearContextPromptMemory(contextKey);
-        const workspaceNotePlain = resolvedSession.workspaceWarning
-          ? `\n\nWorkspace note: ${resolvedSession.workspaceWarning}`
-          : "";
-        const workspaceNoteHTML = resolvedSession.workspaceWarning
-          ? `\n\n<b>Workspace note:</b> ${escapeHTML(resolvedSession.workspaceWarning)}`
-          : "";
-        const plainText = `Switched session.${workspaceNotePlain}\n\n${renderSessionInfoPlain(info)}`;
-        const html = `<b>Switched session.</b>${workspaceNoteHTML}\n\n${renderSessionInfoHTML(info)}`;
-        await safeReply(ctx, html, { fallbackText: plainText }, target);
-      } catch (error) {
-        const failure = renderFailedText(error);
-        await safeReply(ctx, failure.text, {
-          fallbackText: failure.fallbackText,
-          parseMode: failure.parseMode,
-        }, target);
-      } finally {
-        switchingContexts.delete(contextKey);
-      }
-      return;
-    }
-
-    const allSessions = await piSession.listAllSessions();
-    if (allSessions.length === 0) {
-      await safeReply(ctx, escapeHTML("No saved sessions found."), {
-        fallbackText: "No saved sessions found.",
-      }, target);
-      return;
-    }
-
-    const orderedPicks: Array<{ path: string; cwd: string }> = [];
-    const sessionButtons: KeyboardItem[] = allSessions.map((session, idx) => {
-      const shortWorkspace = getWorkspaceShortName(session.cwd || "Unknown");
-      const label = trimLine(session.name || session.firstMessage, 35) || `Session ${idx + 1}`;
-      orderedPicks.push({ path: session.path, cwd: session.cwd });
-      return {
-        label: `📁 ${shortWorkspace.slice(0, 8)} · ${label.slice(0, 30)}`,
-        callbackData: `switch_${idx}`,
-      };
-    });
-
-    pendingSessionPicks.set(contextKey, orderedPicks);
-    pendingSessionButtons.set(contextKey, sessionButtons);
-
-    const keyboard = buildKeyboard(sessionButtons, 0, "switch");
-    const plainText = `Select a session to switch (${allSessions.length} found).`;
-    const html = `<b>Select a session to switch</b> <i>(${allSessions.length} found)</i>`;
-
-    await safeReply(ctx, html, {
-      fallbackText: plainText,
-      replyMarkup: keyboard,
-    }, target);
-  };
-
-  const handleNewCommand = async (ctx: Context, target: PiSessionContext): Promise<void> => {
-    const contextKey = getContextKey(target);
-
-    if (isBusy(target)) {
-      await safeReply(ctx, escapeHTML("Cannot create new session while a prompt is running."), {
-        fallbackText: "Cannot create new session while a prompt is running.",
-      }, target);
-      return;
-    }
-
-    const piSession = await getOrCreateSession(target);
-    const workspaces = await piSession.listWorkspaces();
-
-    if (workspaces.length <= 1) {
-      try {
-        const { info, created } = await piSession.newSession();
-        if (!created) {
-          await safeReply(ctx, escapeHTML("New session was cancelled."), {
-            fallbackText: "New session was cancelled.",
-          }, target);
-          return;
-        }
-
-        await refreshChatScopedCommands(target, piSession);
-        clearContextPickers(contextKey);
-        clearContextPromptMemory(contextKey);
-        const plainText = `New session created.\n\n${renderSessionInfoPlain(info)}`;
-        const html = `<b>New session created.</b>\n\n${renderSessionInfoHTML(info)}`;
-        await safeReply(ctx, html, { fallbackText: plainText }, target);
-      } catch (error) {
-        const failure = renderFailedText(error);
-        await safeReply(ctx, failure.text, {
-          fallbackText: failure.fallbackText,
-          parseMode: failure.parseMode,
-        }, target);
-      }
-      return;
-    }
-
-    pendingWorkspacePicks.set(contextKey, workspaces);
-    const currentWorkspace = piSession.getCurrentWorkspace();
-    const workspaceButtons = workspaces.map((workspace, index) => {
-      const shortName = getWorkspaceShortName(workspace);
-      const prefix = workspace === currentWorkspace ? "📂 " : "📁 ";
-      return {
-        label: `${prefix}${shortName}`,
-        callbackData: `newws_${index}`,
-      };
-    });
-    pendingWorkspaceButtons.set(contextKey, workspaceButtons);
-
-    await safeReply(ctx, "<b>Select workspace for new session:</b>", {
-      fallbackText: "Select workspace for new session:",
-      replyMarkup: buildKeyboard(workspaceButtons, 0, "newws"),
-    }, target);
-  };
-
-  const handleHandbackCommand = async (ctx: Context, target: PiSessionContext): Promise<void> => {
-    const contextKey = getContextKey(target);
-    const piSession = getExistingSession(target);
-
-    if (isBusy(target)) {
-      await safeReply(ctx, escapeHTML("Cannot hand back while a prompt is running. Use /abort first."), {
-        fallbackText: "Cannot hand back while a prompt is running. Use /abort first.",
-      }, target);
-      return;
-    }
-
-    if (!piSession?.hasActiveSession()) {
-      await safeReply(ctx, escapeHTML("No active session to hand back."), {
-        fallbackText: "No active session to hand back.",
-      }, target);
-      return;
-    }
-
-    try {
-      const { sessionFile, workspace } = await piSession.handback();
-      clearContextPickers(contextKey);
-      clearContextPromptMemory(contextKey);
-      sessionRegistry.remove(target);
-      chatScopedCommandSignatures.delete(target.chatId);
-      try {
-        await syncChatScopedCommands(target, []);
-      } catch (error) {
-        console.error("Failed to reset chat-scoped Telegram commands", error);
-      }
-
-      if (!sessionFile) {
-        await safeReply(ctx, escapeHTML("Session was in-memory. No file to resume.\nUse /new to start a fresh session."), {
-          fallbackText: "Session was in-memory. No file to resume.\nUse /new to start a fresh session.",
-        }, target);
-        return;
-      }
-
-      const shellEscape = (s: string): string => "'" + s.replace(/'/g, "'\\''") + "'";
-      const piCommand = `cd ${shellEscape(workspace)} && pi --session ${shellEscape(sessionFile)}`;
-      const piContinueCommand = `cd ${shellEscape(workspace)} && pi -c`;
-
-      let copiedToClipboard = false;
-      if (process.platform === "darwin") {
-        try {
-          const { spawnSync } = await import("node:child_process");
-          const result = spawnSync("pbcopy", [], {
-            input: piCommand,
-            timeout: 2000,
-            stdio: ["pipe", "ignore", "ignore"],
-          });
-          copiedToClipboard = result.status === 0;
-        } catch {
-          // Ignore clipboard failures.
-        }
-      }
-
-      const plainText = [
-        "🔄 Session handed back to Pi CLI.",
-        "",
-        "Run this in your terminal:",
-        piCommand,
-        "",
-        "Or simply:",
-        piContinueCommand,
-        "(to continue the most recent session)",
-        copiedToClipboard ? "" : undefined,
-        copiedToClipboard ? "📋 Command copied to clipboard!" : undefined,
-        "",
-        "Send any message here to start a new TelePi session.",
-      ]
-        .filter((line): line is string => line !== undefined)
-        .join("\n");
-
-      const html = [
-        "<b>🔄 Session handed back to Pi CLI.</b>",
-        "",
-        "Run this in your terminal:",
-        `<pre>${escapeHTML(piCommand)}</pre>`,
-        "",
-        "Or simply:",
-        `<pre>${escapeHTML(piContinueCommand)}</pre>`,
-        "<i>(to continue the most recent session)</i>",
-        copiedToClipboard ? "" : undefined,
-        copiedToClipboard ? "📋 <i>Command copied to clipboard!</i>" : undefined,
-        "",
-        "Send any message here to start a new TelePi session.",
-      ]
-        .filter((line): line is string => line !== undefined)
-        .join("\n");
-
-      await safeReply(ctx, html, { fallbackText: plainText }, target);
-    } catch (error) {
-      const failure = renderFailedText(error);
-      await safeReply(ctx, failure.text, {
-        fallbackText: failure.fallbackText,
-        parseMode: failure.parseMode,
-      }, target);
-    }
-  };
-
-  const renderModelPicker = async (
-    ctx: Context,
-    target: PiSessionContext,
-    piSession: PiSessionService,
-    options?: { showAll?: boolean; messageId?: number },
-  ): Promise<void> => {
-    const contextKey = getContextKey(target);
-    const showAll = options?.showAll ?? false;
-    const messageId = options?.messageId;
-    const models = await piSession.listModels(showAll);
-
-    if (models.length === 0) {
-      const message = "No models available.";
-      if (messageId) {
-        await safeEditMessage(bot, target, messageId, escapeHTML(message), { fallbackText: message });
+  const sessionCommandHandlers = createSessionCommandHandlers({
+    getContextKey,
+    getOrCreateSession,
+    getExistingSession,
+    isBusy,
+    beginSwitching: (target) => chatState.beginSwitching(target),
+    endSwitching: (target) => chatState.endSwitching(target),
+    buildKeyboard,
+    clearContextPickers,
+    clearContextPromptMemory,
+    refreshChatScopedCommands,
+    syncChatScopedCommands,
+    setChatCommandSignature: (chatId, signature) => {
+      if (signature === undefined) {
+        chatScopedCommandSignatures.delete(chatId);
       } else {
-        await safeReply(ctx, escapeHTML(message), { fallbackText: message }, target);
+        chatScopedCommandSignatures.set(chatId, signature);
       }
-      return;
-    }
+    },
+    removeSession: (target) => sessionRegistry.remove(target),
+    pendingSessionPicks,
+    pendingSessionButtons,
+    pendingWorkspacePicks,
+    pendingWorkspaceButtons,
+    safeReply,
+  });
+  const { handleSessionsCommand, handleNewCommand, handleHandbackCommand } = sessionCommandHandlers;
 
-    pendingModelPicks.set(contextKey, models);
+  const modelCommandHandlers = createModelCommandHandlers({
+    getContextKey,
+    getOrCreateSession,
+    isBusy,
+    refreshChatScopedCommands,
+    pendingModelPicks,
+    pendingModelButtons,
+    pendingModelExtraButtons,
+    buildKeyboard,
+    safeReply,
+    safeEditMessage: (target, messageId, text, options) => safeEditMessage(bot, target, messageId, text, options),
+  });
+  const { renderModelPicker, handleModelCommand } = modelCommandHandlers;
 
-    const modelButtons = models.map((model, index) => {
-      const modelRef = `${model.provider}/${model.id}`;
-      const nameSuffix = model.name && model.name !== model.id ? ` · ${model.name}` : "";
-      const thinkingSuffix = model.thinkingLevel ? ` : ${model.thinkingLevel}` : "";
-      return {
-        label: `${model.current ? "✅ " : ""}${modelRef}${nameSuffix}${thinkingSuffix}`,
-        callbackData: `model_${index}`,
-      };
-    });
-    pendingModelButtons.set(contextKey, modelButtons);
-
-    let extraButtons: KeyboardItem[] = [];
-    if (!showAll) {
-      const allModels = await piSession.listModels(true);
-      if (allModels.length > models.length) {
-        extraButtons = [{ label: "Show all models", callbackData: "model_show_all" }];
-      }
-    }
-    pendingModelExtraButtons.set(contextKey, extraButtons);
-
-    const info = piSession.getInfo();
-    const currentModelText = info.model ? `Current: ${info.model}` : "No model selected";
-    const scopeHint = extraButtons.length > 0 ? "Showing the current Pi model scope." : undefined;
-    const html = ["<b>Select a model</b>", escapeHTML(currentModelText), scopeHint ? `<i>${escapeHTML(scopeHint)}</i>` : undefined]
-      .filter((line): line is string => line !== undefined)
-      .join("\n");
-    const fallbackText = ["Select a model", currentModelText, scopeHint]
-      .filter((line): line is string => line !== undefined)
-      .join("\n");
-    const replyMarkup = buildKeyboard(modelButtons, 0, "model", extraButtons);
-
-    if (messageId) {
-      await safeEditMessage(bot, target, messageId, html, { fallbackText, replyMarkup });
-      return;
-    }
-
-    await safeReply(ctx, html, { fallbackText, replyMarkup }, target);
-  };
-
-  const handleModelCommand = async (ctx: Context, target: PiSessionContext): Promise<void> => {
-    const piSession = await getOrCreateSession(target);
-
-    if (!piSession.hasActiveSession()) {
-      try {
-        await piSession.newSession();
-      } catch (error) {
-        const failure = renderPrefixedError("Failed to create session", error);
-        await safeReply(ctx, failure.text, {
-          fallbackText: failure.fallbackText,
-          parseMode: failure.parseMode,
-        }, target);
-        return;
-      }
-    }
-
-    await refreshChatScopedCommands(target, piSession);
-    await renderModelPicker(ctx, target, piSession);
-  };
-
-  const handleTreeCommand = async (
-    ctx: Context,
-    target: PiSessionContext,
-    commandText?: string,
-  ): Promise<void> => {
-    const contextKey = getContextKey(target);
-    const piSession = getExistingSession(target);
-
-    if (isBusy(target)) {
-      await safeReply(ctx, escapeHTML("Cannot view tree while a prompt is running."), {
-        fallbackText: "Cannot view tree while a prompt is running.",
-      }, target);
-      return;
-    }
-
-    if (!piSession?.hasActiveSession()) {
-      await safeReply(ctx, escapeHTML("No active session. Send a message to start one."), {
-        fallbackText: "No active session. Send a message to start one.",
-      }, target);
-      return;
-    }
-
-    const rawText = commandText ?? ctx.message?.text ?? "";
-    const arg = rawText.replace(/^\/tree(?:@\w+)?\s*/, "").trim().toLowerCase();
-    let mode: TreeFilterMode = "default";
-    if (arg === "all") {
-      mode = "all-with-buttons";
-    } else if (arg === "user") {
-      mode = "user-only";
-    }
-
-    const tree = piSession.getTree();
-    const leafId = piSession.getLeafId();
-    const result = renderTree(tree, leafId, { mode });
-
-    if (result.buttons.length === 0) {
-      clearPendingTreeKeyboard(contextKey);
-      await safeReply(ctx, result.text, { fallbackText: stripHtml(result.text) }, target);
-      return;
-    }
-
-    const keyboard = setPendingTreeKeyboard(contextKey, result.buttons);
-
-    await safeReply(ctx, result.text, {
-      fallbackText: stripHtml(result.text),
-      replyMarkup: keyboard,
-    }, target);
-  };
-
-  const handleBranchCommand = async (
-    ctx: Context,
-    target: PiSessionContext,
-    commandText?: string,
-  ): Promise<void> => {
-    const contextKey = getContextKey(target);
-    const piSession = getExistingSession(target);
-
-    if (isBusy(target)) {
-      await safeReply(ctx, escapeHTML("Cannot navigate while a prompt is running."), {
-        fallbackText: "Cannot navigate while a prompt is running.",
-      }, target);
-      return;
-    }
-
-    if (!piSession?.hasActiveSession()) {
-      await safeReply(ctx, escapeHTML("No active session."), { fallbackText: "No active session." }, target);
-      return;
-    }
-
-    const rawText = commandText ?? ctx.message?.text ?? "";
-    const entryId = rawText.replace(/^\/branch(?:@\w+)?\s*/, "").trim();
-    if (!entryId) {
-      await safeReply(ctx, escapeHTML("Usage: /branch <entry-id>\nUse /tree to see entry IDs."), {
-        fallbackText: "Usage: /branch <entry-id>\nUse /tree to see entry IDs.",
-      }, target);
-      return;
-    }
-
-    const entry = piSession.getEntry(entryId);
-    if (!entry) {
-      await safeReply(ctx, escapeHTML(`Entry not found: ${entryId}`), {
-        fallbackText: `Entry not found: ${entryId}`,
-      }, target);
-      return;
-    }
-
-    const leafId = piSession.getLeafId();
-    if (entry.id === leafId) {
-      await safeReply(ctx, escapeHTML("You're already at this point."), {
-        fallbackText: "You're already at this point.",
-      }, target);
-      return;
-    }
-
-    const children = piSession.getChildren(entry.id);
-    const confirmation = renderBranchConfirmation(entry, children, leafId, collectLabelsMap(piSession));
-
-    pendingTreeNavs.set(contextKey, entry.id);
-    pendingBranchButtons.set(contextKey, confirmation.buttons);
-
-    await safeReply(ctx, confirmation.text, {
-      fallbackText: stripHtml(confirmation.text),
-      replyMarkup: buildKeyboard(confirmation.buttons, 0, "branch"),
-    }, target);
-  };
-
-  const handleLabelCommand = async (
-    ctx: Context,
-    target: PiSessionContext,
-    commandText?: string,
-  ): Promise<void> => {
-    const piSession = getExistingSession(target);
-
-    if (isBusy(target)) {
-      await safeReply(ctx, escapeHTML("Cannot label entries while a prompt is running."), {
-        fallbackText: "Cannot label entries while a prompt is running.",
-      }, target);
-      return;
-    }
-
-    if (!piSession?.hasActiveSession()) {
-      await safeReply(ctx, escapeHTML("No active session."), { fallbackText: "No active session." }, target);
-      return;
-    }
-
-    const rawText = commandText ?? ctx.message?.text ?? "";
-    const args = rawText.replace(/^\/label(?:@\w+)?\s*/, "").trim();
-
-    if (!args) {
-      const labelsText = renderLabels(piSession.getTree());
-      await safeReply(ctx, labelsText, { fallbackText: stripHtml(labelsText) }, target);
-      return;
-    }
-
-    const clearMatch = args.match(/^clear\s+(\S+)/i);
-    if (clearMatch) {
-      const targetId = clearMatch[1];
-      const entry = piSession.getEntry(targetId);
-      if (!entry) {
-        await safeReply(ctx, escapeHTML(`Entry not found: ${targetId}`), {
-          fallbackText: `Entry not found: ${targetId}`,
-        }, target);
-        return;
-      }
-
-      piSession.setLabel(targetId, "");
-      await safeReply(ctx, `🏷️ Label cleared on <code>${escapeHTML(targetId)}</code>`, {
-        fallbackText: `🏷️ Label cleared on ${targetId}`,
-      }, target);
-      return;
-    }
-
-    const parts = args.split(/\s+/);
-    if (parts.length >= 2) {
-      const maybeId = parts[0];
-      const entry = piSession.getEntry(maybeId);
-      if (entry) {
-        const labelName = parts.slice(1).join(" ");
-        piSession.setLabel(maybeId, labelName);
-        await safeReply(
-          ctx,
-          `🏷️ Label <b>${escapeHTML(labelName)}</b> set on <code>${escapeHTML(maybeId)}</code>`,
-          {
-            fallbackText: `🏷️ Label "${labelName}" set on ${maybeId}`,
-          },
-          target,
-        );
-        return;
-      }
-    }
-
-    const leafId = piSession.getLeafId();
-    if (!leafId) {
-      await safeReply(ctx, escapeHTML("No current leaf to label. Send a message first."), {
-        fallbackText: "No current leaf to label. Send a message first.",
-      }, target);
-      return;
-    }
-
-    piSession.setLabel(leafId, args);
-    await safeReply(
-      ctx,
-      `🏷️ Label <b>${escapeHTML(args)}</b> set on current leaf <code>${escapeHTML(leafId)}</code>`,
-      {
-        fallbackText: `🏷️ Label "${args}" set on current leaf ${leafId}`,
-      },
-      target,
-    );
-  };
-
-  const handleRetryCommand = async (ctx: Context, target: PiSessionContext): Promise<void> => {
-    const contextKey = getContextKey(target);
-    const lastPrompt = lastPromptStates.get(contextKey);
-    if (!lastPrompt) {
-      await safeReply(ctx, escapeHTML("Nothing to retry yet in this chat/topic."), {
-        fallbackText: "Nothing to retry yet in this chat/topic.",
-      }, target);
-      return;
-    }
-
-    await handleUserPrompt(ctx, target, lastPrompt.text);
-  };
+  const treeCommandHandlers = createTreeCommandHandlers({
+    getContextKey,
+    getExistingSession,
+    isBusy,
+    pendingTreeNavs,
+    pendingBranchButtons,
+    clearPendingTreeKeyboard,
+    setPendingTreeKeyboard,
+    buildKeyboard,
+    safeReply,
+  });
+  const { collectLabelsMap, handleTreeCommand, handleBranchCommand, handleLabelCommand } = treeCommandHandlers;
 
   const runTelePiPickerCommand = async (
     ctx: Context,
@@ -2169,23 +729,14 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
       return;
     }
 
-    const contextKey = getContextKey(target);
-    const pendingDialog = pendingExtensionDialogs.get(contextKey);
-    if (!pendingDialog || pendingDialog.kind !== "select" || pendingDialog.dialogId !== dialogId || pendingDialog.messageId !== ctx.callbackQuery.message?.message_id) {
-      await ctx.answerCallbackQuery({ text: "Dialog expired" });
-      return;
-    }
-
-    const selected = pendingDialog.options[optionIndex];
-    if (!selected) {
-      await ctx.answerCallbackQuery({ text: "Option expired" });
-      return;
-    }
-
-    clearPendingExtensionDialog(contextKey);
-    await ctx.answerCallbackQuery({ text: `Selected ${trimLine(selected, 32)}` });
-    await finalizePendingExtensionDialog(target, pendingDialog, `<b>${escapeHTML(pendingDialog.title)}</b>\n<i>Selected:</i> ${escapeHTML(selected)}`, `${pendingDialog.title}\nSelected: ${selected}`);
-    pendingDialog.resolve(selected);
+    const result = await extensionDialogs.resolveSelect(
+      target,
+      dialogId,
+      ctx.callbackQuery.message?.message_id,
+      optionIndex,
+    );
+    await ctx.answerCallbackQuery({ text: result.callbackText });
+    await result.afterAnswer?.();
   });
 
   bot.callbackQuery(/^ui_cfm_([a-z0-9]+)_(yes|no)$/, async (ctx) => {
@@ -2196,23 +747,14 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
       return;
     }
 
-    const contextKey = getContextKey(target);
-    const pendingDialog = pendingExtensionDialogs.get(contextKey);
-    if (!pendingDialog || pendingDialog.kind !== "confirm" || pendingDialog.dialogId !== dialogId || pendingDialog.messageId !== ctx.callbackQuery.message?.message_id) {
-      await ctx.answerCallbackQuery({ text: "Dialog expired" });
-      return;
-    }
-
-    const confirmed = answer === "yes";
-    clearPendingExtensionDialog(contextKey);
-    await ctx.answerCallbackQuery({ text: confirmed ? "Confirmed" : "Cancelled" });
-    await finalizePendingExtensionDialog(
+    const result = await extensionDialogs.resolveConfirm(
       target,
-      pendingDialog,
-      `<b>${escapeHTML(pendingDialog.title)}</b>\n<i>${confirmed ? "Confirmed" : "Cancelled"}</i>`,
-      `${pendingDialog.title}\n${confirmed ? "Confirmed" : "Cancelled"}`,
+      dialogId,
+      ctx.callbackQuery.message?.message_id,
+      answer === "yes",
     );
-    pendingDialog.resolve(confirmed);
+    await ctx.answerCallbackQuery({ text: result.callbackText });
+    await result.afterAnswer?.();
   });
 
   bot.callbackQuery(/^ui_x_([a-z0-9]+)$/, async (ctx) => {
@@ -2222,17 +764,13 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
       return;
     }
 
-    const contextKey = getContextKey(target);
-    const pendingDialog = pendingExtensionDialogs.get(contextKey);
-    if (!pendingDialog || pendingDialog.dialogId !== dialogId || pendingDialog.messageId !== ctx.callbackQuery.message?.message_id) {
-      await ctx.answerCallbackQuery({ text: "Dialog expired" });
-      return;
-    }
-
-    clearPendingExtensionDialog(contextKey);
-    await ctx.answerCallbackQuery({ text: "Cancelled" });
-    resolvePendingExtensionDialogCancelled(pendingDialog);
-    await finalizePendingExtensionDialog(target, pendingDialog, escapeHTML("Dialog cancelled."), "Dialog cancelled.");
+    const result = await extensionDialogs.resolveCancel(
+      target,
+      dialogId,
+      ctx.callbackQuery.message?.message_id,
+    );
+    await ctx.answerCallbackQuery({ text: result.callbackText });
+    await result.afterAnswer?.();
   });
 
   handlePageCallback(/^switch_page_(\d+)$/, "switch", pendingSessionButtons, "Expired, run /sessions again");
@@ -2368,13 +906,13 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
     pendingSessionPicks.delete(contextKey);
     pendingSessionButtons.delete(contextKey);
 
-    switchingContexts.add(contextKey);
+    chatState.beginSwitching(target);
     try {
       const resolvedSession = await piSession.resolveSessionReference(sessions[index].path);
       const info = await piSession.switchSession(resolvedSession.path, resolvedSession.cwd);
       await refreshChatScopedCommands(target, piSession);
       clearPendingTreeKeyboard(contextKey);
-      clearContextPromptMemory(contextKey);
+      clearContextPromptMemory(target);
       const workspaceNotePlain = resolvedSession.workspaceWarning
         ? `\n\nWorkspace note: ${resolvedSession.workspaceWarning}`
         : "";
@@ -2404,7 +942,7 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
         }, target);
       }
     } finally {
-      switchingContexts.delete(contextKey);
+      chatState.endSwitching(target);
     }
   });
 
@@ -2434,7 +972,7 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
     pendingWorkspacePicks.delete(contextKey);
     pendingWorkspaceButtons.delete(contextKey);
 
-    switchingContexts.add(contextKey);
+    chatState.beginSwitching(target);
     try {
       const { info, created } = await piSession.newSession(workspaces[index]);
       if (!created) {
@@ -2447,7 +985,7 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
 
       await refreshChatScopedCommands(target, piSession);
       clearPendingTreeKeyboard(contextKey);
-      clearContextPromptMemory(contextKey);
+      clearContextPromptMemory(target);
       const plainText = `New session created.\n\n${renderSessionInfoPlain(info)}`;
       const html = `<b>New session created.</b>\n\n${renderSessionInfoHTML(info)}`;
 
@@ -2471,7 +1009,7 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
         }, target);
       }
     } finally {
-      switchingContexts.delete(contextKey);
+      chatState.endSwitching(target);
     }
   });
 
@@ -2527,7 +1065,7 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
     pendingModelButtons.delete(contextKey);
     pendingModelExtraButtons.delete(contextKey);
 
-    switchingContexts.add(contextKey);
+    chatState.beginSwitching(target);
     try {
       const modelName = await piSession.setModel(models[index].provider, models[index].id, models[index].thinkingLevel);
       const html = `<b>Model switched to:</b> <code>${escapeHTML(modelName)}</code>`;
@@ -2553,7 +1091,7 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
         parseMode: failure.parseMode,
       }, target);
     } finally {
-      switchingContexts.delete(contextKey);
+      chatState.endSwitching(target);
     }
   });
 
@@ -2644,7 +1182,7 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
     pendingTreeButtons.delete(contextKey);
     pendingTreeFilterButtons.delete(contextKey);
 
-    switchingContexts.add(contextKey);
+    chatState.beginSwitching(target);
     try {
       const result = await piSession.navigateTree(entryId);
       if (result.cancelled) {
@@ -2685,7 +1223,7 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
         }, target);
       }
     } finally {
-      switchingContexts.delete(contextKey);
+      chatState.endSwitching(target);
     }
   });
 
@@ -2717,7 +1255,7 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
     pendingTreeButtons.delete(contextKey);
     pendingTreeFilterButtons.delete(contextKey);
 
-    switchingContexts.add(contextKey);
+    chatState.beginSwitching(target);
     try {
       const result = await piSession.navigateTree(entryId, { summarize: true });
       if (result.cancelled) {
@@ -2758,7 +1296,7 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
         }, target);
       }
     } finally {
-      switchingContexts.delete(contextKey);
+      chatState.endSwitching(target);
     }
   });
 
@@ -2843,20 +1381,11 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
       return;
     }
 
-    const pendingDialog = pendingExtensionDialogs.get(contextKey);
-    if (pendingDialog?.kind === "input") {
-      clearPendingExtensionDialog(contextKey);
-      await finalizePendingExtensionDialog(
-        target,
-        pendingDialog,
-        `<b>${escapeHTML(pendingDialog.title)}</b>\n<i>Received:</i> ${escapeHTML(userText)}`,
-        `${pendingDialog.title}\nReceived: ${userText}`,
-      );
-      pendingDialog.resolve(userText);
+    if (await extensionDialogs.consumeInput(target, userText)) {
       return;
     }
 
-    if (pendingDialog) {
+    if (extensionDialogs.hasPending(target)) {
       await safeReply(ctx, escapeHTML("Please answer the pending dialog above."), {
         fallbackText: "Please answer the pending dialog above.",
       }, target);
@@ -2901,7 +1430,7 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
       return;
     }
 
-    transcribingContexts.add(contextKey);
+    chatState.beginTranscribing(target);
     let tempFilePath: string | undefined;
     let transcript: string | undefined;
 
@@ -2933,7 +1462,7 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
       }, target);
       return;
     } finally {
-      transcribingContexts.delete(contextKey);
+      chatState.endTranscribing(target);
       if (tempFilePath) {
         await unlink(tempFilePath).catch(() => {});
       }
@@ -2955,477 +1484,4 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
 
 export async function registerCommands(bot: Bot<Context>): Promise<void> {
   await bot.api.setMyCommands([...TELEPI_BOT_COMMANDS]);
-}
-
-function renderHelpPlain(info: PiSessionInfo): string {
-  return [
-    "TelePi commands:",
-    "/start — welcome message and session info",
-    "/help — show this help",
-    "/commands — browse TelePi and Pi commands",
-    "/new — start a new session",
-    "/retry — resend the last prompt in this chat/topic",
-    "/handback — hand the current session back to Pi CLI",
-    "/abort — cancel the current Pi operation",
-    "/session — show current session details",
-    "/sessions — list and switch saved sessions",
-    "/sessions <path|id> — switch directly to a session file or session ID",
-    "/model — switch AI model",
-    "/tree — view the session tree",
-    "/branch <id> — navigate to a tree entry",
-    "/label [args] — add, clear, or list labels",
-    "",
-    "Notes:",
-    "- Each Telegram chat/topic has its own Pi session and retry history.",
-    "- Voice messages are transcribed and then sent as prompts.",
-    "",
-    renderSessionInfoPlain(info),
-  ].join("\n");
-}
-
-function renderHelpHTML(info: PiSessionInfo): string {
-  return [
-    "<b>TelePi commands</b>",
-    "<code>/start</code> — welcome message and session info",
-    "<code>/help</code> — show this help",
-    "<code>/commands</code> — browse TelePi and Pi commands",
-    "<code>/new</code> — start a new session",
-    "<code>/retry</code> — resend the last prompt in this chat/topic",
-    "<code>/handback</code> — hand the current session back to Pi CLI",
-    "<code>/abort</code> — cancel the current Pi operation",
-    "<code>/session</code> — show current session details",
-    "<code>/sessions</code> — list and switch saved sessions",
-    "<code>/sessions &lt;path|id&gt;</code> — switch directly to a session file or session ID",
-    "<code>/model</code> — switch AI model",
-    "<code>/tree</code> — view the session tree",
-    "<code>/branch &lt;id&gt;</code> — navigate to a tree entry",
-    "<code>/label [args]</code> — add, clear, or list labels",
-    "",
-    "<b>Notes</b>",
-    "- Each Telegram chat/topic has its own Pi session and retry history.",
-    "- Voice messages are transcribed and then sent as prompts.",
-    "",
-    renderSessionInfoHTML(info),
-  ].join("\n");
-}
-
-function renderSessionInfoPlain(info: PiSessionInfo): string {
-  return [
-    `Session ID: ${info.sessionId}`,
-    `Session file: ${info.sessionFile ?? "(in-memory)"}`,
-    `Workspace: ${info.workspace}`,
-    info.sessionName ? `Session name: ${info.sessionName}` : undefined,
-    info.model ? `Model: ${info.model}` : undefined,
-    info.modelFallbackMessage ? `Model note: ${info.modelFallbackMessage}` : undefined,
-  ]
-    .filter((line): line is string => Boolean(line))
-    .join("\n");
-}
-
-function renderSessionInfoHTML(info: PiSessionInfo): string {
-  return [
-    `<b>Session ID:</b> <code>${escapeHTML(info.sessionId)}</code>`,
-    `<b>Session file:</b> <code>${escapeHTML(info.sessionFile ?? "(in-memory)")}</code>`,
-    `<b>Workspace:</b> <code>${escapeHTML(info.workspace)}</code>`,
-    info.sessionName ? `<b>Session name:</b> <code>${escapeHTML(info.sessionName)}</code>` : undefined,
-    info.model ? `<b>Model:</b> <code>${escapeHTML(info.model)}</code>` : undefined,
-    info.modelFallbackMessage
-      ? `<b>Model note:</b> ${escapeHTML(info.modelFallbackMessage)}`
-      : undefined,
-  ]
-    .filter((line): line is string => Boolean(line))
-    .join("\n");
-}
-
-function renderVoiceSupportPlain(backends: string[], warning?: string): string {
-  const status = backends.length === 0
-    ? "Voice transcription: unavailable (install parakeet-coreml + ffmpeg, or on Intel Macs install sherpa-onnx-node + SHERPA_ONNX_MODEL_DIR, or set OPENAI_API_KEY)."
-    : `Voice transcription: ${backends.join(", ")}.`;
-
-  return warning ? `${status}\nWarning: ${warning}` : status;
-}
-
-function renderVoiceSupportHTML(backends: string[], warning?: string): string {
-  const status = backends.length === 0
-    ? "<i>Voice transcription unavailable.</i> Install <code>parakeet-coreml</code>, or on Intel Macs install <code>sherpa-onnx-node</code> with <code>SHERPA_ONNX_MODEL_DIR</code>, or set <code>OPENAI_API_KEY</code>."
-    : `<i>Voice transcription available via:</i> <code>${escapeHTML(backends.join(", "))}</code>`;
-
-  return warning ? `${status}\n⚠️ ${escapeHTML(warning)}` : status;
-}
-
-function renderToolStartMessage(toolName: string): RenderedText {
-  return {
-    text: `<b>🔧 Running:</b> <code>${escapeHTML(toolName)}</code>`,
-    fallbackText: `🔧 Running: ${toolName}`,
-    parseMode: "HTML",
-  };
-}
-
-function renderToolEndMessage(toolName: string, partialResult: string, isError: boolean): RenderedText {
-  const preview = summarizeToolOutput(partialResult);
-  const icon = isError ? "❌" : "✅";
-  const htmlLines = [`<b>${icon}</b> <code>${escapeHTML(toolName)}</code>`];
-  const plainLines = [`${icon} ${toolName}`];
-
-  if (preview) {
-    htmlLines.push(`<pre>${escapeHTML(preview)}</pre>`);
-    plainLines.push(preview);
-  }
-
-  return {
-    text: htmlLines.join("\n"),
-    fallbackText: plainLines.join("\n"),
-    parseMode: "HTML",
-  };
-}
-
-function formatToolSummaryLine(toolCounts: Map<string, number>): string {
-  if (toolCounts.size === 0) {
-    return "";
-  }
-
-  const entries = [...toolCounts.entries()].sort((left, right) => {
-    const countDelta = right[1] - left[1];
-    return countDelta !== 0 ? countDelta : left[0].localeCompare(right[0]);
-  });
-  const totalCount = entries.reduce((sum, [, n]) => sum + n, 0);
-  const label = totalCount === 1 ? "tool used" : "tools used";
-  const tools = entries
-    .map(([name, n]) => (n === 1 ? name : `${name} ×${n}`))
-    .join(", ");
-  return `🔧 ${totalCount} ${label}: ${tools}`;
-}
-
-async function safeReply(
-  ctx: Context,
-  text: string,
-  options: TextOptions = {},
-  target = getTelegramTarget(ctx),
-): Promise<void> {
-  if (!target) {
-    return;
-  }
-
-  const parseMode = options.parseMode !== undefined ? options.parseMode : ("HTML" as TelegramParseMode);
-
-  const chunks = splitTelegramText(text);
-  const fallbackChunks = options.fallbackText ? splitTelegramText(options.fallbackText) : [];
-
-  for (const [index, chunk] of chunks.entries()) {
-    await sendTextMessage(ctx.api, target, chunk, {
-      parseMode,
-      fallbackText: fallbackChunks[index] ?? chunk,
-      replyMarkup: index === 0 ? options.replyMarkup : undefined,
-    });
-  }
-}
-
-async function sendTextMessage(
-  api: Context["api"],
-  target: PiSessionContext,
-  text: string,
-  options: TextOptions = {},
-): Promise<{ message_id: number }> {
-  const parseMode = Object.prototype.hasOwnProperty.call(options, "parseMode")
-    ? options.parseMode
-    : "HTML";
-
-  try {
-    return await api.sendMessage(target.chatId, text, {
-      ...(parseMode ? { parse_mode: parseMode } : {}),
-      ...(target.messageThreadId !== undefined ? { message_thread_id: target.messageThreadId } : {}),
-      reply_markup: options.replyMarkup,
-    });
-  } catch (error) {
-    if (parseMode && options.fallbackText !== undefined && isTelegramParseError(error)) {
-      return await api.sendMessage(target.chatId, options.fallbackText, {
-        ...(target.messageThreadId !== undefined ? { message_thread_id: target.messageThreadId } : {}),
-        reply_markup: options.replyMarkup,
-      });
-    }
-    throw error;
-  }
-}
-
-async function safeEditMessage(
-  bot: Bot<Context>,
-  target: PiSessionContext,
-  messageId: number,
-  text: string,
-  options: TextOptions = {},
-): Promise<void> {
-  const parseMode = Object.prototype.hasOwnProperty.call(options, "parseMode")
-    ? options.parseMode
-    : "HTML";
-
-  try {
-    await bot.api.editMessageText(target.chatId, messageId, text, {
-      ...(parseMode ? { parse_mode: parseMode } : {}),
-      reply_markup: options.replyMarkup,
-    });
-  } catch (error) {
-    if (isMessageNotModifiedError(error)) {
-      return;
-    }
-
-    if (parseMode && options.fallbackText !== undefined && isTelegramParseError(error)) {
-      await bot.api.editMessageText(target.chatId, messageId, options.fallbackText, {
-        reply_markup: options.replyMarkup,
-      });
-      return;
-    }
-
-    throw error;
-  }
-}
-
-async function sendChatAction(
-  api: Context["api"],
-  target: PiSessionContext,
-  action: "typing",
-): Promise<void> {
-  await api.sendChatAction(target.chatId, action, {
-    ...(target.messageThreadId !== undefined ? { message_thread_id: target.messageThreadId } : {}),
-  });
-}
-
-const MAX_AUDIO_FILE_SIZE = 25 * 1024 * 1024; // 25 MB
-
-async function downloadTelegramFile(api: Context["api"], token: string, fileId: string): Promise<string> {
-  const file = await api.getFile(fileId);
-  if (!file.file_path) {
-    throw new Error("Telegram did not return a file path");
-  }
-
-  if (file.file_size && file.file_size > MAX_AUDIO_FILE_SIZE) {
-    throw new Error(`Audio file too large (${Math.round(file.file_size / 1024 / 1024)} MB, max 25 MB)`);
-  }
-
-  const url = `https://api.telegram.org/file/bot${token}/${file.file_path}`;
-  const response = await fetch(url);
-  if (!response.ok) {
-    throw new Error(`Failed to download voice file: ${response.status}`);
-  }
-
-  const buffer = Buffer.from(await response.arrayBuffer());
-  const extension = path.extname(file.file_path) || ".ogg";
-  const tempPath = path.join(tmpdir(), `telepi-voice-${randomUUID()}${extension}`);
-  await writeFile(tempPath, buffer);
-  return tempPath;
-}
-
-function splitTelegramText(text: string): string[] {
-  if (text.length <= TELEGRAM_MESSAGE_LIMIT) {
-    return [text];
-  }
-
-  const chunks: string[] = [];
-  let remaining = text;
-  while (remaining.length > TELEGRAM_MESSAGE_LIMIT) {
-    let cut = remaining.lastIndexOf("\n", TELEGRAM_MESSAGE_LIMIT);
-    if (cut < TELEGRAM_MESSAGE_LIMIT * 0.5) {
-      cut = remaining.lastIndexOf(" ", TELEGRAM_MESSAGE_LIMIT);
-    }
-    if (cut < TELEGRAM_MESSAGE_LIMIT * 0.5) {
-      cut = TELEGRAM_MESSAGE_LIMIT;
-    }
-
-    chunks.push(remaining.slice(0, cut).trimEnd());
-    remaining = remaining.slice(cut).trimStart();
-  }
-
-  if (remaining) {
-    chunks.push(remaining);
-  }
-
-  return chunks.length > 0 ? chunks : [""];
-}
-
-function splitMarkdownForTelegram(markdown: string): RenderedChunk[] {
-  if (!markdown) {
-    return [];
-  }
-
-  const chunks: RenderedChunk[] = [];
-  let remaining = markdown;
-
-  while (remaining) {
-    const maxLength = Math.min(remaining.length, FORMATTED_CHUNK_TARGET);
-    const initialCut = findPreferredSplitIndex(remaining, maxLength);
-    const candidate = remaining.slice(0, initialCut) || remaining.slice(0, 1);
-    const rendered = renderMarkdownChunkWithinLimit(candidate);
-
-    chunks.push(rendered);
-    remaining = remaining.slice(rendered.sourceText.length).trimStart();
-  }
-
-  return chunks;
-}
-
-function renderMarkdownChunkWithinLimit(markdown: string): RenderedChunk {
-  if (!markdown) {
-    return {
-      text: "",
-      fallbackText: "",
-      parseMode: "HTML",
-      sourceText: "",
-    };
-  }
-
-  let sourceText = markdown;
-  let rendered = formatMarkdownMessage(sourceText);
-
-  while (rendered.text.length > TELEGRAM_MESSAGE_LIMIT && sourceText.length > 1) {
-    const nextLength = Math.max(1, sourceText.length - Math.max(100, Math.ceil(sourceText.length * 0.1)));
-    sourceText = sourceText.slice(0, nextLength).trimEnd() || sourceText.slice(0, nextLength);
-    rendered = formatMarkdownMessage(sourceText);
-  }
-
-  return {
-    ...rendered,
-    sourceText,
-  };
-}
-
-function formatMarkdownMessage(markdown: string): RenderedText {
-  try {
-    return {
-      text: formatTelegramHTML(markdown),
-      fallbackText: markdown,
-      parseMode: "HTML",
-    };
-  } catch (error) {
-    console.error("Failed to format Telegram HTML, falling back to plain text", error);
-    return {
-      text: markdown,
-      fallbackText: markdown,
-      parseMode: undefined,
-    };
-  }
-}
-
-function findPreferredSplitIndex(text: string, maxLength: number): number {
-  if (text.length <= maxLength) {
-    return Math.max(1, text.length);
-  }
-
-  const newlineIndex = text.lastIndexOf("\n", maxLength);
-  if (newlineIndex >= maxLength * 0.5) {
-    return Math.max(1, newlineIndex);
-  }
-
-  const spaceIndex = text.lastIndexOf(" ", maxLength);
-  if (spaceIndex >= maxLength * 0.5) {
-    return Math.max(1, spaceIndex);
-  }
-
-  return Math.max(1, maxLength);
-}
-
-function buildStreamingPreview(text: string): string {
-  if (text.length <= STREAMING_PREVIEW_LIMIT) {
-    return text;
-  }
-
-  return `${text.slice(0, STREAMING_PREVIEW_LIMIT)}\n\n… streaming (preview truncated)`;
-}
-
-function appendWithCap(base: string, addition: string, cap: number): string {
-  const combined = `${base}${addition}`;
-  return combined.length <= cap ? combined : combined.slice(-cap);
-}
-
-function summarizeToolOutput(text: string): string {
-  const trimmed = text.trim();
-  if (!trimmed) {
-    return "";
-  }
-
-  return trimmed.length <= TOOL_OUTPUT_PREVIEW_LIMIT
-    ? trimmed
-    : `${trimmed.slice(-TOOL_OUTPUT_PREVIEW_LIMIT)}\n…`;
-}
-
-function trimLine(text: string, maxLength: number): string {
-  const singleLine = text.replace(/\s+/g, " ").trim();
-  if (singleLine.length <= maxLength) {
-    return singleLine;
-  }
-
-  return `${singleLine.slice(0, maxLength - 1)}…`;
-}
-
-function stripHtml(text: string): string {
-  return text.replace(/<[^>]+>/g, "");
-}
-
-function getWorkspaceShortName(workspace: string): string {
-  return workspace.split(/[\\/]/).filter(Boolean).pop() ?? workspace;
-}
-
-function isMessageNotModifiedError(error: unknown): boolean {
-  const message = error instanceof Error ? error.message : String(error);
-  return message.includes("message is not modified");
-}
-
-function isTelegramParseError(error: unknown): boolean {
-  const message = (error instanceof Error ? error.message : String(error)).toLowerCase();
-  return (
-    message.includes("can't parse entities") ||
-    message.includes("unsupported start tag") ||
-    message.includes("unexpected end tag") ||
-    message.includes("entity name") ||
-    message.includes("parse entities")
-  );
-}
-
-function renderPromptFailure(accumulatedText: string, error: unknown): string {
-  const message = toFriendlyError(error);
-  const statusLine = isAbortError(message) ? "⏹ Aborted" : `⚠️ ${message}`;
-  return accumulatedText.trim() ? `${accumulatedText.trim()}\n\n${statusLine}` : statusLine;
-}
-
-function isAbortError(message: string): boolean {
-  return message.toLowerCase().includes("abort");
-}
-
-function renderFailedText(error: unknown): RenderedText {
-  return renderPrefixedError("Failed", error);
-}
-
-function renderExtensionNotice(message: string, type: "info" | "warning" | "error" = "info"): RenderedText {
-  const prefix = type === "error" ? "❌" : type === "warning" ? "⚠️" : "ℹ️";
-  return {
-    text: `<b>${prefix}</b> ${escapeHTML(message)}`,
-    fallbackText: `${prefix} ${message}`,
-    parseMode: "HTML",
-  };
-}
-
-function renderExtensionError(extensionPath: string, event: string, error: string): RenderedText {
-  if (event === "command" && extensionPath.startsWith("command:")) {
-    const commandName = extensionPath.slice("command:".length);
-    return {
-      text: `<b>❌ /${escapeHTML(commandName)} failed:</b> ${escapeHTML(error)}`,
-      fallbackText: `❌ /${commandName} failed: ${error}`,
-      parseMode: "HTML",
-    };
-  }
-
-  return {
-    text: `<b>❌ Extension error:</b> ${escapeHTML(error)}`,
-    fallbackText: `❌ Extension error: ${error}`,
-    parseMode: "HTML",
-  };
-}
-
-function renderPrefixedError(prefix: string, error: unknown, multiline = false): RenderedText {
-  const message = toFriendlyError(error);
-  return {
-    text: multiline
-      ? `<b>${escapeHTML(prefix)}:</b>\n${escapeHTML(message)}`
-      : `<b>${escapeHTML(prefix)}:</b> ${escapeHTML(message)}`,
-    fallbackText: multiline ? `${prefix}:\n${message}` : `${prefix}: ${message}`,
-    parseMode: "HTML",
-  };
 }

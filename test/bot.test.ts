@@ -681,6 +681,55 @@ describe("createBot", () => {
     expect(api.sendMessage.mock.calls[0]?.[1]).toContain("Nothing to retry yet in this chat/topic.");
   });
 
+  it("clears /retry memory after creating a new session or switching sessions", async () => {
+    const fresh = setupBot({
+      piSessionOverrides: {
+        listWorkspaces: vi.fn().mockResolvedValue(["/workspace/A"]),
+      },
+    });
+    await fresh.bot.handleUpdate(createTestUpdate({ message: { text: "retry me later" } }));
+    await fresh.bot.handleUpdate(createTestUpdate({ message: { text: "/new" } }));
+
+    fresh.api.sendMessage.mockClear();
+    await fresh.bot.handleUpdate(createTestUpdate({ message: { text: "/retry" } }));
+    expect(fresh.api.sendMessage.mock.calls[0]?.[1]).toContain("Nothing to retry yet");
+
+    const switched = setupBot();
+    await switched.bot.handleUpdate(createTestUpdate({ message: { text: "switch clears retry" } }));
+    await switched.bot.handleUpdate(createTestUpdate({ message: { text: "/sessions /saved/session.jsonl" } }));
+
+    switched.api.sendMessage.mockClear();
+    await switched.bot.handleUpdate(createTestUpdate({ message: { text: "/retry" } }));
+    expect(switched.api.sendMessage.mock.calls[0]?.[1]).toContain("Nothing to retry yet");
+  });
+
+  it("can retry failed prompts and prompts started from voice transcription", async () => {
+    const failing = setupBot();
+    const failingPrompt = failing.pi.service.prompt as ReturnType<typeof vi.fn>;
+    failingPrompt
+      .mockRejectedValueOnce(new Error("boom"))
+      .mockResolvedValueOnce(undefined);
+
+    await failing.bot.handleUpdate(createTestUpdate({ message: { text: "retry failed prompt" } }));
+    await failing.bot.handleUpdate(createTestUpdate({ message: { text: "/retry" } }));
+
+    expect(failing.pi.service.prompt).toHaveBeenNthCalledWith(1, "retry failed prompt");
+    expect(failing.pi.service.prompt).toHaveBeenNthCalledWith(2, "retry failed prompt");
+
+    const voice = setupBot();
+    const voicePrompt = voice.pi.service.prompt as ReturnType<typeof vi.fn>;
+    voicePrompt.mockImplementation(async () => {
+      voice.pi.emitTextDelta("Voice response");
+      voice.pi.emitAgentEnd();
+    });
+
+    await voice.bot.handleUpdate(createVoiceUpdate());
+    await voice.bot.handleUpdate(createTestUpdate({ message: { text: "/retry" } }));
+
+    expect(voice.pi.service.prompt).toHaveBeenNthCalledWith(1, "transcribed text");
+    expect(voice.pi.service.prompt).toHaveBeenNthCalledWith(2, "transcribed text");
+  });
+
   it("rejects unauthorized message senders", async () => {
     const { bot, api } = setupBot();
 
@@ -989,7 +1038,7 @@ describe("createBot", () => {
     await topicOnePending;
   });
 
-  it("switches directly via /sessions <path|id> and shows errors when switching fails", async () => {
+  it("switches directly via /sessions and /switch aliases and shows errors when switching fails", async () => {
     const ok = setupBot();
     await ok.bot.handleUpdate(createTestUpdate({ message: { text: "/sessions /saved/session.jsonl" } }));
     expect(ok.pi.service.resolveSessionReference).toHaveBeenCalledWith("/saved/session.jsonl");
@@ -998,6 +1047,15 @@ describe("createBot", () => {
       "/workspace/A",
     );
     expect(ok.api.sendMessage.mock.calls[0]?.[1]).toContain("Switched session");
+
+    const alias = setupBot();
+    await alias.bot.handleUpdate(createTestUpdate({ message: { text: "/switch /saved/session.jsonl" } }));
+    expect(alias.pi.service.resolveSessionReference).toHaveBeenCalledWith("/saved/session.jsonl");
+    expect(alias.pi.service.switchSession).toHaveBeenCalledWith(
+      "/saved/session.jsonl",
+      "/workspace/A",
+    );
+    expect(alias.api.sendMessage.mock.calls[0]?.[1]).toContain("Switched session");
 
     const byId = setupBot({
       piSessionOverrides: {
@@ -1916,6 +1974,90 @@ describe("createBot", () => {
 
     expect(pi.service.prompt).toHaveBeenCalledTimes(1);
     expect(api.sendMessage.mock.calls.some((call) => String(call[1]).includes("hello Bene"))).toBe(true);
+  });
+
+  it("times out pending extension dialogs and finalizes them in Telegram", async () => {
+    const { bot, pi, api } = setupBot({
+      piSessionOverrides: {
+        listSlashCommands: vi.fn().mockResolvedValue([
+          { name: "pick", description: "Pick an option", source: "extension", path: "/ext/pick.ts" },
+        ]),
+      },
+    });
+
+    const promptMock = pi.service.prompt as ReturnType<typeof vi.fn>;
+    promptMock.mockImplementation(async () => {
+      const choice = await pi.getExtensionBindings()?.uiContext?.select("Pick one", ["Alpha", "Beta"], { timeout: 5 });
+      pi.emitTextDelta(`picked ${choice}`);
+      pi.emitAgentEnd();
+    });
+
+    const pending = bot.handleUpdate(createTestUpdate({ message: { text: "/pick" } }));
+    await nextTick();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await pending;
+
+    expect(api.editMessageText.mock.calls.some((call) => String(call[2]).includes("Dialog timed out."))).toBe(true);
+    expect(api.sendMessage.mock.calls.some((call) => String(call[1]).includes("picked undefined"))).toBe(true);
+  });
+
+  it("cancels pending extension dialogs via /abort and still aborts the session", async () => {
+    const { bot, pi, api } = setupBot({
+      piSessionOverrides: {
+        listSlashCommands: vi.fn().mockResolvedValue([
+          { name: "confirm", description: "Confirm action", source: "extension", path: "/ext/confirm.ts" },
+        ]),
+      },
+    });
+
+    const promptMock = pi.service.prompt as ReturnType<typeof vi.fn>;
+    promptMock.mockImplementation(async () => {
+      const confirmed = await pi.getExtensionBindings()?.uiContext?.confirm("Confirm deploy", "Ship it?");
+      pi.emitTextDelta(`confirmed ${confirmed}`);
+      pi.emitAgentEnd();
+    });
+
+    const pending = bot.handleUpdate(createTestUpdate({ message: { text: "/confirm" } }));
+    await nextTick();
+    await bot.handleUpdate(createTestUpdate({ message: { text: "/abort" } }));
+    await pending;
+
+    expect(pi.service.abort).toHaveBeenCalledTimes(1);
+    expect(api.editMessageText.mock.calls.some((call) => String(call[2]).includes("Dialog cancelled."))).toBe(true);
+    expect(api.sendMessage.mock.calls.some((call) => String(call[1]).includes("confirmed false"))).toBe(true);
+  });
+
+  it("blocks voice messages while an extension input dialog is pending", async () => {
+    const { bot, pi, api } = setupBot({
+      piSessionOverrides: {
+        listSlashCommands: vi.fn().mockResolvedValue([
+          { name: "ask", description: "Ask for input", source: "extension", path: "/ext/ask.ts" },
+        ]),
+      },
+    });
+
+    let resolveInput!: (value: void | PromiseLike<void>) => void;
+    const promptMock = pi.service.prompt as ReturnType<typeof vi.fn>;
+    promptMock.mockImplementation(async () => {
+      await new Promise<void>(async (resolve) => {
+        resolveInput = resolve;
+        const value = await pi.getExtensionBindings()?.uiContext?.input("Name", "Your name");
+        pi.emitTextDelta(`hello ${value}`);
+        pi.emitAgentEnd();
+        resolve();
+      });
+    });
+
+    const pending = bot.handleUpdate(createTestUpdate({ message: { text: "/ask" } }));
+    await nextTick();
+    await bot.handleUpdate(createVoiceUpdate());
+
+    expect(api.sendMessage.mock.calls.at(-1)?.[1]).toContain("Please answer the pending prompt above or use /abort.");
+    expect(transcribeAudio).not.toHaveBeenCalled();
+
+    await bot.handleUpdate(createTestUpdate({ message: { text: "Bene" } }));
+    resolveInput();
+    await pending;
   });
 
   it("transcribes voice messages and feeds the transcript into the prompt flow", async () => {

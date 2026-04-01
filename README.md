@@ -380,6 +380,8 @@ TelePi discovers sessions from **all** project workspaces stored under `~/.pi/ag
 
 Sessions are stored under `~/.pi/agent/sessions/--<encoded-workspace-path>--/`.
 
+For a fuller module walkthrough after the bot/install refactors, see [`docs/architecture.md`](docs/architecture.md).
+
 ## File Layout
 
 Installed mode (`telepi setup`) creates or manages these user-level files:
@@ -406,6 +408,9 @@ TelePi/
 ├── dist/
 │   ├── cli.js                    ← built CLI entrypoint (`node dist/cli.js ...`)
 │   └── index.js                  ← built bot entrypoint
+├── docs/
+│   ├── architecture.md           ← module layout and runtime overview
+│   └── npm-trusted-publishing.md ← npm release automation playbook
 ├── extensions/
 │   └── telepi-handoff.ts         ← Pi CLI extension source
 ├── launchd/
@@ -415,22 +420,43 @@ TelePi/
 ├── src/
 │   ├── cli.ts                    ← CLI commands (`start`, `setup`, `status`)
 │   ├── index.ts                  ← entry point
-│   ├── bot.ts                    ← Telegram bot (Grammy)
+│   ├── bot.ts                    ← Grammy wiring, callbacks, and shared picker state
+│   ├── bot/
+│   │   ├── commands/             ← grouped bot command handlers (`basic`, `sessions`, `model`, `tree`)
+│   │   ├── chat-state.ts         ← per-chat/topic transient state and `/retry` memory
+│   │   ├── extension-dialogs.ts  ← Telegram-backed extension select/confirm/input dialogs
+│   │   ├── keyboard.ts           ← inline keyboard pagination helpers
+│   │   ├── message-rendering.ts  ← Telegram HTML/plain rendering and chunking helpers
+│   │   ├── prompt-handler.ts     ← prompt execution, streaming, and tool updates
+│   │   ├── slash-command.ts      ← slash-command normalization and command catalog helpers
+│   │   └── telegram-transport.ts ← safe reply/edit/send helpers and Telegram file downloads
 │   ├── config.ts                 ← environment config
 │   ├── errors.ts                 ← user-facing error helpers
 │   ├── format.ts                 ← markdown → Telegram HTML
-│   ├── install.ts                ← installed-mode setup/status helpers
+│   ├── install.ts                ← public installed-mode setup/status facade used by the CLI
+│   ├── install/
+│   │   ├── config.ts             ← config-file setup/update helpers
+│   │   ├── extension.ts          ← extension install/status helpers
+│   │   ├── launchd.ts            ← LaunchAgent plist and launchctl helpers
+│   │   └── shared.ts             ← shared install types/constants
 │   ├── model-scope.ts            ← model filtering and grouping
 │   ├── pi-session.ts             ← Pi SDK session wrapper
 │   ├── telegram-ui-context.ts    ← Pi extension UI adapter backed by Telegram dialogs
 │   ├── tree.ts                   ← session tree rendering & navigation
 │   └── voice.ts                  ← audio transcription (Parakeet CoreML / Sherpa-ONNX / OpenAI)
 ├── test/
-│   ├── bot.test.ts               ← bot command/callback integration tests
+│   ├── bot.test.ts               ← high-level bot integration tests
+│   ├── bot/
+│   │   ├── chat-state.test.ts
+│   │   ├── extension-dialogs.test.ts
+│   │   ├── keyboard.test.ts
+│   │   ├── message-rendering.test.ts
+│   │   ├── slash-command.test.ts
+│   │   └── telegram-transport.test.ts
 │   ├── config.test.ts            ← config/env loading tests
 │   ├── errors.test.ts            ← error helper unit tests
 │   ├── format.test.ts            ← formatter unit tests
-│   ├── install.test.ts           ← install/setup unit tests
+│   ├── install.test.ts           ← install/setup integration tests
 │   ├── pi-session.test.ts        ← session service integration tests
 │   ├── telegram-ui-context.test.ts ← extension UI adapter unit tests
 │   ├── tree.test.ts              ← tree rendering unit tests
@@ -467,21 +493,30 @@ The compose file:
 
 ## Architecture
 
+```text
+Telegram
+  ↓
+Grammy bot (`src/bot.ts`)
+  ├── transport helpers         → `src/bot/telegram-transport.ts`
+  ├── rendering helpers         → `src/bot/message-rendering.ts`
+  ├── prompt lifecycle          → `src/bot/prompt-handler.ts`
+  ├── chat-local busy/retry     → `src/bot/chat-state.ts`
+  ├── extension dialogs         → `src/bot/extension-dialogs.ts`
+  ├── grouped command handlers  → `src/bot/commands/*`
+  └── voice route               → `src/voice.ts`
+                                     └── ffmpeg decode + local/cloud transcription backends
+        ↓
+PiSessionRegistry / PiSessionService (`src/pi-session.ts`)
+  ├── AgentSession / SessionManager → `~/.pi/agent/sessions/`
+  ├── workspace + saved-session switching
+  ├── model scope / registry integration
+  ├── tree navigation + labels
+  └── handback/session lifecycle
+        ↓
+Pi SDK + workspace-scoped coding tools
 ```
-Telegram ←→ Grammy bot (auto-retry, topic-aware routing, inline keyboards)
-                |
-                ├── Voice handler ──→ voice.ts (Parakeet CoreML | Sherpa-ONNX | OpenAI Whisper)
-                |                         |
-                |                    ffmpeg decode
-                v
-         PiSessionRegistry (one PiSessionService per chat/topic)
-                |
-                ├── PiSessionService       ──→ current workspace + session state
-                ├── AgentSession (Pi SDK)  ──→ ~/.pi/agent/sessions/
-                ├── ModelRegistry          ──→ ~/.pi/agent/auth.json
-                ├── SessionTree            ──→ tree.ts (render/navigate)
-                └── Coding tools           ──→ current workspace directory
-```
+
+The detailed module map, testing layout, and remaining large hotspots are documented in [`docs/architecture.md`](docs/architecture.md).
 
 ## Development
 
@@ -519,5 +554,5 @@ Notes:
 - npm publishing uses Trusted Publishing from GitHub Actions; no `NPM_TOKEN` secret is required
 - the trusted publisher must be configured on npm for repo `benedict2310/TelePi` and workflow `.github/workflows/release.yml`
 - npm Trusted Publishing currently requires npm CLI `11.5.1+` and Node `22.14.0+`; TelePi's workflow upgrades npm explicitly because older npm versions can fail with misleading `E404 Not Found` publish errors even when OIDC is configured correctly
-- the workflow has been verified end-to-end with release `v0.2.1`
+- the workflow has been verified end-to-end with release `v0.2.2`
 - reusable setup details for this pattern live in `docs/npm-trusted-publishing.md`

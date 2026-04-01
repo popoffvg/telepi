@@ -1,0 +1,414 @@
+import { InlineKeyboard } from "grammy";
+
+import { escapeHTML } from "../format.js";
+import type { PiSessionContext } from "../pi-session.js";
+import { trimLine } from "./message-rendering.js";
+import type { TextOptions } from "./telegram-transport.js";
+
+export type PendingExtensionDialog =
+  | {
+      kind: "select";
+      dialogId: string;
+      messageId: number;
+      title: string;
+      options: string[];
+      resolve: (value: string | undefined) => void;
+      timeoutId?: NodeJS.Timeout;
+      abortCleanup?: () => void;
+    }
+  | {
+      kind: "confirm";
+      dialogId: string;
+      messageId: number;
+      title: string;
+      message: string;
+      resolve: (value: boolean) => void;
+      timeoutId?: NodeJS.Timeout;
+      abortCleanup?: () => void;
+    }
+  | {
+      kind: "input";
+      dialogId: string;
+      messageId: number;
+      title: string;
+      placeholder?: string;
+      resolve: (value: string | undefined) => void;
+      timeoutId?: NodeJS.Timeout;
+      abortCleanup?: () => void;
+    };
+
+export type DialogCallbackResult = {
+  callbackText: string;
+  afterAnswer?: () => Promise<void>;
+};
+
+export interface ExtensionDialogManager {
+  hasPending(target: PiSessionContext): boolean;
+  getPendingKind(target: PiSessionContext): PendingExtensionDialog["kind"] | undefined;
+  openSelect(
+    target: PiSessionContext,
+    title: string,
+    options: string[],
+    dialogOptions?: { signal?: AbortSignal; timeout?: number },
+  ): Promise<string | undefined>;
+  openConfirm(
+    target: PiSessionContext,
+    title: string,
+    message: string,
+    dialogOptions?: { signal?: AbortSignal; timeout?: number },
+  ): Promise<boolean>;
+  openInput(
+    target: PiSessionContext,
+    title: string,
+    placeholder?: string,
+    dialogOptions?: { signal?: AbortSignal; timeout?: number },
+  ): Promise<string | undefined>;
+  consumeInput(target: PiSessionContext, userText: string): Promise<boolean>;
+  cancelPending(target: PiSessionContext): Promise<boolean>;
+  resolveSelect(
+    target: PiSessionContext,
+    dialogId: string,
+    messageId: number | undefined,
+    optionIndex: number,
+  ): Promise<DialogCallbackResult>;
+  resolveConfirm(
+    target: PiSessionContext,
+    dialogId: string,
+    messageId: number | undefined,
+    confirmed: boolean,
+  ): Promise<DialogCallbackResult>;
+  resolveCancel(
+    target: PiSessionContext,
+    dialogId: string,
+    messageId: number | undefined,
+  ): Promise<DialogCallbackResult>;
+}
+
+export function createExtensionDialogManager(deps: {
+  getContextKey: (target: PiSessionContext) => string;
+  sendTextMessage: (
+    target: PiSessionContext,
+    text: string,
+    options?: TextOptions,
+  ) => Promise<{ message_id: number }>;
+  editMessage: (
+    target: PiSessionContext,
+    messageId: number,
+    text: string,
+    options?: TextOptions,
+  ) => Promise<void>;
+  defaultTimeoutMs: number;
+}): ExtensionDialogManager {
+  const pendingDialogs = new Map<string, PendingExtensionDialog>();
+  let extensionDialogCounter = 0;
+
+  const nextExtensionDialogId = (): string => {
+    extensionDialogCounter += 1;
+    return extensionDialogCounter.toString(36);
+  };
+
+  const clearPending = (contextKey: string): PendingExtensionDialog | undefined => {
+    const pendingDialog = pendingDialogs.get(contextKey);
+    if (!pendingDialog) {
+      return undefined;
+    }
+
+    pendingDialogs.delete(contextKey);
+    if (pendingDialog.timeoutId) {
+      clearTimeout(pendingDialog.timeoutId);
+    }
+    pendingDialog.abortCleanup?.();
+    return pendingDialog;
+  };
+
+  const finalizePending = async (
+    target: PiSessionContext,
+    pendingDialog: PendingExtensionDialog | undefined,
+    html: string,
+    fallbackText: string,
+  ): Promise<void> => {
+    if (!pendingDialog) {
+      return;
+    }
+
+    await deps.editMessage(target, pendingDialog.messageId, html, {
+      fallbackText,
+      replyMarkup: undefined,
+    });
+  };
+
+  const resolveCancelled = (pendingDialog: PendingExtensionDialog): void => {
+    switch (pendingDialog.kind) {
+      case "confirm":
+        pendingDialog.resolve(false);
+        return;
+      case "select":
+      case "input":
+        pendingDialog.resolve(undefined);
+        return;
+    }
+  };
+
+  const createDialogTimeout = (
+    contextKey: string,
+    target: PiSessionContext,
+    pendingDialog: PendingExtensionDialog,
+    onTimeout: () => void,
+    timeoutMs?: number,
+  ): NodeJS.Timeout | undefined => {
+    const delay = timeoutMs ?? deps.defaultTimeoutMs;
+    return setTimeout(() => {
+      if (pendingDialogs.get(contextKey)?.dialogId !== pendingDialog.dialogId) {
+        return;
+      }
+      clearPending(contextKey);
+      void finalizePending(target, pendingDialog, escapeHTML("Dialog timed out."), "Dialog timed out.").catch((error) => {
+        console.error("Failed to finalize timed-out extension dialog", error);
+      });
+      onTimeout();
+    }, delay);
+  };
+
+  const getPending = (target: PiSessionContext): PendingExtensionDialog | undefined =>
+    pendingDialogs.get(deps.getContextKey(target));
+
+  return {
+    hasPending(target) {
+      return pendingDialogs.has(deps.getContextKey(target));
+    },
+
+    getPendingKind(target) {
+      return getPending(target)?.kind;
+    },
+
+    async openSelect(target, title, options, dialogOptions) {
+      const contextKey = deps.getContextKey(target);
+      if (pendingDialogs.has(contextKey)) {
+        throw new Error("TelePi already has a pending extension dialog for this chat/topic.");
+      }
+
+      const dialogId = nextExtensionDialogId();
+      const keyboard = new InlineKeyboard();
+      for (const [index, option] of options.entries()) {
+        keyboard.text(trimLine(option, 48), `ui_sel_${dialogId}_${index}`).row();
+      }
+      keyboard.text("Cancel", `ui_x_${dialogId}`).row();
+
+      const message = await deps.sendTextMessage(target, `<b>${escapeHTML(title)}</b>`, {
+        parseMode: "HTML",
+        fallbackText: title,
+        replyMarkup: keyboard,
+      });
+
+      return await new Promise<string | undefined>((resolve) => {
+        const pendingDialog: PendingExtensionDialog = {
+          kind: "select",
+          dialogId,
+          messageId: message.message_id,
+          title,
+          options,
+          resolve,
+        };
+        if (dialogOptions?.signal) {
+          const onAbort = () => {
+            clearPending(contextKey);
+            void finalizePending(target, pendingDialog, escapeHTML("Dialog cancelled."), "Dialog cancelled.");
+            resolve(undefined);
+          };
+          dialogOptions.signal.addEventListener("abort", onAbort, { once: true });
+          pendingDialog.abortCleanup = () => dialogOptions.signal?.removeEventListener("abort", onAbort);
+        }
+        pendingDialog.timeoutId = createDialogTimeout(contextKey, target, pendingDialog, () => resolve(undefined), dialogOptions?.timeout);
+        pendingDialogs.set(contextKey, pendingDialog);
+      });
+    },
+
+    async openConfirm(target, title, message, dialogOptions) {
+      const contextKey = deps.getContextKey(target);
+      if (pendingDialogs.has(contextKey)) {
+        throw new Error("TelePi already has a pending extension dialog for this chat/topic.");
+      }
+
+      const dialogId = nextExtensionDialogId();
+      const telegramMessage = await deps.sendTextMessage(target, `<b>${escapeHTML(title)}</b>\n${escapeHTML(message)}`, {
+        parseMode: "HTML",
+        fallbackText: `${title}\n${message}`,
+        replyMarkup: new InlineKeyboard()
+          .text("Yes", `ui_cfm_${dialogId}_yes`)
+          .text("No", `ui_cfm_${dialogId}_no`)
+          .row(),
+      });
+
+      return await new Promise<boolean>((resolve) => {
+        const pendingDialog: PendingExtensionDialog = {
+          kind: "confirm",
+          dialogId,
+          messageId: telegramMessage.message_id,
+          title,
+          message,
+          resolve,
+        };
+        if (dialogOptions?.signal) {
+          const onAbort = () => {
+            clearPending(contextKey);
+            void finalizePending(target, pendingDialog, escapeHTML("Dialog cancelled."), "Dialog cancelled.");
+            resolve(false);
+          };
+          dialogOptions.signal.addEventListener("abort", onAbort, { once: true });
+          pendingDialog.abortCleanup = () => dialogOptions.signal?.removeEventListener("abort", onAbort);
+        }
+        pendingDialog.timeoutId = createDialogTimeout(contextKey, target, pendingDialog, () => resolve(false), dialogOptions?.timeout);
+        pendingDialogs.set(contextKey, pendingDialog);
+      });
+    },
+
+    async openInput(target, title, placeholder, dialogOptions) {
+      const contextKey = deps.getContextKey(target);
+      if (pendingDialogs.has(contextKey)) {
+        throw new Error("TelePi already has a pending extension dialog for this chat/topic.");
+      }
+
+      const dialogId = nextExtensionDialogId();
+      const fallbackText = placeholder ? `${title}\n${placeholder}` : title;
+      const telegramMessage = await deps.sendTextMessage(
+        target,
+        [
+          `<b>${escapeHTML(title)}</b>`,
+          placeholder ? `<i>${escapeHTML(placeholder)}</i>` : undefined,
+        ].filter((line): line is string => Boolean(line)).join("\n"),
+        {
+          parseMode: "HTML",
+          fallbackText,
+          replyMarkup: new InlineKeyboard().text("Cancel", `ui_x_${dialogId}`).row(),
+        },
+      );
+
+      return await new Promise<string | undefined>((resolve) => {
+        const pendingDialog: PendingExtensionDialog = {
+          kind: "input",
+          dialogId,
+          messageId: telegramMessage.message_id,
+          title,
+          placeholder,
+          resolve,
+        };
+        if (dialogOptions?.signal) {
+          const onAbort = () => {
+            clearPending(contextKey);
+            void finalizePending(target, pendingDialog, escapeHTML("Input cancelled."), "Input cancelled.");
+            resolve(undefined);
+          };
+          dialogOptions.signal.addEventListener("abort", onAbort, { once: true });
+          pendingDialog.abortCleanup = () => dialogOptions.signal?.removeEventListener("abort", onAbort);
+        }
+        pendingDialog.timeoutId = createDialogTimeout(contextKey, target, pendingDialog, () => resolve(undefined), dialogOptions?.timeout);
+        pendingDialogs.set(contextKey, pendingDialog);
+      });
+    },
+
+    async consumeInput(target, userText) {
+      const contextKey = deps.getContextKey(target);
+      const pendingDialog = pendingDialogs.get(contextKey);
+      if (!pendingDialog || pendingDialog.kind !== "input") {
+        return false;
+      }
+
+      clearPending(contextKey);
+      try {
+        await finalizePending(
+          target,
+          pendingDialog,
+          `<b>${escapeHTML(pendingDialog.title)}</b>\n<i>Received:</i> ${escapeHTML(userText)}`,
+          `${pendingDialog.title}\nReceived: ${userText}`,
+        );
+      } finally {
+        pendingDialog.resolve(userText);
+      }
+      return true;
+    },
+
+    async cancelPending(target) {
+      const contextKey = deps.getContextKey(target);
+      const pendingDialog = clearPending(contextKey);
+      if (!pendingDialog) {
+        return false;
+      }
+
+      resolveCancelled(pendingDialog);
+      await finalizePending(target, pendingDialog, escapeHTML("Dialog cancelled."), "Dialog cancelled.");
+      return true;
+    },
+
+    async resolveSelect(target, dialogId, messageId, optionIndex) {
+      const contextKey = deps.getContextKey(target);
+      const pendingDialog = pendingDialogs.get(contextKey);
+      if (!pendingDialog || pendingDialog.kind !== "select" || pendingDialog.dialogId !== dialogId || pendingDialog.messageId !== messageId) {
+        return { callbackText: "Dialog expired" };
+      }
+
+      const selected = pendingDialog.options[optionIndex];
+      if (!selected) {
+        return { callbackText: "Option expired" };
+      }
+
+      clearPending(contextKey);
+      return {
+        callbackText: `Selected ${trimLine(selected, 32)}`,
+        afterAnswer: async () => {
+          try {
+            await finalizePending(
+              target,
+              pendingDialog,
+              `<b>${escapeHTML(pendingDialog.title)}</b>\n<i>Selected:</i> ${escapeHTML(selected)}`,
+              `${pendingDialog.title}\nSelected: ${selected}`,
+            );
+          } finally {
+            pendingDialog.resolve(selected);
+          }
+        },
+      };
+    },
+
+    async resolveConfirm(target, dialogId, messageId, confirmed) {
+      const contextKey = deps.getContextKey(target);
+      const pendingDialog = pendingDialogs.get(contextKey);
+      if (!pendingDialog || pendingDialog.kind !== "confirm" || pendingDialog.dialogId !== dialogId || pendingDialog.messageId !== messageId) {
+        return { callbackText: "Dialog expired" };
+      }
+
+      clearPending(contextKey);
+      return {
+        callbackText: confirmed ? "Confirmed" : "Cancelled",
+        afterAnswer: async () => {
+          try {
+            await finalizePending(
+              target,
+              pendingDialog,
+              `<b>${escapeHTML(pendingDialog.title)}</b>\n<i>${confirmed ? "Confirmed" : "Cancelled"}</i>`,
+              `${pendingDialog.title}\n${confirmed ? "Confirmed" : "Cancelled"}`,
+            );
+          } finally {
+            pendingDialog.resolve(confirmed);
+          }
+        },
+      };
+    },
+
+    async resolveCancel(target, dialogId, messageId) {
+      const contextKey = deps.getContextKey(target);
+      const pendingDialog = pendingDialogs.get(contextKey);
+      if (!pendingDialog || pendingDialog.dialogId !== dialogId || pendingDialog.messageId !== messageId) {
+        return { callbackText: "Dialog expired" };
+      }
+
+      clearPending(contextKey);
+      return {
+        callbackText: "Cancelled",
+        afterAnswer: async () => {
+          resolveCancelled(pendingDialog);
+          await finalizePending(target, pendingDialog, escapeHTML("Dialog cancelled."), "Dialog cancelled.");
+        },
+      };
+    },
+  };
+}

@@ -158,7 +158,7 @@ The workflow will then:
 - publish to npm
 - publish the GitHub Release assets
 
-TelePi has verified this flow successfully with release `v0.2.1`.
+TelePi has verified this flow successfully with release `v0.2.2`.
 
 ## First-time checklist for another repo (example: TeleCodex)
 
