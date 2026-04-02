@@ -1,8 +1,7 @@
 import { InlineKeyboard } from "grammy";
 
-import { escapeHTML } from "../format.js";
 import type { PiSessionContext } from "../pi-session.js";
-import { trimLine } from "./message-rendering.js";
+import { renderDialogPanel, trimLine } from "./message-rendering.js";
 import type { TextOptions } from "./telegram-transport.js";
 
 export type PendingExtensionDialog =
@@ -124,15 +123,15 @@ export function createExtensionDialogManager(deps: {
   const finalizePending = async (
     target: PiSessionContext,
     pendingDialog: PendingExtensionDialog | undefined,
-    html: string,
-    fallbackText: string,
+    rendered: { text: string; fallbackText: string; parseMode?: "HTML" },
   ): Promise<void> => {
     if (!pendingDialog) {
       return;
     }
 
-    await deps.editMessage(target, pendingDialog.messageId, html, {
-      fallbackText,
+    await deps.editMessage(target, pendingDialog.messageId, rendered.text, {
+      fallbackText: rendered.fallbackText,
+      parseMode: rendered.parseMode,
       replyMarkup: undefined,
     });
   };
@@ -162,7 +161,7 @@ export function createExtensionDialogManager(deps: {
         return;
       }
       clearPending(contextKey);
-      void finalizePending(target, pendingDialog, escapeHTML("Dialog timed out."), "Dialog timed out.").catch((error) => {
+      void finalizePending(target, pendingDialog, renderDialogPanel(pendingDialog.title, ["Dialog timed out."], "⏰")).catch((error) => {
         console.error("Failed to finalize timed-out extension dialog", error);
       });
       onTimeout();
@@ -190,13 +189,17 @@ export function createExtensionDialogManager(deps: {
       const dialogId = nextExtensionDialogId();
       const keyboard = new InlineKeyboard();
       for (const [index, option] of options.entries()) {
-        keyboard.text(trimLine(option, 48), `ui_sel_${dialogId}_${index}`).row();
+        keyboard.text(`${index + 1}. ${trimLine(option, 44)}`, `ui_sel_${dialogId}_${index}`).row();
       }
-      keyboard.text("Cancel", `ui_x_${dialogId}`).row();
+      keyboard.text("✖️ Cancel", `ui_x_${dialogId}`).row();
 
-      const message = await deps.sendTextMessage(target, `<b>${escapeHTML(title)}</b>`, {
-        parseMode: "HTML",
-        fallbackText: title,
+      const rendered = renderDialogPanel(title, [
+        `${options.length} option${options.length === 1 ? "" : "s"} available.`,
+        "Use the buttons below.",
+      ], "🧭");
+      const message = await deps.sendTextMessage(target, rendered.text, {
+        parseMode: rendered.parseMode,
+        fallbackText: rendered.fallbackText,
         replyMarkup: keyboard,
       });
 
@@ -212,7 +215,7 @@ export function createExtensionDialogManager(deps: {
         if (dialogOptions?.signal) {
           const onAbort = () => {
             clearPending(contextKey);
-            void finalizePending(target, pendingDialog, escapeHTML("Dialog cancelled."), "Dialog cancelled.");
+            void finalizePending(target, pendingDialog, renderDialogPanel(pendingDialog.title, ["Dialog cancelled."], "⛔"));
             resolve(undefined);
           };
           dialogOptions.signal.addEventListener("abort", onAbort, { once: true });
@@ -230,12 +233,13 @@ export function createExtensionDialogManager(deps: {
       }
 
       const dialogId = nextExtensionDialogId();
-      const telegramMessage = await deps.sendTextMessage(target, `<b>${escapeHTML(title)}</b>\n${escapeHTML(message)}`, {
-        parseMode: "HTML",
-        fallbackText: `${title}\n${message}`,
+      const rendered = renderDialogPanel(title, [message, "Choose Yes or No below."], "⚠️");
+      const telegramMessage = await deps.sendTextMessage(target, rendered.text, {
+        parseMode: rendered.parseMode,
+        fallbackText: rendered.fallbackText,
         replyMarkup: new InlineKeyboard()
-          .text("Yes", `ui_cfm_${dialogId}_yes`)
-          .text("No", `ui_cfm_${dialogId}_no`)
+          .text("✅ Yes", `ui_cfm_${dialogId}_yes`)
+          .text("✖️ No", `ui_cfm_${dialogId}_no`)
           .row(),
       });
 
@@ -251,7 +255,7 @@ export function createExtensionDialogManager(deps: {
         if (dialogOptions?.signal) {
           const onAbort = () => {
             clearPending(contextKey);
-            void finalizePending(target, pendingDialog, escapeHTML("Dialog cancelled."), "Dialog cancelled.");
+            void finalizePending(target, pendingDialog, renderDialogPanel(pendingDialog.title, ["Dialog cancelled."], "⛔"));
             resolve(false);
           };
           dialogOptions.signal.addEventListener("abort", onAbort, { once: true });
@@ -269,17 +273,18 @@ export function createExtensionDialogManager(deps: {
       }
 
       const dialogId = nextExtensionDialogId();
-      const fallbackText = placeholder ? `${title}\n${placeholder}` : title;
+      const rendered = renderDialogPanel(
+        title,
+        [placeholder ?? "Reply in chat below.", placeholder ? "Reply in chat below." : ""].filter((line) => line.length > 0),
+        "✍️",
+      );
       const telegramMessage = await deps.sendTextMessage(
         target,
-        [
-          `<b>${escapeHTML(title)}</b>`,
-          placeholder ? `<i>${escapeHTML(placeholder)}</i>` : undefined,
-        ].filter((line): line is string => Boolean(line)).join("\n"),
+        rendered.text,
         {
-          parseMode: "HTML",
-          fallbackText,
-          replyMarkup: new InlineKeyboard().text("Cancel", `ui_x_${dialogId}`).row(),
+          parseMode: rendered.parseMode,
+          fallbackText: rendered.fallbackText,
+          replyMarkup: new InlineKeyboard().text("✖️ Cancel", `ui_x_${dialogId}`).row(),
         },
       );
 
@@ -295,7 +300,7 @@ export function createExtensionDialogManager(deps: {
         if (dialogOptions?.signal) {
           const onAbort = () => {
             clearPending(contextKey);
-            void finalizePending(target, pendingDialog, escapeHTML("Input cancelled."), "Input cancelled.");
+            void finalizePending(target, pendingDialog, renderDialogPanel(pendingDialog.title, ["Input cancelled."], "⛔"));
             resolve(undefined);
           };
           dialogOptions.signal.addEventListener("abort", onAbort, { once: true });
@@ -318,8 +323,7 @@ export function createExtensionDialogManager(deps: {
         await finalizePending(
           target,
           pendingDialog,
-          `<b>${escapeHTML(pendingDialog.title)}</b>\n<i>Received:</i> ${escapeHTML(userText)}`,
-          `${pendingDialog.title}\nReceived: ${userText}`,
+          renderDialogPanel(pendingDialog.title, [`Received: ${userText}`], "✅"),
         );
       } finally {
         pendingDialog.resolve(userText);
@@ -335,7 +339,7 @@ export function createExtensionDialogManager(deps: {
       }
 
       resolveCancelled(pendingDialog);
-      await finalizePending(target, pendingDialog, escapeHTML("Dialog cancelled."), "Dialog cancelled.");
+      await finalizePending(target, pendingDialog, renderDialogPanel(pendingDialog.title, ["Dialog cancelled."], "⛔"));
       return true;
     },
 
@@ -359,8 +363,7 @@ export function createExtensionDialogManager(deps: {
             await finalizePending(
               target,
               pendingDialog,
-              `<b>${escapeHTML(pendingDialog.title)}</b>\n<i>Selected:</i> ${escapeHTML(selected)}`,
-              `${pendingDialog.title}\nSelected: ${selected}`,
+              renderDialogPanel(pendingDialog.title, [`Selected: ${selected}`], "✅"),
             );
           } finally {
             pendingDialog.resolve(selected);
@@ -384,8 +387,7 @@ export function createExtensionDialogManager(deps: {
             await finalizePending(
               target,
               pendingDialog,
-              `<b>${escapeHTML(pendingDialog.title)}</b>\n<i>${confirmed ? "Confirmed" : "Cancelled"}</i>`,
-              `${pendingDialog.title}\n${confirmed ? "Confirmed" : "Cancelled"}`,
+              renderDialogPanel(pendingDialog.title, [confirmed ? "Confirmed." : "Cancelled."], confirmed ? "✅" : "⛔"),
             );
           } finally {
             pendingDialog.resolve(confirmed);
@@ -406,7 +408,7 @@ export function createExtensionDialogManager(deps: {
         callbackText: "Cancelled",
         afterAnswer: async () => {
           resolveCancelled(pendingDialog);
-          await finalizePending(target, pendingDialog, escapeHTML("Dialog cancelled."), "Dialog cancelled.");
+          await finalizePending(target, pendingDialog, renderDialogPanel(pendingDialog.title, ["Dialog cancelled."], "⛔"));
         },
       };
     },

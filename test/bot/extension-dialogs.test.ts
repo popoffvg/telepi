@@ -1,4 +1,5 @@
 import { createExtensionDialogManager } from "../../src/bot/extension-dialogs.js";
+import { renderDialogPanel } from "../../src/bot/message-rendering.js";
 import type { PiSessionContext } from "../../src/pi-session.js";
 
 describe("extension dialog manager", () => {
@@ -23,8 +24,10 @@ describe("extension dialog manager", () => {
     const pendingChoice = manager.openSelect(target, "Pick one", ["Alpha", "Beta"]);
     await Promise.resolve();
 
-    expect(sendTextMessage).toHaveBeenCalledWith(target, "<b>Pick one</b>", expect.objectContaining({
-      fallbackText: "Pick one",
+    const opened = renderDialogPanel("Pick one", ["2 options available.", "Use the buttons below."], "🧭");
+    expect(sendTextMessage).toHaveBeenCalledWith(target, opened.text, expect.objectContaining({
+      fallbackText: opened.fallbackText,
+      parseMode: "HTML",
     }));
 
     const result = await manager.resolveSelect(target, "1", 1, 1);
@@ -33,11 +36,12 @@ describe("extension dialog manager", () => {
 
     await result.afterAnswer?.();
 
+    const selected = renderDialogPanel("Pick one", ["Selected: Beta"], "✅");
     expect(editMessage).toHaveBeenCalledWith(
       target,
       1,
-      "<b>Pick one</b>\n<i>Selected:</i> Beta",
-      expect.objectContaining({ fallbackText: "Pick one\nSelected: Beta" }),
+      selected.text,
+      expect.objectContaining({ fallbackText: selected.fallbackText, parseMode: "HTML" }),
     );
     await expect(pendingChoice).resolves.toBe("Beta");
   });
@@ -50,11 +54,12 @@ describe("extension dialog manager", () => {
     await new Promise((resolve) => setTimeout(resolve, 20));
 
     await expect(pendingInput).resolves.toBeUndefined();
+    const timedOut = renderDialogPanel("Name", ["Dialog timed out."], "⏰");
     expect(editMessage).toHaveBeenCalledWith(
       target,
       1,
-      "Dialog timed out.",
-      expect.objectContaining({ fallbackText: "Dialog timed out." }),
+      timedOut.text,
+      expect.objectContaining({ fallbackText: timedOut.fallbackText, parseMode: "HTML" }),
     );
   });
 
@@ -69,22 +74,24 @@ describe("extension dialog manager", () => {
 
     await expect(manager.consumeInput(target, "Bene")).resolves.toBe(true);
     await expect(pendingInput).resolves.toBe("Bene");
+    const received = renderDialogPanel("Name", ["Received: Bene"], "✅");
     expect(editMessage).toHaveBeenCalledWith(
       target,
       1,
-      "<b>Name</b>\n<i>Received:</i> Bene",
-      expect.objectContaining({ fallbackText: "Name\nReceived: Bene" }),
+      received.text,
+      expect.objectContaining({ fallbackText: received.fallbackText, parseMode: "HTML" }),
     );
 
     const pendingConfirm = manager.openConfirm(target, "Confirm deploy", "Ship it?");
     await Promise.resolve();
     await expect(manager.cancelPending(target)).resolves.toBe(true);
     await expect(pendingConfirm).resolves.toBe(false);
+    const cancelled = renderDialogPanel("Confirm deploy", ["Dialog cancelled."], "⛔");
     expect(editMessage).toHaveBeenLastCalledWith(
       target,
       1,
-      "Dialog cancelled.",
-      expect.objectContaining({ fallbackText: "Dialog cancelled." }),
+      cancelled.text,
+      expect.objectContaining({ fallbackText: cancelled.fallbackText, parseMode: "HTML" }),
     );
   });
 
@@ -99,11 +106,12 @@ describe("extension dialog manager", () => {
     expect(editMessage).not.toHaveBeenCalled();
     await confirmResult.afterAnswer?.();
     await expect(pendingConfirm).resolves.toBe(true);
+    const confirmed = renderDialogPanel("Confirm deploy", ["Confirmed."], "✅");
     expect(editMessage).toHaveBeenCalledWith(
       target,
       1,
-      "<b>Confirm deploy</b>\n<i>Confirmed</i>",
-      expect.objectContaining({ fallbackText: "Confirm deploy\nConfirmed" }),
+      confirmed.text,
+      expect.objectContaining({ fallbackText: confirmed.fallbackText, parseMode: "HTML" }),
     );
 
     const pendingSelect = manager.openSelect(target, "Pick one", ["Alpha"]);

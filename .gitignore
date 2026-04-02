@@ -11,5 +11,8 @@ artifacts/
 # Runtime workspace (Docker mount)
 workspace/
 
+# Local Pi state / extensions
+.pi/
+
 # macOS
 .DS_Store

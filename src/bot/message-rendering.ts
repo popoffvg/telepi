@@ -115,6 +115,18 @@ export function renderVoiceSupportHTML(backends: string[], warning?: string): st
   return warning ? `${status}\n⚠️ ${escapeHTML(warning)}` : status;
 }
 
+const DIALOG_PANEL_MIN_WIDTH = 22;
+const DIALOG_PANEL_MAX_WIDTH = 36;
+
+export function renderDialogPanel(title: string, bodyLines: string[], titleIcon?: string): RenderedText {
+  const panelText = buildDialogPanelText(titleIcon ? `${titleIcon} ${title}` : title, bodyLines);
+  return {
+    text: `<pre>${escapeHTML(panelText)}</pre>`,
+    fallbackText: panelText,
+    parseMode: "HTML",
+  };
+}
+
 export function renderToolStartMessage(toolName: string): RenderedText {
   return {
     text: `<b>🔧 Running:</b> <code>${escapeHTML(toolName)}</code>`,
@@ -371,6 +383,83 @@ export function renderPrefixedError(prefix: string, error: unknown, multiline = 
     fallbackText: multiline ? `${prefix}:\n${message}` : `${prefix}: ${message}`,
     parseMode: "HTML",
   };
+}
+
+function buildDialogPanelText(title: string, bodyLines: string[]): string {
+  const titleLines = wrapDialogPanelLine(title, DIALOG_PANEL_MAX_WIDTH);
+  const wrappedBodyLines = bodyLines.flatMap((line) => {
+    if (!line.trim()) {
+      return [""];
+    }
+    return wrapDialogPanelLine(line, DIALOG_PANEL_MAX_WIDTH);
+  });
+  const contentWidth = Math.max(
+    DIALOG_PANEL_MIN_WIDTH,
+    ...titleLines.map((line) => line.length),
+    ...wrappedBodyLines.map((line) => line.length),
+  );
+  const horizontal = "─".repeat(contentWidth + 2);
+  const lines = [
+    `┌${horizontal}┐`,
+    ...titleLines.map((line) => frameDialogPanelLine(line, contentWidth)),
+  ];
+
+  if (wrappedBodyLines.length > 0) {
+    lines.push(`├${horizontal}┤`, ...wrappedBodyLines.map((line) => frameDialogPanelLine(line, contentWidth)));
+  }
+
+  lines.push(`└${horizontal}┘`);
+  return lines.join("\n");
+}
+
+function frameDialogPanelLine(text: string, width: number): string {
+  return `│ ${text.padEnd(width, " ")} │`;
+}
+
+function wrapDialogPanelLine(text: string, maxWidth: number): string[] {
+  const normalized = text.replace(/\s+/g, " ").trim();
+  if (!normalized) {
+    return [""];
+  }
+
+  const words = normalized.split(" ");
+  const lines: string[] = [];
+  let current = "";
+
+  for (const word of words) {
+    let remaining = word;
+    while (remaining.length > maxWidth) {
+      if (current) {
+        lines.push(current);
+        current = "";
+      }
+      lines.push(remaining.slice(0, maxWidth));
+      remaining = remaining.slice(maxWidth);
+    }
+
+    if (!remaining) {
+      continue;
+    }
+
+    if (!current) {
+      current = remaining;
+      continue;
+    }
+
+    if (current.length + 1 + remaining.length <= maxWidth) {
+      current += ` ${remaining}`;
+      continue;
+    }
+
+    lines.push(current);
+    current = remaining;
+  }
+
+  if (current) {
+    lines.push(current);
+  }
+
+  return lines.length > 0 ? lines : [""];
 }
 
 function isAbortError(message: string): boolean {

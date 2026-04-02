@@ -1426,6 +1426,7 @@ describe("createBot", () => {
     });
 
     await bot.handleUpdate(createTestUpdate({ message: { text: "/tree" } }));
+    expect(api.sendMessage.mock.calls[0]?.[1]).toContain("Page 1/2");
     expect(getReplyMarkupData(api)).toEqual([
       "tree_nav_root0000",
       "tree_nav_node0002",
@@ -1440,11 +1441,48 @@ describe("createBot", () => {
     ]);
 
     await bot.handleUpdate(createCallbackUpdate("tree_page_1"));
+    expect(api.editMessageText.mock.calls[0]?.[2]).toContain("Page 2/2");
     expect(getEditedReplyMarkupButtons(api).map((button) => button.callback_data)).toEqual([
       "tree_nav_node0007",
       "tree_page_0",
       "noop_page",
       "tree_mode_all",
+      "tree_mode_user",
+    ]);
+  });
+
+  it("keeps the selected tree mode when paging", async () => {
+    const tree = generatePagedTree(8);
+    const { bot, api } = setupBot({
+      piSessionOverrides: {
+        getTree: vi.fn().mockReturnValue(tree),
+        getLeafId: vi.fn().mockReturnValue("node0001"),
+      },
+    });
+
+    await bot.handleUpdate(createTestUpdate({ message: { text: "/tree all" } }));
+    expect(api.sendMessage.mock.calls[0]?.[1]).toContain("Filter: all entries with navigation buttons.");
+    expect(getReplyMarkupData(api)).toEqual([
+      "tree_nav_root0000",
+      "tree_nav_node0001",
+      "tree_nav_node0002",
+      "tree_nav_node0003",
+      "tree_nav_node0004",
+      "tree_nav_node0005",
+      "noop_page",
+      "tree_page_1",
+      "tree_mode_default",
+      "tree_mode_user",
+    ]);
+
+    await bot.handleUpdate(createCallbackUpdate("tree_page_1"));
+    expect(api.editMessageText.mock.calls[0]?.[2]).toContain("Filter: all entries with navigation buttons.");
+    expect(getEditedReplyMarkupButtons(api).map((button) => button.callback_data)).toEqual([
+      "tree_nav_node0006",
+      "tree_nav_node0007",
+      "tree_page_0",
+      "noop_page",
+      "tree_mode_default",
       "tree_mode_user",
     ]);
   });
@@ -1569,8 +1607,16 @@ describe("createBot", () => {
     expect(cancel.api.editMessageText.mock.calls[0]?.[2]).toContain("Navigation cancelled.");
 
     const mode = setupBot();
+    await mode.bot.handleUpdate(createTestUpdate({ message: { text: "/tree" } }));
+    mode.api.editMessageText.mockClear();
     await mode.bot.handleUpdate(createCallbackUpdate("tree_mode_user"));
     expect(mode.api.editMessageText.mock.calls[0]?.[2]).toContain("Filter: user messages only.");
+
+    const modeExpired = setupBot();
+    await modeExpired.bot.handleUpdate(createCallbackUpdate("tree_mode_user"));
+    expect(modeExpired.api.answerCallbackQuery).toHaveBeenCalledWith("cb_1", {
+      text: "Expired, run /tree again",
+    });
   });
 
   it("processes plain text messages and subscribes to Pi events", async () => {

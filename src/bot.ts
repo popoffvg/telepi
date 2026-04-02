@@ -8,24 +8,15 @@ import type { TelePiConfig } from "./config.js";
 import { formatError } from "./errors.js";
 import { escapeHTML } from "./format.js";
 import {
-  getWorkspaceShortName,
   isMessageNotModifiedError,
   renderFailedText,
-  renderHelpHTML,
-  renderHelpPlain,
   renderPrefixedError,
   renderSessionInfoHTML,
   renderSessionInfoPlain,
-  renderVoiceSupportHTML,
-  renderVoiceSupportPlain,
-  stripHtml,
-  trimLine,
-  type RenderedText,
 } from "./bot/message-rendering.js";
 import {
   appendKeyboardItems,
   paginateKeyboard,
-  splitTreeKeyboardItems,
   type KeyboardItem,
   KEYBOARD_PAGE_SIZE,
   NOOP_PAGE_CALLBACK_DATA,
@@ -33,15 +24,9 @@ import {
 import {
   buildChatScopedCommands,
   buildChatScopedCommandSignature,
-  buildCommandPickerEntries,
-  filterCommandPickerEntries,
-  getCommandPickerCounts,
-  getCommandPickerFilterName,
   normalizeSlashCommand,
   TELEPI_BOT_COMMANDS,
   TELEPI_LOCAL_COMMAND_NAMES,
-  type CommandPickerEntry,
-  type CommandPickerFilter,
 } from "./bot/slash-command.js";
 import {
   downloadTelegramFile,
@@ -54,10 +39,12 @@ import {
 import { createExtensionDialogManager } from "./bot/extension-dialogs.js";
 import { createBotChatState } from "./bot/chat-state.js";
 import { createPromptHandler } from "./bot/prompt-handler.js";
+import { createCommandPickerHandlers, type PendingCommandPicker } from "./bot/command-picker.js";
 import { createBasicCommandHandlers } from "./bot/commands/basic.js";
 import { createSessionCommandHandlers } from "./bot/commands/sessions.js";
 import { createModelCommandHandlers } from "./bot/commands/model.js";
 import { createTreeCommandHandlers } from "./bot/commands/tree.js";
+import { registerTreeCallbacks, type PendingTreeView } from "./bot/tree-callbacks.js";
 import {
   type PiSessionContext,
   getPiSessionContextKey,
@@ -65,12 +52,7 @@ import {
   type PiSessionRegistry,
   type PiSessionService,
 } from "./pi-session.js";
-import {
-  renderBranchConfirmation,
-  renderTree,
-  truncateText,
-  type TreeFilterMode,
-} from "./tree.js";
+import { truncateText, type TreeFilterMode } from "./tree.js";
 import { getVoiceBackendStatus, transcribeAudio } from "./voice.js";
 
 const EDIT_DEBOUNCE_MS = 1500;
@@ -79,13 +61,6 @@ const EXTENSION_UI_TIMEOUT_MS = 60_000;
 
 type TelegramChatId = number | string;
 type ContextKey = string;
-
-type PendingCommandPicker = {
-  messageId: number;
-  entries: CommandPickerEntry[];
-  filter: CommandPickerFilter;
-  page: number;
-};
 
 export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegistry): Bot<Context> {
   const bot = new Bot<Context>(config.telegramBotToken);
@@ -101,8 +76,7 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
   const pendingModelButtons = new Map<ContextKey, KeyboardItem[]>();
   const pendingModelExtraButtons = new Map<ContextKey, KeyboardItem[]>();
   const pendingTreeNavs = new Map<ContextKey, string>();
-  const pendingTreeButtons = new Map<ContextKey, KeyboardItem[]>();
-  const pendingTreeFilterButtons = new Map<ContextKey, KeyboardItem[]>();
+  const pendingTreeViews = new Map<ContextKey, PendingTreeView>();
   const pendingBranchButtons = new Map<ContextKey, KeyboardItem[]>();
   const pendingCommandPickers = new Map<ContextKey, PendingCommandPicker>();
   const chatScopedCommandSignatures = new Map<TelegramChatId, string>();
@@ -163,16 +137,41 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
     }
   };
 
-  const setPendingTreeKeyboard = (contextKey: ContextKey, buttons: KeyboardItem[]): InlineKeyboard => {
-    const { navButtons, filterButtons } = splitTreeKeyboardItems(buttons);
-    pendingTreeButtons.set(contextKey, navButtons);
-    pendingTreeFilterButtons.set(contextKey, filterButtons);
-    return buildKeyboard(navButtons, 0, "tree", filterButtons);
+  const setPendingTreeView = (contextKey: ContextKey, mode: TreeFilterMode): void => {
+    pendingTreeViews.set(contextKey, { mode });
   };
 
-  const clearPendingTreeKeyboard = (contextKey: ContextKey): void => {
-    pendingTreeButtons.delete(contextKey);
-    pendingTreeFilterButtons.delete(contextKey);
+  const clearPendingTreeView = (contextKey: ContextKey): void => {
+    pendingTreeViews.delete(contextKey);
+  };
+
+  const buildTreeKeyboard = (items: KeyboardItem[]): InlineKeyboard => {
+    const keyboard = new InlineKeyboard();
+    const navButtons = items.filter((button) => button.callbackData.startsWith("tree_nav_"));
+    const pageButtons = items.filter(
+      (button) => button.callbackData === NOOP_PAGE_CALLBACK_DATA || button.callbackData.startsWith("tree_page_"),
+    );
+    const filterButtons = items.filter((button) => button.callbackData.startsWith("tree_mode_"));
+
+    for (const button of navButtons) {
+      keyboard.text(button.label, button.callbackData).row();
+    }
+
+    if (pageButtons.length > 0) {
+      for (const button of pageButtons) {
+        keyboard.text(button.label, button.callbackData);
+      }
+      keyboard.row();
+    }
+
+    if (filterButtons.length > 0) {
+      for (const button of filterButtons) {
+        keyboard.text(button.label, button.callbackData);
+      }
+      keyboard.row();
+    }
+
+    return keyboard;
   };
 
   const clearContextPickers = (contextKey: ContextKey): void => {
@@ -184,8 +183,7 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
     pendingModelButtons.delete(contextKey);
     pendingModelExtraButtons.delete(contextKey);
     pendingTreeNavs.delete(contextKey);
-    pendingTreeButtons.delete(contextKey);
-    pendingTreeFilterButtons.delete(contextKey);
+    pendingTreeViews.delete(contextKey);
     pendingBranchButtons.delete(contextKey);
     pendingCommandPickers.delete(contextKey);
   };
@@ -299,168 +297,21 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
     sendBusyReply,
   });
 
-  const renderCommandPickerState = (picker: PendingCommandPicker): RenderedText & {
-    replyMarkup: InlineKeyboard;
-    page: number;
-    filteredEntries: CommandPickerEntry[];
-  } => {
-    const filteredEntries = filterCommandPickerEntries(picker.entries, picker.filter);
-    const totalPages = Math.max(1, Math.ceil(filteredEntries.length / KEYBOARD_PAGE_SIZE));
-    const page = Math.max(0, Math.min(picker.page, totalPages - 1));
-    const pageEntries = filteredEntries.slice(page * KEYBOARD_PAGE_SIZE, (page + 1) * KEYBOARD_PAGE_SIZE);
-    const counts = getCommandPickerCounts(picker.entries);
-
-    const keyboard = new InlineKeyboard();
-    for (const entry of pageEntries) {
-      keyboard.text(trimLine(entry.label, 48), `cmd_pick_${entry.id}`).row();
-    }
-
-    if (totalPages > 1) {
-      if (page > 0) {
-        keyboard.text("◀️ Prev", `cmd_page_${page - 1}`);
-      }
-      keyboard.text(`${page + 1}/${totalPages}`, NOOP_PAGE_CALLBACK_DATA);
-      if (page < totalPages - 1) {
-        keyboard.text("Next ▶️", `cmd_page_${page + 1}`);
-      }
-      keyboard.row();
-    }
-
-    const filterButtons: Array<{ filter: CommandPickerFilter; icon: string }> = [
-      { filter: "all", icon: "🧭" },
-      { filter: "telepi", icon: "📱" },
-      { filter: "pi", icon: "⚡" },
-    ];
-    for (const button of filterButtons) {
-      const active = picker.filter === button.filter;
-      const label = `${active ? "✅ " : ""}${button.icon} ${getCommandPickerFilterName(button.filter)} ${counts[button.filter]}`;
-      keyboard.text(label, `cmd_filter_${button.filter}`);
-    }
-    keyboard.row();
-
-    const summary = filteredEntries.length === 0
-      ? `No ${getCommandPickerFilterName(picker.filter)} commands available.`
-      : `Showing ${page * KEYBOARD_PAGE_SIZE + 1}-${page * KEYBOARD_PAGE_SIZE + pageEntries.length} of ${filteredEntries.length} ${getCommandPickerFilterName(picker.filter)} commands.`;
-
-    const plainLines = [
-      "Command picker",
-      `Filter: ${getCommandPickerFilterName(picker.filter)}`,
-      `Page: ${page + 1}/${totalPages}`,
-      summary,
-      "",
-      ...(pageEntries.length > 0
-        ? pageEntries.map((entry) => {
-          const detail = entry.kind === "pi" ? `${entry.description} [${entry.source}]` : entry.description;
-          return `${entry.label.replace(/^[^/]+\s*/, "") } — ${detail}`;
-        })
-        : [picker.filter === "pi" ? "No Pi commands found in this session." : "No commands found for this filter."]),
-      "",
-      "Tap a button below to run a command.",
-    ];
-
-    const htmlLines = [
-      "<b>Command picker</b>",
-      `<i>Filter:</i> <b>${escapeHTML(getCommandPickerFilterName(picker.filter))}</b>`,
-      `<i>Page:</i> ${page + 1}/${totalPages}`,
-      `<i>${escapeHTML(summary)}</i>`,
-      "",
-      ...(pageEntries.length > 0
-        ? pageEntries.map((entry) => entry.kind === "pi"
-          ? `${escapeHTML(entry.label)} — ${escapeHTML(entry.description)} <i>(${escapeHTML(entry.source)})</i>`
-          : `${escapeHTML(entry.label)} — ${escapeHTML(entry.description)}`)
-        : [picker.filter === "pi" ? "<i>No Pi commands found in this session.</i>" : "<i>No commands found for this filter.</i>"]),
-      "",
-      "Tap a button below to run a command.",
-    ];
-
-    return {
-      text: htmlLines.join("\n"),
-      fallbackText: plainLines.join("\n"),
-      parseMode: "HTML",
-      replyMarkup: keyboard,
-      page,
-      filteredEntries,
-    };
-  };
-
-  const openCommandPicker = async (
-    ctx: Context,
-    target: PiSessionContext,
-    options?: { messageId?: number; filter?: CommandPickerFilter; page?: number },
-  ): Promise<void> => {
-    const contextKey = getContextKey(target);
-    const piSession = await getOrCreateSession(target);
-
-    let slashCommands: SlashCommandInfo[];
-    try {
-      slashCommands = await piSession.listSlashCommands();
-    } catch (error) {
-      const failure = renderPrefixedError("Failed to load commands", error);
-      if (options?.messageId) {
-        await safeEditMessage(bot, target, options.messageId, failure.text, {
-          fallbackText: failure.fallbackText,
-          parseMode: failure.parseMode,
-        });
-      } else {
-        await safeReply(ctx, failure.text, {
-          fallbackText: failure.fallbackText,
-          parseMode: failure.parseMode,
-        }, target);
-      }
-      return;
-    }
-
-    try {
-      await syncChatScopedCommands(target, slashCommands);
-    } catch (error) {
-      console.error("Failed to sync chat-scoped Telegram commands", error);
-    }
-
-    const picker: PendingCommandPicker = {
-      messageId: options?.messageId ?? 0,
-      entries: buildCommandPickerEntries(slashCommands),
-      filter: options?.filter ?? "all",
-      page: options?.page ?? 0,
-    };
-    const rendered = renderCommandPickerState(picker);
-    picker.page = rendered.page;
-
-    if (options?.messageId) {
-      await safeEditMessage(bot, target, options.messageId, rendered.text, {
-        fallbackText: rendered.fallbackText,
-        parseMode: rendered.parseMode,
-        replyMarkup: rendered.replyMarkup,
-      });
-      picker.messageId = options.messageId;
-      pendingCommandPickers.set(contextKey, picker);
-      return;
-    }
-
-    const message = await sendTextMessage(ctx.api, target, rendered.text, {
-      fallbackText: rendered.fallbackText,
-      parseMode: rendered.parseMode,
-      replyMarkup: rendered.replyMarkup,
-    });
-    picker.messageId = message.message_id;
-    pendingCommandPickers.set(contextKey, picker);
-  };
-
-  const getPendingCommandPicker = (
-    target: PiSessionContext,
-    messageId?: number,
-  ): { contextKey: ContextKey; picker: PendingCommandPicker } | undefined => {
-    if (!messageId) {
-      return undefined;
-    }
-
-    const contextKey = getContextKey(target);
-    const picker = pendingCommandPickers.get(contextKey);
-    if (!picker || picker.messageId !== messageId) {
-      return undefined;
-    }
-
-    return { contextKey, picker };
-  };
+  const commandPickerHandlers = createCommandPickerHandlers({
+    bot,
+    pendingCommandPickers,
+    getTelegramTarget,
+    getContextKey,
+    getOrCreateSession,
+    syncChatScopedCommands,
+    isBusy,
+    handleUserPrompt,
+    runTelePiPickerCommand,
+    safeReply,
+    safeEditMessage: (target, messageId, text, options) => safeEditMessage(bot, target, messageId, text, options),
+    sendTextMessage: (ctx, target, text, options) => sendTextMessage(ctx.api, target, text, options),
+  });
+  const { openCommandPicker } = commandPickerHandlers;
 
   const basicCommandHandlers = createBasicCommandHandlers({
     sessionRegistry,
@@ -531,18 +382,19 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
     isBusy,
     pendingTreeNavs,
     pendingBranchButtons,
-    clearPendingTreeKeyboard,
-    setPendingTreeKeyboard,
+    clearPendingTreeView,
+    setPendingTreeView,
+    buildTreeKeyboard,
     buildKeyboard,
     safeReply,
   });
   const { collectLabelsMap, handleTreeCommand, handleBranchCommand, handleLabelCommand } = treeCommandHandlers;
 
-  const runTelePiPickerCommand = async (
+  async function runTelePiPickerCommand(
     ctx: Context,
     target: PiSessionContext,
     command: string,
-  ): Promise<void> => {
+  ): Promise<void> {
     switch (command) {
       case "start":
         await handleStartCommand(ctx, target);
@@ -588,7 +440,7 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
         }, target);
         return;
     }
-  };
+  }
 
   bot.command("start", async (ctx) => {
     const target = getTelegramTarget(ctx);
@@ -776,108 +628,26 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
   handlePageCallback(/^switch_page_(\d+)$/, "switch", pendingSessionButtons, "Expired, run /sessions again");
   handlePageCallback(/^newws_page_(\d+)$/, "newws", pendingWorkspaceButtons, "Expired, run /new again");
   handlePageCallback(/^model_page_(\d+)$/, "model", pendingModelButtons, "Expired, run /model again", pendingModelExtraButtons);
-  handlePageCallback(
-    /^tree_page_(\d+)$/,
-    "tree",
-    pendingTreeButtons,
-    "Expired, run /tree again",
-    pendingTreeFilterButtons,
-  );
   handlePageCallback(/^branch_page_(\d+)$/, "branch", pendingBranchButtons, "Expired, run /branch again");
 
-  bot.callbackQuery(/^cmd_page_(\d+)$/, async (ctx) => {
-    const target = getTelegramTarget(ctx);
-    const messageId = ctx.callbackQuery.message?.message_id;
-    const page = Number.parseInt(ctx.match?.[1] ?? "", 10);
-
-    if (!target || !messageId || Number.isNaN(page)) {
-      return;
-    }
-
-    const activePicker = getPendingCommandPicker(target, messageId);
-    if (!activePicker) {
-      await ctx.answerCallbackQuery({ text: "Expired, run /commands again" });
-      return;
-    }
-
-    activePicker.picker.page = page;
-    const rendered = renderCommandPickerState(activePicker.picker);
-    activePicker.picker.page = rendered.page;
-    pendingCommandPickers.set(activePicker.contextKey, activePicker.picker);
-
-    await ctx.answerCallbackQuery();
-    await safeEditMessage(bot, target, messageId, rendered.text, {
-      fallbackText: rendered.fallbackText,
-      parseMode: rendered.parseMode,
-      replyMarkup: rendered.replyMarkup,
-    });
-  });
-
-  bot.callbackQuery(/^cmd_filter_(all|telepi|pi)$/, async (ctx) => {
-    const target = getTelegramTarget(ctx);
-    const messageId = ctx.callbackQuery.message?.message_id;
-    const filter = ctx.match?.[1] as CommandPickerFilter | undefined;
-
-    if (!target || !messageId || !filter) {
-      return;
-    }
-
-    const activePicker = getPendingCommandPicker(target, messageId);
-    if (!activePicker) {
-      await ctx.answerCallbackQuery({ text: "Expired, run /commands again" });
-      return;
-    }
-
-    activePicker.picker.filter = filter;
-    activePicker.picker.page = 0;
-    const rendered = renderCommandPickerState(activePicker.picker);
-    activePicker.picker.page = rendered.page;
-    pendingCommandPickers.set(activePicker.contextKey, activePicker.picker);
-
-    await ctx.answerCallbackQuery({ text: `Showing ${getCommandPickerFilterName(filter)} commands` });
-    await safeEditMessage(bot, target, messageId, rendered.text, {
-      fallbackText: rendered.fallbackText,
-      parseMode: rendered.parseMode,
-      replyMarkup: rendered.replyMarkup,
-    });
-  });
-
-  bot.callbackQuery(/^cmd_pick_(\d+)$/, async (ctx) => {
-    const target = getTelegramTarget(ctx);
-    const messageId = ctx.callbackQuery.message?.message_id;
-    const index = Number.parseInt(ctx.match?.[1] ?? "", 10);
-
-    if (!target || !messageId || Number.isNaN(index)) {
-      return;
-    }
-
-    const activePicker = getPendingCommandPicker(target, messageId);
-    if (!activePicker) {
-      await ctx.answerCallbackQuery({ text: "Expired, run /commands again" });
-      return;
-    }
-
-    const entry = activePicker.picker.entries.find((item) => item.id === index);
-    if (!entry) {
-      await ctx.answerCallbackQuery({ text: "Expired, run /commands again" });
-      return;
-    }
-
-    if (entry.kind === "pi") {
-      if (isBusy(target)) {
-        await ctx.answerCallbackQuery({ text: "Wait for the current prompt to finish" });
-        return;
-      }
-
-      pendingCommandPickers.delete(activePicker.contextKey);
-      await ctx.answerCallbackQuery({ text: `Running ${trimLine(entry.commandText, 32)}` });
-      await handleUserPrompt(ctx, target, entry.commandText);
-      return;
-    }
-
-    pendingCommandPickers.delete(activePicker.contextKey);
-    await ctx.answerCallbackQuery({ text: `Opening ${trimLine(entry.commandText, 32)}` });
-    await runTelePiPickerCommand(ctx, target, entry.command);
+  registerTreeCallbacks({
+    bot,
+    getTelegramTarget,
+    getContextKey,
+    getExistingSession,
+    isBusy,
+    beginSwitching: (target) => chatState.beginSwitching(target),
+    endSwitching: (target) => chatState.endSwitching(target),
+    pendingTreeViews,
+    pendingTreeNavs,
+    pendingBranchButtons,
+    setPendingTreeView,
+    clearPendingTreeView,
+    buildTreeKeyboard,
+    buildKeyboard,
+    collectLabelsMap,
+    safeReply,
+    safeEditMessage: (target, messageId, text, options) => safeEditMessage(bot, target, messageId, text, options),
   });
 
   bot.callbackQuery(/^switch_(\d+)$/, async (ctx) => {
@@ -911,7 +681,7 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
       const resolvedSession = await piSession.resolveSessionReference(sessions[index].path);
       const info = await piSession.switchSession(resolvedSession.path, resolvedSession.cwd);
       await refreshChatScopedCommands(target, piSession);
-      clearPendingTreeKeyboard(contextKey);
+      clearPendingTreeView(contextKey);
       clearContextPromptMemory(target);
       const workspaceNotePlain = resolvedSession.workspaceWarning
         ? `\n\nWorkspace note: ${resolvedSession.workspaceWarning}`
@@ -984,7 +754,7 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
       }
 
       await refreshChatScopedCommands(target, piSession);
-      clearPendingTreeKeyboard(contextKey);
+      clearPendingTreeView(contextKey);
       clearContextPromptMemory(target);
       const plainText = `New session created.\n\n${renderSessionInfoPlain(info)}`;
       const html = `<b>New session created.</b>\n\n${renderSessionInfoHTML(info)}`;
@@ -1093,272 +863,6 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
     } finally {
       chatState.endSwitching(target);
     }
-  });
-
-  bot.callbackQuery(/^tree_nav_(.+)$/, async (ctx) => {
-    const target = getTelegramTarget(ctx);
-    const messageId = ctx.callbackQuery.message?.message_id;
-    const entryId = ctx.match?.[1];
-    if (!target || !entryId) {
-      return;
-    }
-
-    const contextKey = getContextKey(target);
-    const piSession = getExistingSession(target);
-
-    if (isBusy(target)) {
-      await ctx.answerCallbackQuery({ text: "Wait for the current prompt to finish" });
-      return;
-    }
-
-    if (!piSession?.hasActiveSession()) {
-      await ctx.answerCallbackQuery({ text: "No active session" });
-      return;
-    }
-
-    const entry = piSession.getEntry(entryId);
-    if (!entry) {
-      await ctx.answerCallbackQuery({ text: "Entry not found" });
-      return;
-    }
-
-    const leafId = piSession.getLeafId();
-    if (entry.id === leafId) {
-      await ctx.answerCallbackQuery({ text: "Already at this point" });
-      return;
-    }
-
-    await ctx.answerCallbackQuery({ text: "Loading..." });
-
-    const confirmation = renderBranchConfirmation(
-      entry,
-      piSession.getChildren(entry.id),
-      leafId,
-      collectLabelsMap(piSession),
-    );
-    pendingTreeNavs.set(contextKey, entry.id);
-    pendingBranchButtons.set(contextKey, confirmation.buttons);
-
-    const keyboard = buildKeyboard(confirmation.buttons, 0, "branch");
-
-    if (messageId) {
-      await safeEditMessage(bot, target, messageId, confirmation.text, {
-        fallbackText: stripHtml(confirmation.text),
-        replyMarkup: keyboard,
-      });
-    } else {
-      await safeReply(ctx, confirmation.text, {
-        fallbackText: stripHtml(confirmation.text),
-        replyMarkup: keyboard,
-      }, target);
-    }
-  });
-
-  bot.callbackQuery(/^tree_go_(.+)$/, async (ctx) => {
-    const target = getTelegramTarget(ctx);
-    const messageId = ctx.callbackQuery.message?.message_id;
-    const entryId = ctx.match?.[1];
-    if (!target || !entryId) {
-      return;
-    }
-
-    const contextKey = getContextKey(target);
-    const piSession = getExistingSession(target);
-
-    if (isBusy(target)) {
-      await ctx.answerCallbackQuery({ text: "Wait for the current prompt to finish" });
-      return;
-    }
-
-    const pendingId = pendingTreeNavs.get(contextKey);
-    if (pendingId !== entryId || !piSession) {
-      await ctx.answerCallbackQuery({ text: "Confirmation expired. Use /branch again." });
-      return;
-    }
-
-    await ctx.answerCallbackQuery({ text: "Navigating..." });
-    pendingTreeNavs.delete(contextKey);
-    pendingBranchButtons.delete(contextKey);
-    pendingTreeButtons.delete(contextKey);
-    pendingTreeFilterButtons.delete(contextKey);
-
-    chatState.beginSwitching(target);
-    try {
-      const result = await piSession.navigateTree(entryId);
-      if (result.cancelled) {
-        const html = escapeHTML("Navigation cancelled.");
-        if (messageId) {
-          await safeEditMessage(bot, target, messageId, html, { fallbackText: "Navigation cancelled." });
-        } else {
-          await safeReply(ctx, "Navigation cancelled.", { fallbackText: "Navigation cancelled.", parseMode: undefined }, target);
-        }
-        return;
-      }
-
-      let html = `<b>✅ Navigated to</b> <code>${escapeHTML(entryId.slice(0, 8))}</code>`;
-      let plain = `✅ Navigated to ${entryId.slice(0, 8)}`;
-      if (result.editorText) {
-        html += `\n\nRe-submit: <i>${escapeHTML(truncateText(result.editorText, 200))}</i>`;
-        plain += `\n\nRe-submit: ${truncateText(result.editorText, 200)}`;
-      }
-      html += "\n\nSend your next message to create a new branch from this point.";
-      plain += "\n\nSend your next message to create a new branch from this point.";
-
-      if (messageId) {
-        await safeEditMessage(bot, target, messageId, html, { fallbackText: plain });
-      } else {
-        await safeReply(ctx, html, { fallbackText: plain }, target);
-      }
-    } catch (error) {
-      const failure = renderFailedText(error);
-      if (messageId) {
-        await safeEditMessage(bot, target, messageId, failure.text, {
-          fallbackText: failure.fallbackText,
-          parseMode: failure.parseMode,
-        });
-      } else {
-        await safeReply(ctx, failure.text, {
-          fallbackText: failure.fallbackText,
-          parseMode: failure.parseMode,
-        }, target);
-      }
-    } finally {
-      chatState.endSwitching(target);
-    }
-  });
-
-  bot.callbackQuery(/^tree_sum_(.+)$/, async (ctx) => {
-    const target = getTelegramTarget(ctx);
-    const messageId = ctx.callbackQuery.message?.message_id;
-    const entryId = ctx.match?.[1];
-    if (!target || !entryId) {
-      return;
-    }
-
-    const contextKey = getContextKey(target);
-    const piSession = getExistingSession(target);
-
-    if (isBusy(target)) {
-      await ctx.answerCallbackQuery({ text: "Wait for the current prompt to finish" });
-      return;
-    }
-
-    const pendingId = pendingTreeNavs.get(contextKey);
-    if (pendingId !== entryId || !piSession) {
-      await ctx.answerCallbackQuery({ text: "Confirmation expired. Use /branch again." });
-      return;
-    }
-
-    await ctx.answerCallbackQuery({ text: "Navigating with summary..." });
-    pendingTreeNavs.delete(contextKey);
-    pendingBranchButtons.delete(contextKey);
-    pendingTreeButtons.delete(contextKey);
-    pendingTreeFilterButtons.delete(contextKey);
-
-    chatState.beginSwitching(target);
-    try {
-      const result = await piSession.navigateTree(entryId, { summarize: true });
-      if (result.cancelled) {
-        const html = escapeHTML("Navigation cancelled.");
-        if (messageId) {
-          await safeEditMessage(bot, target, messageId, html, { fallbackText: "Navigation cancelled." });
-        } else {
-          await safeReply(ctx, "Navigation cancelled.", { fallbackText: "Navigation cancelled.", parseMode: undefined }, target);
-        }
-        return;
-      }
-
-      let html = `<b>✅ Navigated to</b> <code>${escapeHTML(entryId.slice(0, 8))}</code>\n📝 Branch summary saved.`;
-      let plain = `✅ Navigated to ${entryId.slice(0, 8)}\n📝 Branch summary saved.`;
-      if (result.editorText) {
-        html += `\n\nRe-submit: <i>${escapeHTML(truncateText(result.editorText, 200))}</i>`;
-        plain += `\n\nRe-submit: ${truncateText(result.editorText, 200)}`;
-      }
-      html += "\n\nSend your next message to create a new branch from this point.";
-      plain += "\n\nSend your next message to create a new branch from this point.";
-
-      if (messageId) {
-        await safeEditMessage(bot, target, messageId, html, { fallbackText: plain });
-      } else {
-        await safeReply(ctx, html, { fallbackText: plain }, target);
-      }
-    } catch (error) {
-      const failure = renderFailedText(error);
-      if (messageId) {
-        await safeEditMessage(bot, target, messageId, failure.text, {
-          fallbackText: failure.fallbackText,
-          parseMode: failure.parseMode,
-        });
-      } else {
-        await safeReply(ctx, failure.text, {
-          fallbackText: failure.fallbackText,
-          parseMode: failure.parseMode,
-        }, target);
-      }
-    } finally {
-      chatState.endSwitching(target);
-    }
-  });
-
-  bot.callbackQuery("tree_cancel", async (ctx) => {
-    const target = getTelegramTarget(ctx);
-    if (target) {
-      const contextKey = getContextKey(target);
-      pendingTreeNavs.delete(contextKey);
-      pendingBranchButtons.delete(contextKey);
-      pendingTreeButtons.delete(contextKey);
-      pendingTreeFilterButtons.delete(contextKey);
-    }
-    await ctx.answerCallbackQuery({ text: "Cancelled" });
-    const messageId = ctx.callbackQuery.message?.message_id;
-    if (target && messageId) {
-      await safeEditMessage(bot, target, messageId, escapeHTML("Navigation cancelled."), {
-        fallbackText: "Navigation cancelled.",
-      });
-    }
-  });
-
-  bot.callbackQuery(/^tree_mode_(.+)$/, async (ctx) => {
-    const target = getTelegramTarget(ctx);
-    const messageId = ctx.callbackQuery.message?.message_id;
-    const mode = ctx.match?.[1];
-    if (!target || !messageId) {
-      return;
-    }
-
-    const contextKey = getContextKey(target);
-    const piSession = getExistingSession(target);
-
-    if (isBusy(target)) {
-      await ctx.answerCallbackQuery({ text: "Wait for the current prompt to finish" });
-      return;
-    }
-
-    if (!piSession?.hasActiveSession()) {
-      await ctx.answerCallbackQuery({ text: "No active session" });
-      return;
-    }
-
-    await ctx.answerCallbackQuery();
-
-    let filterMode: TreeFilterMode = "default";
-    if (mode === "all") {
-      filterMode = "all-with-buttons";
-    } else if (mode === "user") {
-      filterMode = "user-only";
-    }
-
-    const result = renderTree(piSession.getTree(), piSession.getLeafId(), { mode: filterMode });
-    const keyboard = result.buttons.length > 0 ? setPendingTreeKeyboard(contextKey, result.buttons) : undefined;
-
-    if (!keyboard) {
-      clearPendingTreeKeyboard(contextKey);
-    }
-
-    await safeEditMessage(bot, target, messageId, result.text, {
-      fallbackText: stripHtml(result.text),
-      replyMarkup: keyboard,
-    });
   });
 
   bot.on("message:text", async (ctx) => {

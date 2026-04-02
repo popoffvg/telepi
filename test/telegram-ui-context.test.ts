@@ -38,4 +38,21 @@ describe("createTelegramUIContext", () => {
     await expect(ui.input("Name"))
       .rejects.toThrow("TelePi does not yet support extension UI method 'input'.");
   });
+
+  it("provides a plain-text theme shim for extension compatibility", () => {
+    const ui = createTelegramUIContext({ notify: vi.fn() });
+
+    expect(ui.theme.fg("accent", "hello")).toBe("hello");
+    expect(ui.theme.bg("selectedBg", "hello")).toBe("hello");
+    expect(ui.theme.bold("hello")).toBe("hello");
+    expect(ui.theme.italic("hello")).toBe("hello");
+    expect(ui.theme.underline("hello")).toBe("hello");
+    expect(ui.theme.inverse("hello")).toBe("hello");
+    expect(ui.theme.strikethrough("hello")).toBe("hello");
+    expect(ui.theme.getFgAnsi("accent")).toBe("");
+    expect(ui.theme.getBgAnsi("selectedBg")).toBe("");
+    expect(ui.theme.getColorMode()).toBe("truecolor");
+    expect(ui.theme.getThinkingBorderColor("medium")("hello")).toBe("hello");
+    expect(ui.theme.getBashModeBorderColor()("hello")).toBe("hello");
+  });
 });

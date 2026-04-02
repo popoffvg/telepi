@@ -1,8 +1,14 @@
-import type { Context } from "grammy";
+import { InlineKeyboard, type Context } from "grammy";
 
 import { escapeHTML } from "../../format.js";
 import type { PiSessionContext, PiSessionService } from "../../pi-session.js";
-import { renderBranchConfirmation, renderLabels, renderTree, type TreeFilterMode } from "../../tree.js";
+import {
+  renderBranchConfirmation,
+  renderLabels,
+  renderTree,
+  type SessionTreeNodeLike,
+  type TreeFilterMode,
+} from "../../tree.js";
 import { stripHtml } from "../message-rendering.js";
 import type { KeyboardItem } from "../keyboard.js";
 import type { TextOptions } from "../telegram-transport.js";
@@ -13,9 +19,10 @@ export function createTreeCommandHandlers(deps: {
   isBusy: (target: PiSessionContext) => boolean;
   pendingTreeNavs: Map<string, string>;
   pendingBranchButtons: Map<string, KeyboardItem[]>;
-  clearPendingTreeKeyboard: (contextKey: string) => void;
-  setPendingTreeKeyboard: (contextKey: string, buttons: KeyboardItem[]) => any;
-  buildKeyboard: (items: KeyboardItem[], page: number, prefix: string, extraItems?: KeyboardItem[]) => any;
+  clearPendingTreeView: (contextKey: string) => void;
+  setPendingTreeView: (contextKey: string, mode: TreeFilterMode) => void;
+  buildTreeKeyboard: (items: KeyboardItem[]) => InlineKeyboard;
+  buildKeyboard: (items: KeyboardItem[], page: number, prefix: string, extraItems?: KeyboardItem[]) => InlineKeyboard;
   safeReply: (ctx: Context, text: string, options?: TextOptions, target?: PiSessionContext) => Promise<void>;
 }) {
   const {
@@ -24,15 +31,16 @@ export function createTreeCommandHandlers(deps: {
     isBusy,
     pendingTreeNavs,
     pendingBranchButtons,
-    clearPendingTreeKeyboard,
-    setPendingTreeKeyboard,
+    clearPendingTreeView,
+    setPendingTreeView,
+    buildTreeKeyboard,
     buildKeyboard,
     safeReply,
   } = deps;
 
   const collectLabelsMap = (piSession: PiSessionService): Map<string, string> => {
     const labels = new Map<string, string>();
-    const walk = (node: { entry: { id: string }; children: any[]; label?: string }): void => {
+    const walk = (node: SessionTreeNodeLike): void => {
       if (node.label) {
         labels.set(node.entry.id, node.label);
       }
@@ -79,17 +87,21 @@ export function createTreeCommandHandlers(deps: {
       mode = "user-only";
     }
 
+    pendingTreeNavs.delete(contextKey);
+    pendingBranchButtons.delete(contextKey);
+
     const tree = piSession.getTree();
     const leafId = piSession.getLeafId();
     const result = renderTree(tree, leafId, { mode });
 
     if (result.buttons.length === 0) {
-      clearPendingTreeKeyboard(contextKey);
+      clearPendingTreeView(contextKey);
       await safeReply(ctx, result.text, { fallbackText: stripHtml(result.text) }, target);
       return;
     }
 
-    const keyboard = setPendingTreeKeyboard(contextKey, result.buttons);
+    setPendingTreeView(contextKey, mode);
+    const keyboard = buildTreeKeyboard(result.buttons);
 
     await safeReply(ctx, result.text, {
       fallbackText: stripHtml(result.text),

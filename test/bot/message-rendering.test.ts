@@ -6,6 +6,7 @@ import {
   findPreferredSplitIndex,
   formatMarkdownMessage,
   formatToolSummaryLine,
+  renderDialogPanel,
   renderExtensionError,
   renderExtensionNotice,
   renderFailedText,
@@ -54,10 +55,17 @@ describe("bot message rendering helpers", () => {
     expect(renderHelpHTML(info)).toContain("<b>Notes</b>");
   });
 
-  it("renders voice support, tool updates, and tool summaries", () => {
+  it("renders voice support, dialog panels, tool updates, and tool summaries", () => {
     expect(renderVoiceSupportPlain(["openai", "parakeet"]))
       .toBe("Voice transcription: openai, parakeet.");
     expect(renderVoiceSupportHTML([], "Missing ffmpeg")).toContain("⚠️ Missing ffmpeg");
+
+    const dialogPanel = renderDialogPanel("Pick one", ["2 options available.", "Use the buttons below."], "🧭");
+    expect(dialogPanel.parseMode).toBe("HTML");
+    expect(dialogPanel.text).toContain("<pre>");
+    expect(dialogPanel.fallbackText).toContain("┌");
+    expect(dialogPanel.fallbackText).toContain("🧭 Pick one");
+    expect(dialogPanel.fallbackText).toContain("Use the buttons below.");
 
     expect(renderToolStartMessage("bash")).toEqual({
       text: "<b>🔧 Running:</b> <code>bash</code>",

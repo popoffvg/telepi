@@ -6,6 +6,9 @@
 ## Build, Test, and Development Commands
 Use `npm install` to install dependencies. `npm run dev` starts TelePi with `tsx` against `src/index.ts` for local development. `npm run build` compiles TypeScript into `dist/`. `npm start` runs the built app from `dist/index.js`. `npm test` runs the Vitest suite once, and `npm run test:coverage` enforces coverage thresholds. For Docker, use `docker compose up --build` after creating `.env`.
 
+## Operational Commands
+For the installed macOS `launchd` flow, rebuild from the repo root with `npm run build`. Restart the installed bot with `launchctl kickstart -k gui/$UID/com.telepi`. Check installed-mode status with `node dist/cli.js status` (or `telepi status` when the global CLI is on `PATH`). Installed-mode logs live under `~/Library/Logs/TelePi/`.
+
 ## Coding Style & Naming Conventions
 This project uses strict TypeScript with ESM modules. Follow the existing style: 2-space indentation, double quotes, semicolons, and explicit `.js` import suffixes in TypeScript source. Prefer small, focused modules in `src/` and keep filenames lowercase with hyphens only when already established, for example `pi-session.ts` and `model-scope.ts`. Export named functions and types where practical; avoid default exports unless there is a clear single entrypoint.
 

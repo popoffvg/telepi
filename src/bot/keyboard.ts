@@ -1,5 +1,7 @@
 import { InlineKeyboard } from "grammy";
 
+import { NOOP_PAGE_CALLBACK_DATA } from "../callback-data.js";
+
 export type KeyboardItem = { label: string; callbackData: string };
 
 export interface PaginatedKeyboard {
@@ -7,7 +9,7 @@ export interface PaginatedKeyboard {
 }
 
 export const KEYBOARD_PAGE_SIZE = 6;
-export const NOOP_PAGE_CALLBACK_DATA = "noop_page";
+export { NOOP_PAGE_CALLBACK_DATA };
 
 export function paginateKeyboard(items: KeyboardItem[], page: number, prefix: string): PaginatedKeyboard {
   const totalPages = Math.max(1, Math.ceil(items.length / KEYBOARD_PAGE_SIZE));
@@ -42,13 +44,4 @@ export function appendKeyboardItems(keyboard: InlineKeyboard, items: KeyboardIte
   }
 
   return keyboard;
-}
-
-export function splitTreeKeyboardItems(buttons: KeyboardItem[]): {
-  navButtons: KeyboardItem[];
-  filterButtons: KeyboardItem[];
-} {
-  const navButtons = buttons.filter((button) => button.callbackData.startsWith("tree_nav_"));
-  const filterButtons = buttons.filter((button) => !button.callbackData.startsWith("tree_nav_"));
-  return { navButtons, filterButtons };
 }

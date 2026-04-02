@@ -1,11 +1,6 @@
 import { InlineKeyboard } from "grammy";
 
-import {
-  appendKeyboardItems,
-  paginateKeyboard,
-  splitTreeKeyboardItems,
-  type KeyboardItem,
-} from "../../src/bot/keyboard.js";
+import { appendKeyboardItems, paginateKeyboard, type KeyboardItem } from "../../src/bot/keyboard.js";
 
 describe("bot keyboard helpers", () => {
   it("paginates keyboard items and adds navigation controls", () => {
@@ -70,21 +65,4 @@ describe("bot keyboard helpers", () => {
     ]);
   });
 
-  it("splits tree navigation buttons from filter buttons", () => {
-    const result = splitTreeKeyboardItems([
-      { label: "Branch A", callbackData: "tree_nav_a" },
-      { label: "Branch B", callbackData: "tree_nav_b" },
-      { label: "All", callbackData: "tree_filter_all" },
-      { label: "User", callbackData: "tree_filter_user" },
-    ]);
-
-    expect(result.navButtons).toEqual([
-      { label: "Branch A", callbackData: "tree_nav_a" },
-      { label: "Branch B", callbackData: "tree_nav_b" },
-    ]);
-    expect(result.filterButtons).toEqual([
-      { label: "All", callbackData: "tree_filter_all" },
-      { label: "User", callbackData: "tree_filter_user" },
-    ]);
-  });
 });
