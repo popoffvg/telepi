@@ -23,6 +23,7 @@ import type { ThinkingLevel } from "@mariozechner/pi-agent-core";
 import type { Api, Model } from "@mariozechner/pi-ai";
 
 import type { TelePiConfig } from "./config.js";
+import { createProviderResponseNoticeExtension } from "./provider-response-notices.js";
 import {
   resolveInitialScopedModelSelection,
   resolveScopedModels,
@@ -197,6 +198,9 @@ async function createPiSessionHandle(
       authStorage,
       modelRegistry,
       settingsManager,
+      resourceLoaderOptions: {
+        extensionFactories: [createProviderResponseNoticeExtension()],
+      },
     });
     const configuredModel = resolveModelOverride(services.modelRegistry, config.piModel);
     const scopedModels = await resolveScopedModels(services.settingsManager, services.modelRegistry);
