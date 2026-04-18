@@ -456,6 +456,18 @@ describe("PiSessionService", () => {
     );
   });
 
+  it("adds the provider-response notice extension factory to session services", async () => {
+    await PiSessionService.create(createConfig());
+
+    expect(mockState.createAgentSessionServices).toHaveBeenCalledWith(
+      expect.objectContaining({
+        resourceLoaderOptions: expect.objectContaining({
+          extensionFactories: [expect.any(Function)],
+        }),
+      }),
+    );
+  });
+
   it("binds extension hooks through the underlying session", async () => {
     const service = await PiSessionService.create(createConfig());
     const currentSession = mockState.createdSessions[0]?.session;
