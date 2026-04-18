@@ -2405,6 +2405,20 @@ describe("createBot", () => {
     await failedNew.bot.handleUpdate(createTestUpdate({ message: { text: "/new" } }));
     expect(failedNew.api.sendMessage.mock.calls[0]?.[1]).toContain("new failed");
 
+    const sameWorkspaceNewUnavailable = setupBot({
+      piSessionOverrides: {
+        listWorkspaces: vi.fn().mockResolvedValue(["/workspace/A"]),
+        newSession: vi.fn().mockRejectedValue(
+          new Error("Starting a fresh session in the current workspace isn't available in this TelePi version yet."),
+        ),
+      },
+    });
+    await sameWorkspaceNewUnavailable.bot.handleUpdate(createTestUpdate({ message: { text: "/new" } }));
+    expect(sameWorkspaceNewUnavailable.api.sendMessage.mock.calls[0]?.[1]).toContain(
+      "Starting a fresh session in the current workspace isn't available in this TelePi version yet.",
+    );
+    expect(sameWorkspaceNewUnavailable.api.sendMessage.mock.calls[0]?.[1]).not.toContain("AgentSessionRuntime migration");
+
     const failedModelBootstrap = setupBot({
       piSessionOverrides: {
         hasActiveSession: vi.fn().mockReturnValue(false),

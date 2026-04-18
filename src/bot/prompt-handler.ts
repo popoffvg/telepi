@@ -315,6 +315,9 @@ export function createPromptHandler(options: CreatePromptHandlerOptions): Handle
           waitForIdle: async () => {
             await piSession.getSession().agent.waitForIdle();
           },
+          // NOTE: This adapter still exposes TelePi's legacy zero-argument new-session flow.
+          // Newer Pi SDK releases can pass richer new-session options through this hook, but
+          // TelePi has not completed the deferred AgentSessionRuntime migration for that yet.
           newSession: async () => {
             const result = await piSession.newSession();
             return { cancelled: !result.created };

@@ -34,6 +34,8 @@ import {
  * The LLM can still pass an explicit `timeout` to override this per-call.
  */
 const DEFAULT_BASH_TIMEOUT_SECONDS = 120;
+const SAME_WORKSPACE_NEW_SESSION_UNAVAILABLE_MESSAGE = "Starting a fresh session in the current workspace isn't available in this TelePi version yet.";
+const FORK_UNAVAILABLE_MESSAGE = "Forking the current conversation isn't available in this TelePi version yet.";
 import { describeEntry, type SessionTreeNodeLike as SessionTreeNode } from "./tree.js";
 
 export interface PiSessionCallbacks {
@@ -789,9 +791,7 @@ export class PiSessionRegistry {
 function requireLegacyNewSession(session: AgentSession): NonNullable<LegacySessionRuntimeCompat["newSession"]> {
   const compatSession = session as AgentSession & LegacySessionRuntimeCompat;
   if (typeof compatSession.newSession !== "function") {
-    throw new Error(
-      "TelePi needs the AgentSessionRuntime migration before same-workspace /new is supported on pi 0.67.x.",
-    );
+    throw new Error(SAME_WORKSPACE_NEW_SESSION_UNAVAILABLE_MESSAGE);
   }
 
   return compatSession.newSession.bind(compatSession);
@@ -800,9 +800,7 @@ function requireLegacyNewSession(session: AgentSession): NonNullable<LegacySessi
 function requireLegacyFork(session: AgentSession): NonNullable<LegacySessionRuntimeCompat["fork"]> {
   const compatSession = session as AgentSession & LegacySessionRuntimeCompat;
   if (typeof compatSession.fork !== "function") {
-    throw new Error(
-      "TelePi needs the AgentSessionRuntime migration before /fork is supported on pi 0.67.x.",
-    );
+    throw new Error(FORK_UNAVAILABLE_MESSAGE);
   }
 
   return compatSession.fork.bind(compatSession);

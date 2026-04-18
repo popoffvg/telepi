@@ -368,13 +368,13 @@ describe("PiSessionService", () => {
     expect(mockState.createAgentSession).toHaveBeenCalledTimes(1);
   });
 
-  it("fails clearly when same-workspace /new requires the runtime migration", async () => {
+  it("fails with a user-facing message when same-workspace /new is unavailable", async () => {
     const service = await PiSessionService.create(createConfig());
     const currentSession = mockState.createdSessions[0]?.session;
     delete currentSession.newSession;
 
     await expect(service.newSession()).rejects.toThrow(
-      "TelePi needs the AgentSessionRuntime migration before same-workspace /new is supported on pi 0.67.x.",
+      "Starting a fresh session in the current workspace isn't available in this TelePi version yet.",
     );
   });
 
@@ -1035,13 +1035,13 @@ describe("PiSessionService", () => {
     expect(currentSession.setThinkingLevel).toHaveBeenCalledWith("high");
   });
 
-  it("fails clearly when /fork requires the runtime migration", async () => {
+  it("fails with a user-facing message when /fork is unavailable", async () => {
     const service = await PiSessionService.create(createConfig());
     const currentSession = mockState.createdSessions[0]?.session;
     delete currentSession.fork;
 
     await expect(service.fork("known-id")).rejects.toThrow(
-      "TelePi needs the AgentSessionRuntime migration before /fork is supported on pi 0.67.x.",
+      "Forking the current conversation isn't available in this TelePi version yet.",
     );
   });
 
