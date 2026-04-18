@@ -1,6 +1,6 @@
 import { toFriendlyError } from "../errors.js";
 import { escapeHTML, formatTelegramHTML } from "../format.js";
-import type { PiSessionInfo } from "../pi-session.js";
+import type { PiSessionDiagnostic, PiSessionInfo } from "../pi-session.js";
 
 export type TelegramParseMode = "HTML";
 
@@ -72,6 +72,8 @@ export function renderHelpHTML(info: PiSessionInfo): string {
 }
 
 export function renderSessionInfoPlain(info: PiSessionInfo): string {
+  const diagnostics = renderSessionDiagnosticsPlain(info.diagnostics);
+
   return [
     `Session ID: ${info.sessionId}`,
     `Session file: ${info.sessionFile ?? "(in-memory)"}`,
@@ -79,12 +81,16 @@ export function renderSessionInfoPlain(info: PiSessionInfo): string {
     info.sessionName ? `Session name: ${info.sessionName}` : undefined,
     info.model ? `Model: ${info.model}` : undefined,
     info.modelFallbackMessage ? `Model note: ${info.modelFallbackMessage}` : undefined,
+    diagnostics ? "" : undefined,
+    diagnostics,
   ]
-    .filter((line): line is string => Boolean(line))
+    .filter((line): line is string => line !== undefined)
     .join("\n");
 }
 
 export function renderSessionInfoHTML(info: PiSessionInfo): string {
+  const diagnostics = renderSessionDiagnosticsHTML(info.diagnostics);
+
   return [
     `<b>Session ID:</b> <code>${escapeHTML(info.sessionId)}</code>`,
     `<b>Session file:</b> <code>${escapeHTML(info.sessionFile ?? "(in-memory)")}</code>`,
@@ -94,9 +100,66 @@ export function renderSessionInfoHTML(info: PiSessionInfo): string {
     info.modelFallbackMessage
       ? `<b>Model note:</b> ${escapeHTML(info.modelFallbackMessage)}`
       : undefined,
+    diagnostics ? "" : undefined,
+    diagnostics,
   ]
-    .filter((line): line is string => Boolean(line))
+    .filter((line): line is string => line !== undefined)
     .join("\n");
+}
+
+function renderSessionDiagnosticsPlain(diagnostics: PiSessionDiagnostic[] | undefined): string | undefined {
+  return renderSessionDiagnostics(diagnostics, {
+    errorLabel: "Errors:",
+    warningLabel: "Warnings:",
+    infoLabel: "Notes:",
+    renderItem: (message) => `- ${message}`,
+  });
+}
+
+function renderSessionDiagnosticsHTML(diagnostics: PiSessionDiagnostic[] | undefined): string | undefined {
+  return renderSessionDiagnostics(diagnostics, {
+    errorLabel: "<b>Errors:</b>",
+    warningLabel: "<b>Warnings:</b>",
+    infoLabel: "<b>Notes:</b>",
+    renderItem: (message) => `• ${escapeHTML(message)}`,
+  });
+}
+
+function renderSessionDiagnostics(
+  diagnostics: PiSessionDiagnostic[] | undefined,
+  options: {
+    errorLabel: string;
+    warningLabel: string;
+    infoLabel: string;
+    renderItem: (message: string) => string;
+  },
+): string | undefined {
+  if (!diagnostics || diagnostics.length === 0) {
+    return undefined;
+  }
+
+  const groups: Array<{ type: PiSessionDiagnostic["type"]; label: string }> = [
+    { type: "error", label: options.errorLabel },
+    { type: "warning", label: options.warningLabel },
+    { type: "info", label: options.infoLabel },
+  ];
+  const lines: string[] = [];
+
+  for (const group of groups) {
+    const matching = diagnostics.filter((diagnostic) => diagnostic.type === group.type);
+    if (matching.length === 0) {
+      continue;
+    }
+
+    if (lines.length > 0) {
+      lines.push("");
+    }
+
+    lines.push(group.label);
+    lines.push(...matching.map((diagnostic) => options.renderItem(diagnostic.message)));
+  }
+
+  return lines.join("\n");
 }
 
 export function renderVoiceSupportPlain(backends: string[], warning?: string): string {

@@ -2447,6 +2447,134 @@ describe("createBot", () => {
     await pending;
   });
 
+  it("surfaces startup error diagnostics once before the first prompt in a fresh context", async () => {
+    const topicKey = makeContextKey(ALLOWED_CHAT_ID, 909);
+    let registryRef: ReturnType<typeof createMockPiSessionRegistry> | undefined;
+    const prompt = vi.fn().mockImplementation(async () => {
+      const topicSession = registryRef?.getSession(ALLOWED_CHAT_ID, 909);
+      topicSession?.emitTextDelta("Fresh context response");
+      topicSession?.emitAgentEnd();
+    });
+    const harness = setupBot({
+      perContextSessionOverrides: {
+        [topicKey]: {
+          getInfo: vi.fn().mockReturnValue({
+            sessionId: "diagnostic-session",
+            sessionFile: "/tmp/diagnostic.jsonl",
+            workspace: "/workspace",
+            model: "anthropic/claude-sonnet-4-5",
+            diagnostics: [
+              { type: "error", message: 'Failed to load extension "/ext/bad.ts": boom' },
+              { type: "warning", message: "Theme issue (/themes/missing.json): theme path does not exist" },
+            ],
+          }),
+          prompt,
+        },
+      },
+    });
+    registryRef = harness.registry;
+    const { bot, api } = harness;
+
+    await bot.handleUpdate(createTestUpdate({
+      message: {
+        text: "first prompt",
+        chat: { id: ALLOWED_CHAT_ID, type: "supergroup" },
+        message_thread_id: 909,
+      },
+    }));
+    await bot.handleUpdate(createTestUpdate({
+      message: {
+        text: "second prompt",
+        chat: { id: ALLOWED_CHAT_ID, type: "supergroup" },
+        message_thread_id: 909,
+      },
+    }));
+
+    const startupMessages = api.sendMessage.mock.calls
+      .map((call) => String(call[1]))
+      .filter((text) => text.includes("Session startup issues"));
+    expect(startupMessages).toHaveLength(1);
+    expect(startupMessages[0]).toContain('Failed to load extension "/ext/bad.ts": boom');
+    expect(startupMessages[0]).not.toContain("Theme issue");
+  });
+
+  it("surfaces startup error diagnostics when /model creates a fresh session context", async () => {
+    const topicKey = makeContextKey(ALLOWED_CHAT_ID, 910);
+    const { bot, api } = setupBot({
+      perContextSessionOverrides: {
+        [topicKey]: {
+          getInfo: vi.fn().mockReturnValue({
+            sessionId: "model-diagnostic-session",
+            sessionFile: "/tmp/model-diagnostic.jsonl",
+            workspace: "/workspace",
+            model: "anthropic/claude-sonnet-4-5",
+            diagnostics: [
+              { type: "error", message: "Prompt issue (/prompts/deploy.md): invalid frontmatter" },
+            ],
+          }),
+        },
+      },
+    });
+
+    await bot.handleUpdate(createTestUpdate({
+      message: {
+        text: "/model",
+        chat: { id: ALLOWED_CHAT_ID, type: "supergroup" },
+        message_thread_id: 910,
+      },
+    }));
+
+    expect(api.sendMessage.mock.calls.some((call) => String(call[1]).includes("Session startup issues"))).toBe(true);
+    expect(api.sendMessage.mock.calls.some((call) => String(call[1]).includes("Prompt issue (/prompts/deploy.md): invalid frontmatter"))).toBe(true);
+    expect(api.sendMessage.mock.calls.some((call) => String(call[1]).includes("Select a model"))).toBe(true);
+  });
+
+  it("re-surfaces startup diagnostics after /handback tears down the context", async () => {
+    const topicKey = makeContextKey(ALLOWED_CHAT_ID, 911);
+    let registryRef: ReturnType<typeof createMockPiSessionRegistry> | undefined;
+    const prompt = vi.fn().mockImplementation(async () => {
+      const session = registryRef?.getSession(ALLOWED_CHAT_ID, 911);
+      session?.emitTextDelta("Context rebuilt response");
+      session?.emitAgentEnd();
+    });
+    const harness = setupBot({
+      perContextSessionOverrides: {
+        [topicKey]: {
+          getInfo: vi.fn().mockReturnValue({
+            sessionId: "reused-diagnostic-session",
+            sessionFile: "/tmp/reused-diagnostic.jsonl",
+            workspace: "/workspace",
+            model: "anthropic/claude-sonnet-4-5",
+            diagnostics: [
+              { type: "error", message: "Extension issue (/ext/reload.ts): startup failed" },
+            ],
+          }),
+          prompt,
+        },
+      },
+    });
+    registryRef = harness.registry;
+    const { bot, api } = harness;
+    const topicMessage = (text: string) => createTestUpdate({
+      message: {
+        text,
+        chat: { id: ALLOWED_CHAT_ID, type: "supergroup" },
+        message_thread_id: 911,
+      },
+    });
+
+    await bot.handleUpdate(topicMessage("first prompt"));
+    await bot.handleUpdate(topicMessage("/handback"));
+    await bot.handleUpdate(topicMessage("second prompt"));
+
+    const startupMessages = api.sendMessage.mock.calls
+      .map((call) => String(call[1]))
+      .filter((text) => text.includes("Session startup issues"));
+    expect(startupMessages).toHaveLength(2);
+    expect(startupMessages[0]).toContain("Extension issue (/ext/reload.ts): startup failed");
+    expect(startupMessages[1]).toContain("Extension issue (/ext/reload.ts): startup failed");
+  });
+
   it("covers additional command edge cases", async () => {
     const noSessions = setupBot({
       piSessionOverrides: {
