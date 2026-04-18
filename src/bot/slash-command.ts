@@ -1,4 +1,6 @@
-import type { SlashCommandInfo } from "@mariozechner/pi-coding-agent";
+import { readFileSync } from "node:fs";
+
+import { parseFrontmatter, type SlashCommandInfo } from "@mariozechner/pi-coding-agent";
 
 import { trimLine } from "./message-rendering.js";
 
@@ -76,16 +78,80 @@ export function normalizeSlashCommand(text: string, botUsername?: string): Norma
   };
 }
 
-function getPiSlashCommandLabel(command: SlashCommandInfo): string {
+type SlashCommandInfoWithArgumentHint = SlashCommandInfo & {
+  argumentHint?: string;
+};
+
+function normalizeArgumentHint(argumentHint: unknown): string | undefined {
+  if (typeof argumentHint !== "string") {
+    return undefined;
+  }
+
+  const trimmed = argumentHint.trim();
+  return trimmed ? trimmed : undefined;
+}
+
+function readPromptArgumentHint(sourcePath: string): string | undefined {
+  try {
+    const { frontmatter } = parseFrontmatter<Record<string, unknown>>(readFileSync(sourcePath, "utf8"));
+    return normalizeArgumentHint(frontmatter["argument-hint"]);
+  } catch {
+    return undefined;
+  }
+}
+
+function createSlashCommandArgumentHintResolver(): (command: SlashCommandInfo) => string | undefined {
+  const hintBySourcePath = new Map<string, string | undefined>();
+
+  return (command: SlashCommandInfo): string | undefined => {
+    const commandWithMetadata = command as SlashCommandInfoWithArgumentHint;
+    const directHint = normalizeArgumentHint(commandWithMetadata.argumentHint);
+    if (directHint) {
+      return directHint;
+    }
+
+    if (command.source !== "prompt") {
+      return undefined;
+    }
+
+    const sourcePath = typeof command.sourceInfo?.path === "string" ? command.sourceInfo.path.trim() : "";
+    if (!sourcePath) {
+      return undefined;
+    }
+
+    if (hintBySourcePath.has(sourcePath)) {
+      return hintBySourcePath.get(sourcePath);
+    }
+
+    const argumentHint = readPromptArgumentHint(sourcePath);
+    hintBySourcePath.set(sourcePath, argumentHint);
+    return argumentHint;
+  };
+}
+
+function getPiSlashCommandDisplayText(
+  command: SlashCommandInfo,
+  getSlashCommandArgumentHint: (command: SlashCommandInfo) => string | undefined,
+): string {
+  const argumentHint = getSlashCommandArgumentHint(command);
+  return argumentHint ? `/${command.name} ${argumentHint}` : `/${command.name}`;
+}
+
+function getPiSlashCommandLabel(
+  command: SlashCommandInfo,
+  getSlashCommandArgumentHint: (command: SlashCommandInfo) => string | undefined,
+): string {
+  const displayText = getPiSlashCommandDisplayText(command, getSlashCommandArgumentHint);
+
   switch (command.source) {
     case "prompt":
-      return `📝 /${command.name}`;
+      return `📝 ${displayText}`;
     case "skill":
-      return `🧰 /${command.name}`;
+      return `🧰 ${displayText}`;
     case "extension":
-      return `🧩 /${command.name}`;
+      return `🧩 ${displayText}`;
     default:
-      return `⚡ /${command.name}`;
+      return `⚡ ${displayText}`;
   }
 }
 
@@ -121,6 +187,7 @@ export function filterCommandPickerEntries(
 }
 
 export function buildCommandPickerEntries(slashCommands: SlashCommandInfo[]): CommandPickerEntry[] {
+  const getSlashCommandArgumentHint = createSlashCommandArgumentHintResolver();
   const telepiEntries = TELEPI_BOT_COMMANDS
     .filter((command) => command.command !== "commands")
     .map((command, index) => ({
@@ -137,7 +204,7 @@ export function buildCommandPickerEntries(slashCommands: SlashCommandInfo[]): Co
     kind: "pi" as const,
     name: command.name,
     description: command.description ?? command.source,
-    label: getPiSlashCommandLabel(command),
+    label: getPiSlashCommandLabel(command, getSlashCommandArgumentHint),
     commandText: `/${command.name}`,
     source: command.source,
   }));
