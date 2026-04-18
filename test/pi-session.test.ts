@@ -45,6 +45,8 @@ const mockState = vi.hoisted(() => {
   const createSession = (options: Record<string, unknown> = {}) => {
     sessionCounter += 1;
 
+    const bashExecute = vi.fn();
+
     const session: any = {
       sessionId: options.sessionId ?? `session-${sessionCounter}`,
       sessionFile: options.sessionFile ?? `/tmp/session-${sessionCounter}.jsonl`,
@@ -57,12 +59,11 @@ const mockState = vi.hoisted(() => {
         state: {
           tools: [
             { name: "read", description: "Read files", execute: vi.fn() },
-            { name: "bash", description: "Execute bash", execute: vi.fn(), label: "bash", parameters: {} },
+            { name: "bash", description: "Execute bash", execute: bashExecute, label: "bash", parameters: {} },
             { name: "edit", description: "Edit files", execute: vi.fn() },
             { name: "write", description: "Write files", execute: vi.fn() },
           ],
         },
-        setTools: vi.fn(),
       },
       prompt: vi.fn().mockResolvedValue(undefined),
       bindExtensions: vi.fn().mockResolvedValue(undefined),
@@ -105,7 +106,7 @@ const mockState = vi.hoisted(() => {
       dispose: vi.fn(),
     };
 
-    createdSessions.push({ session, options });
+    createdSessions.push({ session, options: { ...options, bashExecute } });
     return session;
   };
 
@@ -130,17 +131,19 @@ const mockState = vi.hoisted(() => {
     create: vi.fn().mockReturnValue({ kind: "auth-storage" }),
   };
 
-  const ModelRegistry = vi.fn().mockImplementation(() => {
-    const instance = {
-      getAvailable: vi.fn().mockReturnValue(models),
-      getAll: vi.fn().mockReturnValue(models),
-      find: vi.fn().mockImplementation((provider: string, id: string) =>
-        models.find((model) => model.provider === provider && model.id === id),
-      ),
-    };
-    modelRegistryInstances.push(instance);
-    return instance;
-  });
+  const ModelRegistry = {
+    create: vi.fn().mockImplementation(() => {
+      const instance = {
+        getAvailable: vi.fn().mockReturnValue(models),
+        getAll: vi.fn().mockReturnValue(models),
+        find: vi.fn().mockImplementation((provider: string, id: string) =>
+          models.find((model) => model.provider === provider && model.id === id),
+        ),
+      };
+      modelRegistryInstances.push(instance);
+      return instance;
+    }),
+  };
 
   const SessionManager = {
     create: vi.fn().mockImplementation((workspace: string) => {
@@ -185,7 +188,7 @@ const mockState = vi.hoisted(() => {
       createAgentSession.mockClear();
       createCodingTools.mockClear();
       AuthStorage.create.mockClear();
-      ModelRegistry.mockClear();
+      ModelRegistry.create.mockClear();
       SessionManager.create.mockClear();
       SessionManager.open.mockClear();
       SessionManager.listAll.mockReset();
@@ -233,7 +236,8 @@ describe("PiSessionService", () => {
     const service = await PiSessionService.create(createConfig());
 
     expect(mockState.AuthStorage.create).toHaveBeenCalledTimes(1);
-    expect(mockState.ModelRegistry).toHaveBeenCalledTimes(1);
+    expect(mockState.ModelRegistry.create).toHaveBeenCalledTimes(1);
+    expect(mockState.ModelRegistry.create).toHaveBeenCalledWith({ kind: "auth-storage" });
     expect(mockState.SettingsManager.create).toHaveBeenCalledWith("/workspace/base");
     expect(mockState.createCodingTools).toHaveBeenCalledWith("/workspace/base");
     expect(mockState.createAgentSession).toHaveBeenCalledWith(
@@ -253,6 +257,25 @@ describe("PiSessionService", () => {
       modelFallbackMessage: "fallback-model",
       model: "anthropic/claude-sonnet-4-5",
     });
+  });
+
+  it("patches the live bash tool via agent state mutation", async () => {
+    await PiSessionService.create(createConfig());
+    const currentSession = mockState.createdSessions[0]?.session;
+    const originalExecute = mockState.createdSessions[0]?.options?.bashExecute;
+    const bashTool = currentSession.agent.state.tools.find((tool: any) => tool.name === "bash");
+
+    expect(bashTool.description).toContain("Commands time out after 120 seconds by default.");
+    expect(bashTool.execute).not.toBe(originalExecute);
+
+    await bashTool.execute("tool-1", { command: "pwd" });
+
+    expect(originalExecute).toHaveBeenCalledWith(
+      "tool-1",
+      { command: "pwd", timeout: 120 },
+      undefined,
+      undefined,
+    );
   });
 
   it("binds extension hooks through the underlying session", async () => {
@@ -343,6 +366,16 @@ describe("PiSessionService", () => {
       info: service.getInfo(),
     });
     expect(mockState.createAgentSession).toHaveBeenCalledTimes(1);
+  });
+
+  it("fails clearly when same-workspace /new requires the runtime migration", async () => {
+    const service = await PiSessionService.create(createConfig());
+    const currentSession = mockState.createdSessions[0]?.session;
+    delete currentSession.newSession;
+
+    await expect(service.newSession()).rejects.toThrow(
+      "TelePi needs the AgentSessionRuntime migration before same-workspace /new is supported on pi 0.67.x.",
+    );
   });
 
   it("creates a new handle when starting a session in another workspace", async () => {
@@ -1000,6 +1033,16 @@ describe("PiSessionService", () => {
       name: "GPT-4o",
     });
     expect(currentSession.setThinkingLevel).toHaveBeenCalledWith("high");
+  });
+
+  it("fails clearly when /fork requires the runtime migration", async () => {
+    const service = await PiSessionService.create(createConfig());
+    const currentSession = mockState.createdSessions[0]?.session;
+    delete currentSession.fork;
+
+    await expect(service.fork("known-id")).rejects.toThrow(
+      "TelePi needs the AgentSessionRuntime migration before /fork is supported on pi 0.67.x.",
+    );
   });
 
   it("delegates tree access, navigation, and labels", async () => {

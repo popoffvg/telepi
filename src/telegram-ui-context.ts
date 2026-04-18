@@ -88,6 +88,7 @@ export function createTelegramUIContext(options: CreateTelegramUIContextOptions)
     },
     setStatus() {},
     setWorkingMessage() {},
+    setHiddenThinkingLabel() {},
     setWidget() {},
     setFooter() {},
     setHeader() {},

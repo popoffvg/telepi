@@ -39,6 +39,13 @@ describe("createTelegramUIContext", () => {
       .rejects.toThrow("TelePi does not yet support extension UI method 'input'.");
   });
 
+  it("exposes setHiddenThinkingLabel as a no-op for compatibility", () => {
+    const ui = createTelegramUIContext({ notify: vi.fn() });
+
+    expect(() => ui.setHiddenThinkingLabel("Thinking…")).not.toThrow();
+    expect(() => ui.setHiddenThinkingLabel()).not.toThrow();
+  });
+
   it("provides a plain-text theme shim for extension compatibility", () => {
     const ui = createTelegramUIContext({ notify: vi.fn() });
 

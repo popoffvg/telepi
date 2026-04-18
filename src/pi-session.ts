@@ -82,6 +82,11 @@ interface PiSessionHandle {
   dispose: () => void;
 }
 
+interface LegacySessionRuntimeCompat {
+  newSession?: () => Promise<boolean>;
+  fork?: (entryId: string) => Promise<{ cancelled: boolean; selectedText?: string }>;
+}
+
 /**
  * Patch the bash tool on a live session to enforce a default timeout.
  *
@@ -91,7 +96,7 @@ interface PiSessionHandle {
  *
  * We can't override the tool via `createAgentSession({ tools })` because the
  * SDK only reads tool names from that option and rebuilds implementations
- * internally. Instead, we patch the live tool on `session.agent` after creation.
+ * internally. Instead, we patch the live tool on `session.agent.state` after creation.
  */
 function patchBashTimeout(session: AgentSession): void {
   const tools = session.agent.state.tools;
@@ -113,7 +118,7 @@ function patchBashTimeout(session: AgentSession): void {
         ),
     };
   });
-  session.agent.setTools(patched);
+  session.agent.state.tools = patched;
 }
 
 export async function createPiSession(
@@ -141,7 +146,7 @@ async function createPiSessionHandle(
   options: { hasExistingSession: boolean },
 ): Promise<PiSessionHandle> {
   const authStorage = AuthStorage.create();
-  const modelRegistry = new ModelRegistry(authStorage);
+  const modelRegistry = ModelRegistry.create(authStorage);
   const settingsManager = SettingsManager.create(workspace);
   drainSettingsWarnings(settingsManager);
   const configuredModel = resolveModelOverride(modelRegistry, config.piModel);
@@ -355,7 +360,7 @@ export class PiSessionService {
       return { info: this.getInfo(), created: true };
     }
 
-    const created = await this.getSession().newSession();
+    const created = await requireLegacyNewSession(this.getSession())();
     return { info: this.getInfo(), created };
   }
 
@@ -584,7 +589,7 @@ export class PiSessionService {
   }
 
   async fork(entryId: string): Promise<{ cancelled: boolean }> {
-    const result = await this.getSession().fork(entryId);
+    const result = await requireLegacyFork(this.getSession())(entryId);
     return { cancelled: result.cancelled };
   }
 
@@ -779,6 +784,28 @@ export class PiSessionRegistry {
     this.generations.set(key, nextGeneration);
     return nextGeneration;
   }
+}
+
+function requireLegacyNewSession(session: AgentSession): NonNullable<LegacySessionRuntimeCompat["newSession"]> {
+  const compatSession = session as AgentSession & LegacySessionRuntimeCompat;
+  if (typeof compatSession.newSession !== "function") {
+    throw new Error(
+      "TelePi needs the AgentSessionRuntime migration before same-workspace /new is supported on pi 0.67.x.",
+    );
+  }
+
+  return compatSession.newSession.bind(compatSession);
+}
+
+function requireLegacyFork(session: AgentSession): NonNullable<LegacySessionRuntimeCompat["fork"]> {
+  const compatSession = session as AgentSession & LegacySessionRuntimeCompat;
+  if (typeof compatSession.fork !== "function") {
+    throw new Error(
+      "TelePi needs the AgentSessionRuntime migration before /fork is supported on pi 0.67.x.",
+    );
+  }
+
+  return compatSession.fork.bind(compatSession);
 }
 
 function drainSettingsWarnings(settingsManager: SettingsManager): void {
