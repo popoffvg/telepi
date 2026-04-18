@@ -653,6 +653,25 @@ describe("PiSessionService", () => {
     expect(service.getCurrentWorkspace()).toBe("/workspace/other");
   });
 
+  it("disposes the previous handle even when extension rebinding fails during replacement", async () => {
+    const service = await PiSessionService.create(createConfig());
+    const previousSession = mockState.createdSessions[0]?.session;
+    const bindings = { uiContext: { notify: vi.fn() } } as any;
+    const originalCreateAgentSession = mockState.createAgentSession.getMockImplementation();
+
+    await service.bindExtensions(bindings);
+    mockState.createAgentSession.mockImplementationOnce(async (options: any) => {
+      const result = await originalCreateAgentSession!(options);
+      result.session.bindExtensions.mockRejectedValueOnce(new Error("extension rebinding exploded"));
+      return result;
+    });
+
+    await expect(service.newSession("/workspace/other")).rejects.toThrow("extension rebinding exploded");
+
+    expect(mockState.createdSessions[1]?.session.bindExtensions).toHaveBeenCalledWith(bindings);
+    expect(previousSession.dispose).toHaveBeenCalledTimes(1);
+  });
+
   it("disposes the created runtime when cross-workspace setup fails", async () => {
     const service = await PiSessionService.create(createConfig());
     const previousSession = mockState.createdSessions[0]?.session;

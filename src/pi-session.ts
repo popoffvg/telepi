@@ -793,12 +793,15 @@ export class PiSessionService {
     const previousHandle = this.handle;
     const previousSession = previousHandle?.runtime.session;
     this.handle = nextHandle;
-    await this.rebindAfterSessionReplacement(previousSession);
 
     try {
-      await previousHandle?.dispose();
-    } catch (error) {
-      console.error("Failed to dispose previous session:", error);
+      await this.rebindAfterSessionReplacement(previousSession);
+    } finally {
+      try {
+        await previousHandle?.dispose();
+      } catch (error) {
+        console.error("Failed to dispose previous session:", error);
+      }
     }
   }
 
