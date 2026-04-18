@@ -13,7 +13,9 @@ import {
   SettingsManager,
   type AgentSession,
   type AgentSessionRuntime,
+  type AgentSessionRuntimeDiagnostic,
   type CreateAgentSessionRuntimeFactory,
+  type ResourceDiagnostic,
   type SessionEntry,
   type SlashCommandInfo,
 } from "@mariozechner/pi-coding-agent";
@@ -49,6 +51,11 @@ export interface PiSessionCallbacks {
   onAgentEnd: () => void;
 }
 
+export interface PiSessionDiagnostic {
+  type: "info" | "warning" | "error";
+  message: string;
+}
+
 export interface PiSessionInfo {
   sessionId: string;
   sessionFile?: string;
@@ -56,6 +63,7 @@ export interface PiSessionInfo {
   sessionName?: string;
   modelFallbackMessage?: string;
   model?: string;
+  diagnostics?: PiSessionDiagnostic[];
 }
 
 export interface PiSessionSwitchResult extends PiSessionInfo {
@@ -183,7 +191,6 @@ async function createPiSessionHandle(
     sessionStartEvent,
   }) => {
     const settingsManager = SettingsManager.create(cwd);
-    drainSettingsWarnings(settingsManager);
     const services = await createAgentSessionServices({
       cwd,
       agentDir,
@@ -218,7 +225,11 @@ async function createPiSessionHandle(
     return {
       ...result,
       services,
-      diagnostics: services.diagnostics,
+      diagnostics: dedupeDiagnostics([
+        ...services.diagnostics,
+        ...collectSettingsDiagnostics(settingsManager),
+        ...collectSessionResourceDiagnostics(services.resourceLoader, result.session),
+      ]),
     };
   };
 
@@ -328,6 +339,10 @@ export class PiSessionService {
 
     const session = this.handle.runtime.session;
     const model = session.model;
+    const diagnostics = this.handle.runtime.diagnostics.length > 0
+      ? [...this.handle.runtime.diagnostics]
+      : undefined;
+
     return {
       sessionId: session.sessionId,
       sessionFile: session.sessionFile,
@@ -335,6 +350,7 @@ export class PiSessionService {
       sessionName: session.sessionName,
       modelFallbackMessage: this.handle.runtime.modelFallbackMessage,
       model: model ? `${model.provider}/${model.id}` : undefined,
+      ...(diagnostics ? { diagnostics } : {}),
     };
   }
 
@@ -961,11 +977,73 @@ async function applySessionSetup(
   session.agent.state.messages = session.sessionManager.buildSessionContext().messages;
 }
 
-function drainSettingsWarnings(settingsManager: SettingsManager): void {
-  const errors = settingsManager.drainErrors?.() ?? [];
-  for (const error of errors) {
-    console.warn(`Pi settings warning (${error.scope}): ${error.error.message}`);
+function collectSettingsDiagnostics(settingsManager: SettingsManager): PiSessionDiagnostic[] {
+  return (settingsManager.drainErrors?.() ?? []).map(({ scope, error }): PiSessionDiagnostic => ({
+    type: "warning",
+    message: `${humanizeDiagnosticScope(scope)} settings: ${error.message}`,
+  }));
+}
+
+function collectSessionResourceDiagnostics(
+  resourceLoader: { getExtensions?: () => { errors: Array<{ path: string; error: string }> }; getSkills?: () => { diagnostics: ResourceDiagnostic[] }; getPrompts?: () => { diagnostics: ResourceDiagnostic[] }; getThemes?: () => { diagnostics: ResourceDiagnostic[] } },
+  session: AgentSession,
+): PiSessionDiagnostic[] {
+  return [
+    ...(resourceLoader.getExtensions?.().errors ?? []).map(({ path, error }): PiSessionDiagnostic => ({
+      type: "error",
+      message: `Failed to load extension "${path}": ${error}`,
+    })),
+    ...normalizeResourceDiagnostics("Skill", resourceLoader.getSkills?.().diagnostics ?? []),
+    ...normalizeResourceDiagnostics("Prompt", resourceLoader.getPrompts?.().diagnostics ?? []),
+    ...normalizeResourceDiagnostics("Theme", resourceLoader.getThemes?.().diagnostics ?? []),
+    ...normalizeResourceDiagnostics("Extension", session.extensionRunner?.getCommandDiagnostics?.() ?? []),
+    ...normalizeResourceDiagnostics("Extension", session.extensionRunner?.getShortcutDiagnostics?.() ?? []),
+  ];
+}
+
+function normalizeResourceDiagnostics(
+  label: string,
+  diagnostics: ResourceDiagnostic[],
+): PiSessionDiagnostic[] {
+  return diagnostics.map((diagnostic) => {
+    if (diagnostic.type === "collision" && diagnostic.collision) {
+      return {
+        type: "warning",
+        message:
+          `${label} collision (${diagnostic.collision.name}): using ${diagnostic.collision.winnerPath}, skipped ${diagnostic.collision.loserPath}`,
+      };
+    }
+
+    const location = diagnostic.path ? ` (${diagnostic.path})` : "";
+    return {
+      type: diagnostic.type === "error" ? "error" : "warning",
+      message: `${label} issue${location}: ${diagnostic.message}`,
+    };
+  });
+}
+
+function dedupeDiagnostics(diagnostics: PiSessionDiagnostic[]): AgentSessionRuntimeDiagnostic[] {
+  const seen = new Set<string>();
+  const deduped: AgentSessionRuntimeDiagnostic[] = [];
+
+  for (const diagnostic of diagnostics) {
+    const key = `${diagnostic.type}:${diagnostic.message}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    deduped.push(diagnostic);
   }
+
+  return deduped;
+}
+
+function humanizeDiagnosticScope(scope: string): string {
+  if (!scope) {
+    return "Unknown";
+  }
+
+  return scope.charAt(0).toUpperCase() + scope.slice(1);
 }
 
 function createSessionManager(

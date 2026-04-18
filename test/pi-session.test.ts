@@ -437,6 +437,55 @@ describe("PiSessionService", () => {
     });
   });
 
+  it("collects runtime diagnostics for Telegram-visible session info", async () => {
+    mockState.SettingsManager.create.mockImplementationOnce(() => ({
+      getEnabledModels: vi.fn().mockReturnValue(undefined),
+      getDefaultProvider: vi.fn().mockReturnValue(undefined),
+      getDefaultModel: vi.fn().mockReturnValue(undefined),
+      drainErrors: vi.fn().mockReturnValue([
+        { scope: "project", error: new Error("failed to parse .pi/settings.json") },
+      ]),
+    }));
+
+    const originalCreateServices = mockState.createAgentSessionServices.getMockImplementation();
+    mockState.createAgentSessionServices.mockImplementationOnce(async (options: any) => {
+      const result = await originalCreateServices!(options);
+      return {
+        ...result,
+        diagnostics: [{ type: "warning", message: "Project auth: no API key configured for anthropic" }],
+        resourceLoader: {
+          ...result.resourceLoader,
+          getExtensions: vi.fn().mockReturnValue({
+            extensions: [],
+            errors: [{ path: "/ext/bad.ts", error: "boom" }],
+            runtime: { pendingProviderRegistrations: [] },
+          }),
+          getSkills: vi.fn().mockReturnValue({
+            skills: [],
+            diagnostics: [{ type: "warning", message: "skill path does not exist", path: "/skills/missing" }],
+          }),
+          getPrompts: vi.fn().mockReturnValue({ prompts: [], diagnostics: [] }),
+          getThemes: vi.fn().mockReturnValue({
+            themes: [],
+            diagnostics: [{ type: "warning", message: "theme path does not exist", path: "/themes/missing.json" }],
+          }),
+        },
+      };
+    });
+
+    const service = await PiSessionService.create(createConfig());
+
+    expect(service.getInfo()).toMatchObject({
+      diagnostics: [
+        { type: "warning", message: "Project auth: no API key configured for anthropic" },
+        { type: "warning", message: "Project settings: failed to parse .pi/settings.json" },
+        { type: "error", message: 'Failed to load extension "/ext/bad.ts": boom' },
+        { type: "warning", message: "Skill issue (/skills/missing): skill path does not exist" },
+        { type: "warning", message: "Theme issue (/themes/missing.json): theme path does not exist" },
+      ],
+    });
+  });
+
   it("patches the live bash tool via agent state mutation", async () => {
     await PiSessionService.create(createConfig());
     const currentSession = mockState.createdSessions[0]?.session;
