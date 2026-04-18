@@ -42,6 +42,8 @@ import type {
 import { createBot, registerCommands } from "../src/bot.js";
 import { getAvailableBackends, transcribeAudio } from "../src/voice.js";
 
+type SwitchResult = Awaited<ReturnType<PiSessionService["switchSession"]>>;
+
 const ALLOWED_USER_ID = 123;
 const ALLOWED_CHAT_ID = 456;
 
@@ -151,6 +153,7 @@ function createMockPiSession(overrides: Partial<PiSessionService> = {}) {
       sessionFile: "/tmp/switched.jsonl",
       workspace: "/other",
       model: "anthropic/claude-sonnet-4-5",
+      cancelled: false,
     }),
     handback: vi.fn().mockResolvedValue({
       sessionFile: "/tmp/test.jsonl",
@@ -1057,6 +1060,20 @@ describe("createBot", () => {
     );
     expect(alias.api.sendMessage.mock.calls[0]?.[1]).toContain("Switched session");
 
+    const cancelled = setupBot({
+      piSessionOverrides: {
+        switchSession: vi.fn().mockResolvedValue({
+          sessionId: "test-id",
+          sessionFile: "/tmp/test.jsonl",
+          workspace: "/workspace",
+          model: "anthropic/claude-sonnet-4-5",
+          cancelled: true,
+        }),
+      },
+    });
+    await cancelled.bot.handleUpdate(createTestUpdate({ message: { text: "/sessions /saved/session.jsonl" } }));
+    expect(cancelled.api.sendMessage.mock.calls[0]?.[1]).toContain("Session switch was cancelled.");
+
     const byId = setupBot({
       piSessionOverrides: {
         resolveSessionReference: vi.fn().mockResolvedValue({
@@ -1095,6 +1112,21 @@ describe("createBot", () => {
     expect(ready.pi.service.resolveSessionReference).toHaveBeenCalledWith("/s2.jsonl");
     expect(ready.pi.service.switchSession).toHaveBeenCalledWith("/s2.jsonl", "/workspace/B");
     expect(ready.api.editMessageText).toHaveBeenCalled();
+
+    const cancelled = setupBot({
+      piSessionOverrides: {
+        switchSession: vi.fn().mockResolvedValue({
+          sessionId: "test-id",
+          sessionFile: "/tmp/test.jsonl",
+          workspace: "/workspace",
+          model: "anthropic/claude-sonnet-4-5",
+          cancelled: true,
+        }),
+      },
+    });
+    await cancelled.bot.handleUpdate(createTestUpdate({ message: { text: "/sessions" } }));
+    await cancelled.bot.handleUpdate(createCallbackUpdate("switch_0"));
+    expect(cancelled.api.editMessageText.mock.calls.at(-1)?.[2]).toContain("Session switch was cancelled.");
 
     const expired = setupBot();
     await expired.bot.handleUpdate(createCallbackUpdate("switch_0"));
@@ -1984,6 +2016,32 @@ describe("createBot", () => {
     });
   });
 
+  it("bubbles cancelled switch-session results from extension command actions", async () => {
+    const { bot, pi } = setupBot({
+      piSessionOverrides: {
+        switchSession: vi.fn().mockResolvedValue({
+          sessionId: "test-id",
+          sessionFile: "/tmp/test.jsonl",
+          workspace: "/workspace",
+          model: "anthropic/claude-sonnet-4-5",
+          cancelled: true,
+        }),
+      },
+    });
+    let switchResult: { cancelled: boolean } | undefined;
+
+    const promptMock = pi.service.prompt as ReturnType<typeof vi.fn>;
+    promptMock.mockImplementation(async () => {
+      switchResult = await pi.getExtensionBindings()?.commandContextActions?.switchSession("/tmp/other.jsonl");
+      pi.emitAgentEnd();
+    });
+
+    await bot.handleUpdate(createTestUpdate({ message: { text: "switch from extension" } }));
+
+    expect(pi.service.switchSession).toHaveBeenCalledWith("/tmp/other.jsonl");
+    expect(switchResult).toEqual({ cancelled: true });
+  });
+
   it("surfaces extension command notifications in Telegram", async () => {
     const { bot, pi, api } = setupBot({
       piSessionOverrides: {
@@ -2328,12 +2386,12 @@ describe("createBot", () => {
   });
 
   it("blocks commands while switching sessions", async () => {
-    let resolveSwitch!: (info: PiSessionInfo) => void;
+    let resolveSwitch!: (info: SwitchResult) => void;
     const { bot, api } = setupBot({
       piSessionOverrides: {
         switchSession: vi.fn().mockImplementation(
           () =>
-            new Promise<PiSessionInfo>((resolve) => {
+            new Promise<SwitchResult>((resolve) => {
               resolveSwitch = resolve;
             }),
         ),
@@ -2353,6 +2411,7 @@ describe("createBot", () => {
       sessionFile: "/tmp/switched.jsonl",
       workspace: "/other",
       model: "anthropic/claude-sonnet-4-5",
+      cancelled: false,
     });
     await switching;
   });
@@ -2753,12 +2812,12 @@ describe("createBot", () => {
   });
 
   it("blocks text messages when isSwitching is active", async () => {
-    let resolveSwitch!: (info: PiSessionInfo) => void;
+    let resolveSwitch!: (info: SwitchResult) => void;
     const { bot, api } = setupBot({
       piSessionOverrides: {
         switchSession: vi.fn().mockImplementation(
           () =>
-            new Promise<PiSessionInfo>((resolve) => {
+            new Promise<SwitchResult>((resolve) => {
               resolveSwitch = resolve;
             }),
         ),
@@ -2778,6 +2837,7 @@ describe("createBot", () => {
       sessionFile: "/tmp/switched.jsonl",
       workspace: "/other",
       model: "anthropic/claude-sonnet-4-5",
+      cancelled: false,
     });
     await switching;
   });

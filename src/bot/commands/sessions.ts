@@ -70,6 +70,13 @@ export function createSessionCommandHandlers(deps: {
       try {
         const resolvedSession = await piSession.resolveSessionReference(sessionReference);
         const info = await piSession.switchSession(resolvedSession.path, resolvedSession.cwd);
+        if (info.cancelled) {
+          await safeReply(ctx, escapeHTML("Session switch was cancelled."), {
+            fallbackText: "Session switch was cancelled.",
+          }, target);
+          return;
+        }
+
         await refreshChatScopedCommands(target, piSession);
         clearContextPickers(contextKey);
         clearContextPromptMemory(target);

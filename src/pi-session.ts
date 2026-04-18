@@ -58,6 +58,10 @@ export interface PiSessionInfo {
   model?: string;
 }
 
+export interface PiSessionSwitchResult extends PiSessionInfo {
+  cancelled: boolean;
+}
+
 export interface PiSessionModelOption {
   provider: string;
   id: string;
@@ -149,8 +153,18 @@ async function createNewPiSession(
   }
 
   const handle = await createPiSessionHandle(config, workspace, sessionManager, { reason: "new" });
-  await applySessionSetup(handle.runtime.session, options?.setup);
-  return handle;
+
+  try {
+    await applySessionSetup(handle.runtime.session, options?.setup);
+    return handle;
+  } catch (error) {
+    try {
+      await handle.dispose();
+    } catch (disposeError) {
+      console.error("Failed to dispose session after setup error:", disposeError);
+    }
+    throw error;
+  }
 }
 
 async function createPiSessionHandle(
@@ -180,7 +194,7 @@ async function createPiSessionHandle(
     const configuredModel = resolveModelOverride(services.modelRegistry, config.piModel);
     const scopedModels = await resolveScopedModels(services.settingsManager, services.modelRegistry);
     const hasExistingSession = sessionStartEvent?.reason !== "new"
-      && Boolean(runtimeSessionManager.getSessionFile?.() || sessionManager.getSessionFile?.());
+      && Boolean(runtimeSessionManager.getSessionFile?.());
     const { model, thinkingLevel } = resolveInitialScopedModelSelection({
       configuredModel,
       scopedModels,
@@ -585,7 +599,7 @@ export class PiSessionService {
     }
   }
 
-  async switchSession(sessionPath: string, workspace?: string): Promise<PiSessionInfo> {
+  async switchSession(sessionPath: string, workspace?: string): Promise<PiSessionSwitchResult> {
     const effectiveWorkspace = workspace
       ?? await this.resolveWorkspaceForSession(sessionPath)
       ?? this.currentWorkspace;
@@ -593,13 +607,19 @@ export class PiSessionService {
     if (!this.handle) {
       const nextHandle = await createPiSession(this.config, sessionPath, effectiveWorkspace);
       await this.replaceHandle(nextHandle);
-      return this.getInfo();
+      return {
+        ...this.getInfo(),
+        cancelled: false,
+      };
     }
 
     const previousSession = this.getSession();
-    await this.getHandle().runtime.switchSession(sessionPath, effectiveWorkspace);
+    const result = await this.getHandle().runtime.switchSession(sessionPath, effectiveWorkspace);
     await this.rebindAfterSessionReplacement(previousSession);
-    return this.getInfo();
+    return {
+      ...this.getInfo(),
+      cancelled: result.cancelled,
+    };
   }
 
   private resolveSessionWorkspace(workspace: string | undefined): {
@@ -787,6 +807,10 @@ export class PiSessionService {
     }
 
     const currentSession = this.getSession();
+    // AgentSessionRuntime replacements currently perform a process.chdir(runtime.cwd).
+    // TelePi therefore treats runtime.cwd as the source of truth after every runtime-driven
+    // session replacement and assumes these flows stay serialized enough to avoid surprising
+    // process-wide cwd races if maintainers add more concurrent workspace-sensitive work later.
     this.currentWorkspace = this.handle.runtime.cwd;
     if (previousSession === currentSession) {
       return;

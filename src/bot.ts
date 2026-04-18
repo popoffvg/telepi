@@ -680,6 +680,19 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
     try {
       const resolvedSession = await piSession.resolveSessionReference(sessions[index].path);
       const info = await piSession.switchSession(resolvedSession.path, resolvedSession.cwd);
+      if (info.cancelled) {
+        const cancelledText = "Session switch was cancelled.";
+        if (messageId) {
+          await safeEditMessage(bot, target, messageId, escapeHTML(cancelledText), {
+            fallbackText: cancelledText,
+          });
+          return;
+        }
+
+        await safeReply(ctx, escapeHTML(cancelledText), { fallbackText: cancelledText }, target);
+        return;
+      }
+
       await refreshChatScopedCommands(target, piSession);
       clearPendingTreeView(contextKey);
       clearContextPromptMemory(target);

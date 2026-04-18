@@ -325,8 +325,8 @@ export function createPromptHandler(options: CreatePromptHandlerOptions): Handle
             return { cancelled: result.cancelled };
           },
           switchSession: async (sessionPath) => {
-            await piSession.switchSession(sessionPath);
-            return { cancelled: false };
+            const result = await piSession.switchSession(sessionPath);
+            return { cancelled: result.cancelled };
           },
           reload: async () => {
             await piSession.reload();

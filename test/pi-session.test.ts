@@ -592,6 +592,21 @@ describe("PiSessionService", () => {
     expect(service.getCurrentWorkspace()).toBe("/workspace/other");
   });
 
+  it("disposes the created runtime when cross-workspace setup fails", async () => {
+    const service = await PiSessionService.create(createConfig());
+    const previousSession = mockState.createdSessions[0]?.session;
+    const setup = vi.fn().mockRejectedValue(new Error("setup exploded"));
+
+    await expect(service.newSession({ workspace: "/workspace/other", setup })).rejects.toThrow("setup exploded");
+
+    expect(setup).toHaveBeenCalledWith(mockState.createdSessions[1]?.session.sessionManager);
+    expect(mockState.createdRuntimes[1]?.runtime.dispose).toHaveBeenCalledTimes(1);
+    expect(mockState.createdSessions[1]?.session.dispose).toHaveBeenCalledTimes(1);
+    expect(previousSession.dispose).not.toHaveBeenCalled();
+    expect(service.getCurrentWorkspace()).toBe("/workspace/base");
+    expect(service.getInfo().sessionId).toBe("session-1");
+  });
+
   it("switches to a specific saved session and workspace via AgentSessionRuntime", async () => {
     const service = await PiSessionService.create(createConfig());
     const previousSession = mockState.createdSessions[0]?.session;
@@ -612,25 +627,47 @@ describe("PiSessionService", () => {
 
   it("adopts the runtime-resolved cwd when switching without an explicit workspace override", async () => {
     const targetWorkspace = mkdtempSync(path.join(tmpdir(), "telepi-session-"));
-    const sessionPath = path.join(targetWorkspace, "cross-cwd.jsonl");
-    writeFileSync(
-      sessionPath,
-      `${JSON.stringify({
-        type: "session",
-        version: 3,
-        id: "crosscwd1",
-        timestamp: "2025-01-03T00:00:00.000Z",
-        cwd: targetWorkspace,
-      })}\n`,
-    );
-    const service = await PiSessionService.create(createConfig({ workspace: "/workspace/projectA" }));
+
+    try {
+      const sessionPath = path.join(targetWorkspace, "cross-cwd.jsonl");
+      writeFileSync(
+        sessionPath,
+        `${JSON.stringify({
+          type: "session",
+          version: 3,
+          id: "crosscwd1",
+          timestamp: "2025-01-03T00:00:00.000Z",
+          cwd: targetWorkspace,
+        })}\n`,
+      );
+      const service = await PiSessionService.create(createConfig({ workspace: "/workspace/projectA" }));
+      const runtime = mockState.createdRuntimes[0]?.runtime;
+
+      const info = await service.switchSession(sessionPath);
+
+      expect(runtime.switchSession).toHaveBeenCalledWith(sessionPath, targetWorkspace);
+      expect(service.getCurrentWorkspace()).toBe(targetWorkspace);
+      expect(info.workspace).toBe(targetWorkspace);
+    } finally {
+      rmSync(targetWorkspace, { recursive: true, force: true });
+    }
+  });
+
+  it("returns the runtime cancellation signal when switching sessions is cancelled", async () => {
+    const service = await PiSessionService.create(createConfig());
+    const previousSession = mockState.createdSessions[0]?.session;
     const runtime = mockState.createdRuntimes[0]?.runtime;
+    const initialInfo = service.getInfo();
 
-    const info = await service.switchSession(sessionPath);
+    runtime.switchSession.mockResolvedValueOnce({ cancelled: true });
 
-    expect(runtime.switchSession).toHaveBeenCalledWith(sessionPath, targetWorkspace);
-    expect(service.getCurrentWorkspace()).toBe(targetWorkspace);
-    expect(info.workspace).toBe(targetWorkspace);
+    const result = await service.switchSession("/sessions/saved.jsonl", "/workspace/projectA");
+
+    expect(result).toEqual({
+      ...initialInfo,
+      cancelled: true,
+    });
+    expect(previousSession.dispose).not.toHaveBeenCalled();
   });
 
   it("hands back the active session and clears the handle", async () => {
