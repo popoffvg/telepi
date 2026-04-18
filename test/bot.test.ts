@@ -1966,6 +1966,24 @@ describe("createBot", () => {
     expect(getSetMyCommandsCall(api, 1)?.commands.some((command) => command.command === "compact")).toBe(false);
   });
 
+  it("forwards runtime-backed new-session options from extension command actions", async () => {
+    const { bot, pi } = setupBot();
+
+    const promptMock = pi.service.prompt as ReturnType<typeof vi.fn>;
+    promptMock.mockImplementation(async () => {
+      await pi.getExtensionBindings()?.commandContextActions?.newSession({
+        parentSession: "/tmp/handoff-parent.jsonl",
+      });
+      pi.emitAgentEnd();
+    });
+
+    await bot.handleUpdate(createTestUpdate({ message: { text: "prepare a handoff" } }));
+
+    expect(pi.service.newSession).toHaveBeenCalledWith({
+      parentSession: "/tmp/handoff-parent.jsonl",
+    });
+  });
+
   it("surfaces extension command notifications in Telegram", async () => {
     const { bot, pi, api } = setupBot({
       piSessionOverrides: {
