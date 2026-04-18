@@ -453,11 +453,12 @@ export class PiSessionService {
     }
 
     const previousSession = this.getSession();
+    const previousWorkspace = this.currentWorkspace;
     const result = await this.getHandle().runtime.newSession({
       parentSession: options.parentSession,
       setup: options.setup,
     });
-    await this.rebindAfterSessionReplacement(previousSession);
+    await this.rebindAfterRuntimeSessionReplacement(previousSession, previousWorkspace);
     return { info: this.getInfo(), created: !result.cancelled };
   }
 
@@ -634,8 +635,9 @@ export class PiSessionService {
     }
 
     const previousSession = this.getSession();
+    const previousWorkspace = this.currentWorkspace;
     const result = await this.getHandle().runtime.switchSession(sessionPath, effectiveWorkspace);
-    await this.rebindAfterSessionReplacement(previousSession);
+    await this.rebindAfterRuntimeSessionReplacement(previousSession, previousWorkspace);
     return {
       ...this.getInfo(),
       cancelled: result.cancelled,
@@ -696,8 +698,9 @@ export class PiSessionService {
 
   async fork(entryId: string): Promise<{ cancelled: boolean }> {
     const previousSession = this.getSession();
+    const previousWorkspace = this.currentWorkspace;
     const result = await this.getHandle().runtime.fork(entryId);
-    await this.rebindAfterSessionReplacement(previousSession);
+    await this.rebindAfterRuntimeSessionReplacement(previousSession, previousWorkspace);
     return { cancelled: result.cancelled };
   }
 
@@ -798,18 +801,7 @@ export class PiSessionService {
     try {
       await this.rebindAfterSessionReplacement(previousSession);
     } catch (error) {
-      this.sessionUnsubscribe?.();
-      this.sessionUnsubscribe = undefined;
-      this.handle = undefined;
-      this.currentWorkspace = previousWorkspace;
-
-      try {
-        await nextHandle.dispose();
-      } catch (disposeError) {
-        console.error("Failed to dispose replacement session after rebinding error:", disposeError);
-      }
-
-      throw error;
+      await this.disposeHandleAfterRebindFailure(nextHandle, previousWorkspace, error);
     } finally {
       try {
         await previousHandle?.dispose();
@@ -836,6 +828,36 @@ export class PiSessionService {
     }
 
     this.sessionUnsubscribe = subscribeToSession(this.getSession(), this.sessionCallbacks);
+  }
+
+  private async disposeHandleAfterRebindFailure(
+    handle: PiSessionHandle | undefined,
+    previousWorkspace: string,
+    error: unknown,
+  ): Promise<never> {
+    this.sessionUnsubscribe?.();
+    this.sessionUnsubscribe = undefined;
+    this.handle = undefined;
+    this.currentWorkspace = previousWorkspace;
+
+    try {
+      await handle?.dispose();
+    } catch (disposeError) {
+      console.error("Failed to dispose replacement session after rebinding error:", disposeError);
+    }
+
+    throw error;
+  }
+
+  private async rebindAfterRuntimeSessionReplacement(
+    previousSession: AgentSession | undefined,
+    previousWorkspace: string,
+  ): Promise<void> {
+    try {
+      await this.rebindAfterSessionReplacement(previousSession);
+    } catch (error) {
+      await this.disposeHandleAfterRebindFailure(this.handle, previousWorkspace, error);
+    }
   }
 
   private async rebindAfterSessionReplacement(previousSession?: AgentSession): Promise<void> {

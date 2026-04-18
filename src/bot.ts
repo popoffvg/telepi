@@ -387,6 +387,7 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
     pendingWorkspacePicks,
     pendingWorkspaceButtons,
     safeReply,
+    surfaceStartupErrorDiagnostics,
   });
   const { handleSessionsCommand, handleNewCommand, handleHandbackCommand } = sessionCommandHandlers;
 
@@ -737,10 +738,11 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
 
       if (messageId) {
         await safeEditMessage(bot, target, messageId, html, { fallbackText: plainText });
-        return;
+      } else {
+        await safeReply(ctx, html, { fallbackText: plainText }, target);
       }
 
-      await safeReply(ctx, html, { fallbackText: plainText }, target);
+      await surfaceStartupErrorDiagnostics(ctx, target, info);
     } catch (error) {
       const failure = renderFailedText(error);
       if (messageId) {

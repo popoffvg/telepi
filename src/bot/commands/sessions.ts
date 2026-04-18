@@ -2,7 +2,7 @@ import type { Context } from "grammy";
 import type { SlashCommandInfo } from "@mariozechner/pi-coding-agent";
 
 import { escapeHTML } from "../../format.js";
-import type { PiSessionContext, PiSessionService } from "../../pi-session.js";
+import type { PiSessionContext, PiSessionInfo, PiSessionService } from "../../pi-session.js";
 import type { KeyboardItem } from "../keyboard.js";
 import { getWorkspaceShortName, renderFailedText, renderPrefixedError, renderSessionInfoHTML, renderSessionInfoPlain, trimLine } from "../message-rendering.js";
 import type { TextOptions } from "../telegram-transport.js";
@@ -26,6 +26,7 @@ export function createSessionCommandHandlers(deps: {
   pendingWorkspacePicks: Map<string, string[]>;
   pendingWorkspaceButtons: Map<string, KeyboardItem[]>;
   safeReply: (ctx: Context, text: string, options?: TextOptions, target?: PiSessionContext) => Promise<void>;
+  surfaceStartupErrorDiagnostics: (ctx: Context, target: PiSessionContext, info: PiSessionInfo) => Promise<void>;
 }) {
   const {
     getContextKey,
@@ -46,6 +47,7 @@ export function createSessionCommandHandlers(deps: {
     pendingWorkspacePicks,
     pendingWorkspaceButtons,
     safeReply,
+    surfaceStartupErrorDiagnostics,
   } = deps;
 
   const handleSessionsCommand = async (
@@ -89,6 +91,7 @@ export function createSessionCommandHandlers(deps: {
         const plainText = `Switched session.${workspaceNotePlain}\n\n${renderSessionInfoPlain(info)}`;
         const html = `<b>Switched session.</b>${workspaceNoteHTML}\n\n${renderSessionInfoHTML(info)}`;
         await safeReply(ctx, html, { fallbackText: plainText }, target);
+        await surfaceStartupErrorDiagnostics(ctx, target, info);
       } catch (error) {
         const failure = renderFailedText(error);
         await safeReply(ctx, failure.text, {

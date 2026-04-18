@@ -683,6 +683,49 @@ describe("PiSessionService", () => {
     expect(() => service.getSession()).toThrow("Pi session is not initialized");
   });
 
+  it("clears the active handle when extension rebinding fails during same-runtime new-session replacement", async () => {
+    const service = await PiSessionService.create(createConfig());
+    const previousSession = mockState.createdSessions[0]?.session;
+    const runtime = mockState.createdRuntimes[0]?.runtime;
+    const bindings = { uiContext: { notify: vi.fn() } } as any;
+    const originalCreateAgentSession = mockState.createAgentSession.getMockImplementation();
+
+    await service.bindExtensions(bindings);
+    service.subscribe({
+      onTextDelta: vi.fn(),
+      onToolStart: vi.fn(),
+      onToolUpdate: vi.fn(),
+      onToolEnd: vi.fn(),
+      onAgentEnd: vi.fn(),
+    });
+
+    mockState.createAgentSession.mockImplementationOnce(async (options: any) => {
+      const result = await originalCreateAgentSession!(options);
+      result.session.bindExtensions.mockRejectedValueOnce(new Error("extension rebinding exploded"));
+      return result;
+    });
+
+    await expect(service.newSession()).rejects.toThrow("extension rebinding exploded");
+
+    const nextSession = mockState.createdSessions[1]?.session;
+    expect(nextSession.bindExtensions).toHaveBeenCalledWith(bindings);
+    expect(runtime.dispose).toHaveBeenCalledTimes(1);
+    expect(previousSession.dispose).toHaveBeenCalledTimes(1);
+    expect(nextSession.dispose).toHaveBeenCalledTimes(1);
+    expect(mockState.getSubscriber(previousSession)).toBeUndefined();
+    expect(mockState.getSubscriber(nextSession)).toBeUndefined();
+    expect(service.hasActiveSession()).toBe(false);
+    expect(service.getInfo()).toEqual({
+      sessionId: "(no active session)",
+      sessionFile: undefined,
+      workspace: "/workspace/base",
+      sessionName: undefined,
+      modelFallbackMessage: undefined,
+      model: undefined,
+    });
+    expect(() => service.getSession()).toThrow("Pi session is not initialized");
+  });
+
   it("disposes the created runtime when cross-workspace setup fails", async () => {
     const service = await PiSessionService.create(createConfig());
     const previousSession = mockState.createdSessions[0]?.session;
@@ -759,6 +802,51 @@ describe("PiSessionService", () => {
       cancelled: true,
     });
     expect(previousSession.dispose).not.toHaveBeenCalled();
+  });
+
+  it("clears the active handle when extension rebinding fails during same-runtime session switching", async () => {
+    const service = await PiSessionService.create(createConfig());
+    const previousSession = mockState.createdSessions[0]?.session;
+    const runtime = mockState.createdRuntimes[0]?.runtime;
+    const bindings = { uiContext: { notify: vi.fn() } } as any;
+    const originalCreateAgentSession = mockState.createAgentSession.getMockImplementation();
+
+    await service.bindExtensions(bindings);
+    service.subscribe({
+      onTextDelta: vi.fn(),
+      onToolStart: vi.fn(),
+      onToolUpdate: vi.fn(),
+      onToolEnd: vi.fn(),
+      onAgentEnd: vi.fn(),
+    });
+
+    mockState.createAgentSession.mockImplementationOnce(async (options: any) => {
+      const result = await originalCreateAgentSession!(options);
+      result.session.bindExtensions.mockRejectedValueOnce(new Error("extension rebinding exploded"));
+      return result;
+    });
+
+    await expect(service.switchSession("/sessions/saved.jsonl", "/workspace/projectA")).rejects.toThrow(
+      "extension rebinding exploded",
+    );
+
+    const nextSession = mockState.createdSessions[1]?.session;
+    expect(nextSession.bindExtensions).toHaveBeenCalledWith(bindings);
+    expect(runtime.dispose).toHaveBeenCalledTimes(1);
+    expect(previousSession.dispose).toHaveBeenCalledTimes(1);
+    expect(nextSession.dispose).toHaveBeenCalledTimes(1);
+    expect(mockState.getSubscriber(previousSession)).toBeUndefined();
+    expect(mockState.getSubscriber(nextSession)).toBeUndefined();
+    expect(service.hasActiveSession()).toBe(false);
+    expect(service.getCurrentWorkspace()).toBe("/workspace/base");
+    expect(service.getInfo()).toEqual({
+      sessionId: "(no active session)",
+      sessionFile: undefined,
+      workspace: "/workspace/base",
+      sessionName: undefined,
+      modelFallbackMessage: undefined,
+      model: undefined,
+    });
   });
 
   it("hands back the active session and clears the handle", async () => {
@@ -1392,6 +1480,39 @@ describe("PiSessionService", () => {
 
     await expect(service.fork("known-id")).resolves.toEqual({ cancelled: false });
     expect(runtime.fork).toHaveBeenCalledWith("known-id");
+  });
+
+  it("clears the active handle when extension rebinding fails during same-runtime forks", async () => {
+    const service = await PiSessionService.create(createConfig());
+    const previousSession = mockState.createdSessions[0]?.session;
+    const runtime = mockState.createdRuntimes[0]?.runtime;
+    const bindings = { uiContext: { notify: vi.fn() } } as any;
+    const originalCreateAgentSession = mockState.createAgentSession.getMockImplementation();
+
+    await service.bindExtensions(bindings);
+
+    mockState.createAgentSession.mockImplementationOnce(async (options: any) => {
+      const result = await originalCreateAgentSession!(options);
+      result.session.bindExtensions.mockRejectedValueOnce(new Error("extension rebinding exploded"));
+      return result;
+    });
+
+    await expect(service.fork("known-id")).rejects.toThrow("extension rebinding exploded");
+
+    const nextSession = mockState.createdSessions[1]?.session;
+    expect(nextSession.bindExtensions).toHaveBeenCalledWith(bindings);
+    expect(runtime.dispose).toHaveBeenCalledTimes(1);
+    expect(previousSession.dispose).toHaveBeenCalledTimes(1);
+    expect(nextSession.dispose).toHaveBeenCalledTimes(1);
+    expect(service.hasActiveSession()).toBe(false);
+    expect(service.getInfo()).toEqual({
+      sessionId: "(no active session)",
+      sessionFile: undefined,
+      workspace: "/workspace/base",
+      sessionName: undefined,
+      modelFallbackMessage: undefined,
+      model: undefined,
+    });
   });
 
   it("delegates tree access, navigation, and labels", async () => {

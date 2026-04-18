@@ -1160,6 +1160,58 @@ describe("createBot", () => {
     await firstPrompt;
   });
 
+  it("surfaces startup diagnostics after successful direct session switches", async () => {
+    const { bot, api } = setupBot({
+      piSessionOverrides: {
+        switchSession: vi.fn().mockResolvedValue({
+          sessionId: "switched-id",
+          sessionFile: "/tmp/switched.jsonl",
+          workspace: "/workspace/B",
+          model: "anthropic/claude-sonnet-4-5",
+          diagnostics: [
+            { type: "error", message: "Extension issue (/ext/rebound.ts): startup failed" },
+          ],
+          cancelled: false,
+        }),
+      },
+    });
+
+    await bot.handleUpdate(createTestUpdate({ message: { text: "/sessions /saved/session.jsonl" } }));
+
+    const startupMessages = api.sendMessage.mock.calls
+      .map((call) => String(call[1]))
+      .filter((text) => text.includes("Session startup issues"));
+    expect(startupMessages).toHaveLength(1);
+    expect(startupMessages[0]).toContain("Extension issue (/ext/rebound.ts): startup failed");
+  });
+
+  it("surfaces startup diagnostics after successful switch callbacks", async () => {
+    const { bot, api } = setupBot({
+      piSessionOverrides: {
+        switchSession: vi.fn().mockResolvedValue({
+          sessionId: "switched-id",
+          sessionFile: "/tmp/switched.jsonl",
+          workspace: "/workspace/B",
+          model: "anthropic/claude-sonnet-4-5",
+          diagnostics: [
+            { type: "error", message: "Prompt issue (/prompts/deploy.md): invalid frontmatter" },
+          ],
+          cancelled: false,
+        }),
+      },
+    });
+
+    await bot.handleUpdate(createTestUpdate({ message: { text: "/sessions" } }));
+    await bot.handleUpdate(createCallbackUpdate("switch_1"));
+
+    expect(api.editMessageText).toHaveBeenCalled();
+    const startupMessages = api.sendMessage.mock.calls
+      .map((call) => String(call[1]))
+      .filter((text) => text.includes("Session startup issues"));
+    expect(startupMessages).toHaveLength(1);
+    expect(startupMessages[0]).toContain("Prompt issue (/prompts/deploy.md): invalid frontmatter");
+  });
+
   it("shows a workspace picker for /new and creates directly when only one workspace exists", async () => {
     const picker = setupBot();
     await picker.bot.handleUpdate(createTestUpdate({ message: { text: "/new" } }));
