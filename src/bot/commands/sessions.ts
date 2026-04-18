@@ -165,6 +165,7 @@ export function createSessionCommandHandlers(deps: {
         const plainText = `New session created.\n\n${renderSessionInfoPlain(info)}`;
         const html = `<b>New session created.</b>\n\n${renderSessionInfoHTML(info)}`;
         await safeReply(ctx, html, { fallbackText: plainText }, target);
+        await surfaceStartupErrorDiagnostics(ctx, target, info);
       } catch (error) {
         const failure = renderFailedText(error);
         await safeReply(ctx, failure.text, {

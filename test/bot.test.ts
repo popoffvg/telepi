@@ -1228,6 +1228,34 @@ describe("createBot", () => {
     expect(single.api.sendMessage.mock.calls[0]?.[1]).toContain("New session created.");
   });
 
+  it("surfaces startup diagnostics after successful direct /new session creation", async () => {
+    const { bot, api } = setupBot({
+      piSessionOverrides: {
+        listWorkspaces: vi.fn().mockResolvedValue(["/workspace/A"]),
+        newSession: vi.fn().mockResolvedValue({
+          info: {
+            sessionId: "new-id",
+            sessionFile: "/tmp/new.jsonl",
+            workspace: "/workspace/A",
+            model: "anthropic/claude-sonnet-4-5",
+            diagnostics: [
+              { type: "error", message: "Extension issue (/ext/new.ts): startup failed" },
+            ],
+          },
+          created: true,
+        }),
+      },
+    });
+
+    await bot.handleUpdate(createTestUpdate({ message: { text: "/new" } }));
+
+    const startupMessages = api.sendMessage.mock.calls
+      .map((call) => String(call[1]))
+      .filter((text) => text.includes("Session startup issues"));
+    expect(startupMessages).toHaveLength(1);
+    expect(startupMessages[0]).toContain("Extension issue (/ext/new.ts): startup failed");
+  });
+
   it("handles new workspace selection callbacks", async () => {
     const { bot, pi, api } = setupBot();
 
@@ -1237,6 +1265,35 @@ describe("createBot", () => {
     expect(api.answerCallbackQuery).toHaveBeenCalledWith("cb_1", { text: "Creating session..." });
     expect(pi.service.newSession).toHaveBeenCalledWith("/workspace/B");
     expect(api.editMessageText).toHaveBeenCalled();
+  });
+
+  it("surfaces startup diagnostics after successful workspace-picker session creation", async () => {
+    const { bot, api } = setupBot({
+      piSessionOverrides: {
+        newSession: vi.fn().mockResolvedValue({
+          info: {
+            sessionId: "new-id",
+            sessionFile: "/tmp/new.jsonl",
+            workspace: "/workspace/B",
+            model: "anthropic/claude-sonnet-4-5",
+            diagnostics: [
+              { type: "error", message: "Prompt issue (/prompts/new.md): invalid frontmatter" },
+            ],
+          },
+          created: true,
+        }),
+      },
+    });
+
+    await bot.handleUpdate(createTestUpdate({ message: { text: "/new" } }));
+    await bot.handleUpdate(createCallbackUpdate("newws_1"));
+
+    expect(api.editMessageText).toHaveBeenCalled();
+    const startupMessages = api.sendMessage.mock.calls
+      .map((call) => String(call[1]))
+      .filter((text) => text.includes("Session startup issues"));
+    expect(startupMessages).toHaveLength(1);
+    expect(startupMessages[0]).toContain("Prompt issue (/prompts/new.md): invalid frontmatter");
   });
 
   it("paginates workspace pickers and creates the selected workspace session", async () => {
