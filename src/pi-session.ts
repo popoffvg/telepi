@@ -792,10 +792,24 @@ export class PiSessionService {
   private async replaceHandle(nextHandle: PiSessionHandle): Promise<void> {
     const previousHandle = this.handle;
     const previousSession = previousHandle?.runtime.session;
+    const previousWorkspace = this.currentWorkspace;
     this.handle = nextHandle;
 
     try {
       await this.rebindAfterSessionReplacement(previousSession);
+    } catch (error) {
+      this.sessionUnsubscribe?.();
+      this.sessionUnsubscribe = undefined;
+      this.handle = undefined;
+      this.currentWorkspace = previousWorkspace;
+
+      try {
+        await nextHandle.dispose();
+      } catch (disposeError) {
+        console.error("Failed to dispose replacement session after rebinding error:", disposeError);
+      }
+
+      throw error;
     } finally {
       try {
         await previousHandle?.dispose();

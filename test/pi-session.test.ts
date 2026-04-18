@@ -653,7 +653,7 @@ describe("PiSessionService", () => {
     expect(service.getCurrentWorkspace()).toBe("/workspace/other");
   });
 
-  it("disposes the previous handle even when extension rebinding fails during replacement", async () => {
+  it("clears the active handle when extension rebinding fails during replacement", async () => {
     const service = await PiSessionService.create(createConfig());
     const previousSession = mockState.createdSessions[0]?.session;
     const bindings = { uiContext: { notify: vi.fn() } } as any;
@@ -669,7 +669,18 @@ describe("PiSessionService", () => {
     await expect(service.newSession("/workspace/other")).rejects.toThrow("extension rebinding exploded");
 
     expect(mockState.createdSessions[1]?.session.bindExtensions).toHaveBeenCalledWith(bindings);
+    expect(mockState.createdRuntimes[1]?.runtime.dispose).toHaveBeenCalledTimes(1);
     expect(previousSession.dispose).toHaveBeenCalledTimes(1);
+    expect(service.hasActiveSession()).toBe(false);
+    expect(service.getInfo()).toEqual({
+      sessionId: "(no active session)",
+      sessionFile: undefined,
+      workspace: "/workspace/base",
+      sessionName: undefined,
+      modelFallbackMessage: undefined,
+      model: undefined,
+    });
+    expect(() => service.getSession()).toThrow("Pi session is not initialized");
   });
 
   it("disposes the created runtime when cross-workspace setup fails", async () => {
