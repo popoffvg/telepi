@@ -15,6 +15,15 @@ import {
   normalizeSlashCommand,
 } from "../../src/bot/slash-command.js";
 
+function createSourceInfo(filePath: string) {
+  return {
+    path: filePath,
+    source: "local" as const,
+    scope: "project" as const,
+    origin: "top-level" as const,
+  };
+}
+
 describe("bot slash-command helpers", () => {
   let tempDir: string | undefined;
 
@@ -61,25 +70,25 @@ describe("bot slash-command helpers", () => {
         name: "review",
         description: "Review recent changes",
         source: "prompt",
-        sourceInfo: { path: reviewPromptPath, source: "local", scope: "project", origin: "top-level" },
+        sourceInfo: createSourceInfo(reviewPromptPath),
       },
       {
         name: "skill:browser-tools",
         description: "Browser tools",
         source: "skill",
-        sourceInfo: { path: "/skills/browser.md", source: "local", scope: "project", origin: "top-level" },
+        sourceInfo: createSourceInfo("/skills/browser.md"),
       },
       {
         name: "deploy",
         description: "Deploy app",
         source: "extension",
-        sourceInfo: { path: "/ext/deploy.ts", source: "local", scope: "project", origin: "top-level" },
+        sourceInfo: createSourceInfo("/ext/deploy.ts"),
       },
       {
         name: "agentic",
         description: "Agent action",
         source: "agent" as any,
-        sourceInfo: { path: "/agentic", source: "local", scope: "project", origin: "top-level" },
+        sourceInfo: createSourceInfo("/agentic"),
       },
     ];
 
@@ -106,19 +115,33 @@ describe("bot slash-command helpers", () => {
     ]);
   });
 
+  it("uses direct argumentHint metadata without needing prompt file reads", () => {
+    const entries = buildCommandPickerEntries([
+      {
+        name: "review",
+        description: "Review recent changes",
+        source: "prompt",
+        argumentHint: "<PR-URL>",
+        sourceInfo: createSourceInfo("/missing/review.md"),
+      } as SlashCommandInfo & { argumentHint: string },
+    ]);
+
+    expect(entries).toContainEqual(expect.objectContaining({ kind: "pi", name: "review", label: "📝 /review <PR-URL>" }));
+  });
+
   it("gracefully skips argument hints when prompt metadata is unavailable", () => {
     const entries = buildCommandPickerEntries([
       {
         name: "review",
         description: "Review recent changes",
         source: "prompt",
-        sourceInfo: { path: "/missing/review.md", source: "local", scope: "project", origin: "top-level" },
+        sourceInfo: createSourceInfo("/missing/review.md"),
       },
       {
         name: "deploy",
         description: "Deploy app",
         source: "extension",
-        sourceInfo: { path: "/ext/deploy.ts", source: "local", scope: "project", origin: "top-level" },
+        sourceInfo: createSourceInfo("/ext/deploy.ts"),
       },
     ]);
 
@@ -128,8 +151,8 @@ describe("bot slash-command helpers", () => {
 
   it("filters and counts command picker entries by kind", () => {
     const entries = buildCommandPickerEntries([
-      { name: "review", description: "Review", source: "prompt" },
-      { name: "deploy", description: "Deploy", source: "extension" },
+      { name: "review", description: "Review", source: "prompt", sourceInfo: createSourceInfo("/prompts/review.md") },
+      { name: "deploy", description: "Deploy", source: "extension", sourceInfo: createSourceInfo("/ext/deploy.ts") },
     ]);
 
     expect(getCommandPickerFilterName("all")).toBe("All");
@@ -150,10 +173,10 @@ describe("bot slash-command helpers", () => {
   it("builds chat-scoped commands for Telegram and filters unsupported or conflicting names", () => {
     const longDescription = "x".repeat(400);
     const commands = buildChatScopedCommands([
-      { name: "review", description: longDescription, source: "prompt" },
-      { name: "switch", description: "Conflicts with local command", source: "extension" },
-      { name: "skill:browser-tools", description: "Not Telegram-native", source: "skill" },
-      { name: "Review", description: "Duplicate after lowercasing", source: "prompt" },
+      { name: "review", description: longDescription, source: "prompt", sourceInfo: createSourceInfo("/prompts/review.md") },
+      { name: "switch", description: "Conflicts with local command", source: "extension", sourceInfo: createSourceInfo("/ext/switch.ts") },
+      { name: "skill:browser-tools", description: "Not Telegram-native", source: "skill", sourceInfo: createSourceInfo("/skills/browser.md") },
+      { name: "Review", description: "Duplicate after lowercasing", source: "prompt", sourceInfo: createSourceInfo("/prompts/review-duplicate.md") },
     ]);
 
     expect(commands).toEqual([
