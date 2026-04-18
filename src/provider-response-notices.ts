@@ -30,6 +30,8 @@ export function getProviderResponseNotice(
   ]);
 
   if (event.status === 401 || event.status === 403) {
+    // Auth/access failures need operator action; surfacing Retry-After here would
+    // imply a transient backoff signal when the credentials or permissions are the issue.
     return {
       message: joinSentences(
         `Provider authentication failed (HTTP ${event.status}). Check API credentials or provider access.`,

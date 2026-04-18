@@ -87,6 +87,30 @@ describe("getProviderResponseNotice", () => {
     });
   });
 
+  it("uses the fallback notice branch for unhandled non-2xx statuses with provider warnings", () => {
+    expect(getProviderResponseNotice({
+      status: 409,
+      headers: {
+        Warning: '199 api "Conflict should be retried after reconciliation"',
+      },
+    })).toEqual({
+      message: "Provider reported an issue (HTTP 409). Provider warning: Conflict should be retried after reconciliation.",
+      type: "warning",
+    });
+  });
+
+  it("preserves non-numeric retry-after values on fallback notices", () => {
+    expect(getProviderResponseNotice({
+      status: 425,
+      headers: {
+        "Retry-After": "Wed, 21 Oct 2015 07:28:00 GMT",
+      },
+    })).toEqual({
+      message: "Provider reported an issue (HTTP 425). Retry after Wed, 21 Oct 2015 07:28:00 GMT.",
+      type: "warning",
+    });
+  });
+
   it("returns undefined for unhandled 4xx responses without advisory headers", () => {
     expect(getProviderResponseNotice({
       status: 404,
