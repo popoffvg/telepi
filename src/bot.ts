@@ -188,6 +188,7 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
     pendingTreeViews.delete(contextKey);
     pendingBranchButtons.delete(contextKey);
     pendingCommandPickers.delete(contextKey);
+    surfacedStartupErrorSignatures.delete(contextKey);
   };
 
   const clearContextPromptMemory = (target: PiSessionContext): void => {
