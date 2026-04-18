@@ -29,6 +29,40 @@ describe("getProviderResponseNotice", () => {
     });
   });
 
+  it("formats timeout notices with singular retry-after wording", () => {
+    expect(getProviderResponseNotice({
+      status: 408,
+      headers: {
+        "Retry-After": "1",
+      },
+    })).toEqual({
+      message: "Provider appears unavailable or degraded (HTTP 408). Please retry later. Retry after 1 second.",
+      type: "warning",
+    });
+  });
+
+  it("returns degraded notices for bare 5xx responses without advisory headers", () => {
+    expect(getProviderResponseNotice({
+      status: 500,
+      headers: {},
+    })).toEqual({
+      message: "Provider appears unavailable or degraded (HTTP 500). Please retry later.",
+      type: "warning",
+    });
+  });
+
+  it("includes provider request ids when available", () => {
+    expect(getProviderResponseNotice({
+      status: 401,
+      headers: {
+        "x-request-id": "req_123",
+      },
+    })).toEqual({
+      message: "Provider authentication failed (HTTP 401). Check API credentials or provider access. Request ID: req_123.",
+      type: "error",
+    });
+  });
+
   it("surfaces degraded upstream warnings from headers on failed responses", () => {
     expect(getProviderResponseNotice({
       status: 503,
@@ -39,6 +73,25 @@ describe("getProviderResponseNotice", () => {
       message: "Provider appears unavailable or degraded (HTTP 503). Please retry later. Provider warning: Upstream service is degraded.",
       type: "warning",
     });
+  });
+
+  it("falls back to readable warning text for non-RFC unquoted warning headers", () => {
+    expect(getProviderResponseNotice({
+      status: 503,
+      headers: {
+        Warning: "199 degraded upstream",
+      },
+    })).toEqual({
+      message: "Provider appears unavailable or degraded (HTTP 503). Please retry later. Provider warning: degraded upstream.",
+      type: "warning",
+    });
+  });
+
+  it("returns undefined for unhandled 4xx responses without advisory headers", () => {
+    expect(getProviderResponseNotice({
+      status: 404,
+      headers: {},
+    })).toBeUndefined();
   });
 
   it("keeps successful 2xx responses silent even when headers include warnings", () => {

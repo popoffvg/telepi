@@ -4,7 +4,7 @@ import type { TelegramExtensionNoticeType } from "./telegram-ui-context.js";
 
 export interface ProviderResponseNoticeEvent {
   status: number;
-  headers: Record<string, string | undefined>;
+  headers: Record<string, string>;
 }
 
 export interface ProviderResponseNotice {
@@ -90,15 +90,17 @@ export function createProviderResponseNoticeExtension(): ExtensionFactory {
         return;
       }
 
+      // If the SDK/client ever starts retrying provider calls internally, this hook
+      // will fire for each attempted response. Keep any future dedupe at this edge so
+      // getProviderResponseNotice stays a pure mapper for direct unit coverage.
       ctx.ui.notify(notice.message, notice.type);
     });
   };
 }
 
-function normalizeHeaders(headers: Record<string, string | undefined>): Record<string, string> {
+function normalizeHeaders(headers: Record<string, string>): Record<string, string> {
   return Object.fromEntries(
     Object.entries(headers)
-      .filter((entry): entry is [string, string] => typeof entry[1] === "string")
       .map(([name, value]) => [name.toLowerCase(), value.trim()])
       .filter((entry) => entry[1].length > 0),
   );
@@ -135,7 +137,7 @@ function formatWarningHeader(value: string | undefined): string | undefined {
 
   const quotedMessage = value.match(/"([^"]+)"/);
   const trimmed = (quotedMessage?.[1] ?? value)
-    .replace(/^\d{3}\s+[^\s]+\s+/u, "")
+    .replace(/^\d{3}\s+/u, "")
     .replace(/^"|"$/gu, "")
     .trim();
 
