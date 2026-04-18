@@ -1,4 +1,6 @@
-import type { SlashCommandInfo } from "@mariozechner/pi-coding-agent";
+import { readFileSync } from "node:fs";
+
+import { parseFrontmatter, type SlashCommandInfo } from "@mariozechner/pi-coding-agent";
 
 import { trimLine } from "./message-rendering.js";
 
@@ -76,16 +78,74 @@ export function normalizeSlashCommand(text: string, botUsername?: string): Norma
   };
 }
 
+type SlashCommandInfoWithMetadata = SlashCommandInfo & {
+  argumentHint?: string;
+  path?: string;
+  sourceInfo?: {
+    path?: string;
+  };
+};
+
+function normalizeArgumentHint(argumentHint: unknown): string | undefined {
+  if (typeof argumentHint !== "string") {
+    return undefined;
+  }
+
+  const trimmed = argumentHint.trim();
+  return trimmed ? trimmed : undefined;
+}
+
+function getSlashCommandSourcePath(command: SlashCommandInfoWithMetadata): string | undefined {
+  const sourceInfoPath = typeof command.sourceInfo?.path === "string" ? command.sourceInfo.path.trim() : "";
+  if (sourceInfoPath) {
+    return sourceInfoPath;
+  }
+
+  const legacyPath = typeof command.path === "string" ? command.path.trim() : "";
+  return legacyPath || undefined;
+}
+
+function getSlashCommandArgumentHint(command: SlashCommandInfo): string | undefined {
+  const commandWithMetadata = command as SlashCommandInfoWithMetadata;
+  const directHint = normalizeArgumentHint(commandWithMetadata.argumentHint);
+  if (directHint) {
+    return directHint;
+  }
+
+  if (command.source !== "prompt") {
+    return undefined;
+  }
+
+  const sourcePath = getSlashCommandSourcePath(commandWithMetadata);
+  if (!sourcePath) {
+    return undefined;
+  }
+
+  try {
+    const { frontmatter } = parseFrontmatter<Record<string, unknown>>(readFileSync(sourcePath, "utf8"));
+    return normalizeArgumentHint(frontmatter["argument-hint"]);
+  } catch {
+    return undefined;
+  }
+}
+
+function getPiSlashCommandDisplayText(command: SlashCommandInfo): string {
+  const argumentHint = getSlashCommandArgumentHint(command);
+  return argumentHint ? `/${command.name} ${argumentHint}` : `/${command.name}`;
+}
+
 function getPiSlashCommandLabel(command: SlashCommandInfo): string {
+  const displayText = getPiSlashCommandDisplayText(command);
+
   switch (command.source) {
     case "prompt":
-      return `📝 /${command.name}`;
+      return `📝 ${displayText}`;
     case "skill":
-      return `🧰 /${command.name}`;
+      return `🧰 ${displayText}`;
     case "extension":
-      return `🧩 /${command.name}`;
+      return `🧩 ${displayText}`;
     default:
-      return `⚡ /${command.name}`;
+      return `⚡ ${displayText}`;
   }
 }
 

@@ -1,4 +1,7 @@
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { unlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { vi } from "vitest";
 
 vi.mock("@grammyjs/auto-retry", () => ({
@@ -1886,6 +1889,52 @@ describe("createBot", () => {
     await bot.handleUpdate(createCallbackUpdate(compactButton!.callback_data));
 
     expect(pi.service.prompt).toHaveBeenCalledWith("/compact");
+  });
+
+  it("shows prompt argument hints in /commands without changing Pi command dispatch", async () => {
+    const tempDir = mkdtempSync(path.join(tmpdir(), "telepi-command-picker-"));
+    const promptPath = path.join(tempDir, "review.md");
+    writeFileSync(
+      promptPath,
+      [
+        "---",
+        "description: Review staged changes",
+        'argument-hint: "<PR-URL>"',
+        "---",
+        "Review changes.",
+        "",
+      ].join("\n"),
+    );
+
+    try {
+      const { bot, pi, api } = setupBot({
+        piSessionOverrides: {
+          listSlashCommands: vi.fn().mockResolvedValue([
+            {
+              name: "review",
+              description: "Review staged changes",
+              source: "prompt",
+              sourceInfo: { path: promptPath, source: "local", scope: "project", origin: "top-level" },
+            },
+          ]),
+        },
+      });
+
+      await bot.handleUpdate(createTestUpdate({ message: { text: "/commands" } }));
+      await bot.handleUpdate(createCallbackUpdate("cmd_filter_pi"));
+
+      expect(String(api.editMessageText.mock.calls[0]?.[2])).toContain("/review &lt;PR-URL&gt;");
+      expect(getEditedReplyMarkupTexts(api, 0)).toContain("📝 /review <PR-URL>");
+
+      const reviewButton = getEditedReplyMarkupButtons(api, 0).find((button) => button.text.includes("/review <PR-URL>"));
+      expect(reviewButton).toBeDefined();
+
+      await bot.handleUpdate(createCallbackUpdate(reviewButton!.callback_data));
+
+      expect(pi.service.prompt).toHaveBeenCalledWith("/review");
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
   });
 
   it("keeps the /commands picker active when a Pi command is tapped while busy", async () => {
