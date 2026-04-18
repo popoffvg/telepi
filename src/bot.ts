@@ -47,6 +47,7 @@ import { createTreeCommandHandlers } from "./bot/commands/tree.js";
 import { registerTreeCallbacks, type PendingTreeView } from "./bot/tree-callbacks.js";
 import {
   type PiSessionContext,
+  type PiSessionInfo,
   getPiSessionContextKey,
   type PiSessionModelOption,
   type PiSessionRegistry,
@@ -79,6 +80,7 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
   const pendingTreeViews = new Map<ContextKey, PendingTreeView>();
   const pendingBranchButtons = new Map<ContextKey, KeyboardItem[]>();
   const pendingCommandPickers = new Map<ContextKey, PendingCommandPicker>();
+  const surfacedStartupErrorSignatures = new Map<ContextKey, string>();
   const chatScopedCommandSignatures = new Map<TelegramChatId, string>();
 
   const getContextKey = (target: PiSessionContext): ContextKey => getPiSessionContextKey(target);
@@ -192,6 +194,29 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
     chatState.clearPromptMemory(target);
   };
 
+  const surfaceStartupErrorDiagnostics = async (
+    ctx: Context,
+    target: PiSessionContext,
+    info: PiSessionInfo,
+  ): Promise<void> => {
+    const contextKey = getContextKey(target);
+    const errors = info.diagnostics?.filter((diagnostic) => diagnostic.type === "error") ?? [];
+    if (errors.length === 0) {
+      surfacedStartupErrorSignatures.delete(contextKey);
+      return;
+    }
+
+    const signature = `${info.sessionId}:${errors.map((diagnostic) => diagnostic.message).join("\n")}`;
+    if (surfacedStartupErrorSignatures.get(contextKey) === signature) {
+      return;
+    }
+
+    surfacedStartupErrorSignatures.set(contextKey, signature);
+    const plainText = ["Session startup issues:", ...errors.map((diagnostic) => `- ${diagnostic.message}`)].join("\n");
+    const html = ["<b>Session startup issues:</b>", ...errors.map((diagnostic) => `• ${escapeHTML(diagnostic.message)}`)].join("\n");
+    await safeReply(ctx, html, { fallbackText: plainText }, target);
+  };
+
   const isBusy = (target: PiSessionContext): boolean => {
     const piSession = getExistingSession(target);
     return chatState.isLocallyBusy(target) || piSession?.isStreaming() === true;
@@ -212,7 +237,8 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
 
   const ensureActiveSession = async (ctx: Context, target: PiSessionContext): Promise<PiSessionService | undefined> => {
     const existing = getExistingSession(target);
-    if (existing?.hasActiveSession()) {
+    const hadActiveSession = existing?.hasActiveSession() === true;
+    if (hadActiveSession) {
       return existing;
     }
 
@@ -221,6 +247,7 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
       if (!piSession.hasActiveSession()) {
         await piSession.newSession();
       }
+      await surfaceStartupErrorDiagnostics(ctx, target, piSession.getInfo());
       return piSession;
     } catch (error) {
       const failure = renderPrefixedError("Failed to create session", error);
@@ -364,6 +391,7 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
 
   const modelCommandHandlers = createModelCommandHandlers({
     getContextKey,
+    getExistingSession,
     getOrCreateSession,
     isBusy,
     refreshChatScopedCommands,
@@ -373,6 +401,7 @@ export function createBot(config: TelePiConfig, sessionRegistry: PiSessionRegist
     buildKeyboard,
     safeReply,
     safeEditMessage: (target, messageId, text, options) => safeEditMessage(bot, target, messageId, text, options),
+    surfaceStartupErrorDiagnostics,
   });
   const { renderModelPicker, handleModelCommand } = modelCommandHandlers;
 

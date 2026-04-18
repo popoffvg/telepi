@@ -55,12 +55,13 @@ describe("bot message rendering helpers", () => {
     expect(renderHelpHTML(info)).toContain("<b>Notes</b>");
   });
 
-  it("renders session diagnostics with warning and error sections", () => {
+  it("renders session diagnostics with warning, error, and info sections", () => {
     const diagnosticsInfo = {
       ...info,
       diagnostics: [
         { type: "warning", message: "Project settings: failed to parse .pi/settings.json" },
         { type: "error", message: 'Failed to load extension "/ext/bad.ts": boom' },
+        { type: "info", message: "Session will continue with the current workspace." },
         { type: "warning", message: "Theme issue (/themes/missing.json): theme path does not exist" },
       ],
     };
@@ -69,9 +70,12 @@ describe("bot message rendering helpers", () => {
     expect(renderSessionInfoPlain(diagnosticsInfo)).toContain('- Failed to load extension "/ext/bad.ts": boom');
     expect(renderSessionInfoPlain(diagnosticsInfo)).toContain("Warnings:");
     expect(renderSessionInfoPlain(diagnosticsInfo)).toContain("- Project settings: failed to parse .pi/settings.json");
+    expect(renderSessionInfoPlain(diagnosticsInfo)).toContain("Notes:");
+    expect(renderSessionInfoPlain(diagnosticsInfo)).toContain("- Session will continue with the current workspace.");
     expect(renderSessionInfoHTML(diagnosticsInfo)).toContain("<b>Errors:</b>");
     expect(renderSessionInfoHTML(diagnosticsInfo)).toContain("<b>Warnings:</b>");
-    expect(renderSessionInfoHTML(diagnosticsInfo)).toContain("Failed to load extension");
+    expect(renderSessionInfoHTML(diagnosticsInfo)).toContain("<b>Notes:</b>");
+    expect(renderSessionInfoHTML(diagnosticsInfo)).toContain("Session will continue with the current workspace.");
   });
 
   it("renders voice support, dialog panels, tool updates, and tool summaries", () => {

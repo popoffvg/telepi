@@ -13,9 +13,9 @@ import {
   SettingsManager,
   type AgentSession,
   type AgentSessionRuntime,
-  type AgentSessionRuntimeDiagnostic,
   type CreateAgentSessionRuntimeFactory,
   type ResourceDiagnostic,
+  type ResourceLoader,
   type SessionEntry,
   type SlashCommandInfo,
 } from "@mariozechner/pi-coding-agent";
@@ -985,7 +985,7 @@ function collectSettingsDiagnostics(settingsManager: SettingsManager): PiSession
 }
 
 function collectSessionResourceDiagnostics(
-  resourceLoader: { getExtensions?: () => { errors: Array<{ path: string; error: string }> }; getSkills?: () => { diagnostics: ResourceDiagnostic[] }; getPrompts?: () => { diagnostics: ResourceDiagnostic[] }; getThemes?: () => { diagnostics: ResourceDiagnostic[] } },
+  resourceLoader: ResourceLoader,
   session: AgentSession,
 ): PiSessionDiagnostic[] {
   return [
@@ -1022,9 +1022,9 @@ function normalizeResourceDiagnostics(
   });
 }
 
-function dedupeDiagnostics(diagnostics: PiSessionDiagnostic[]): AgentSessionRuntimeDiagnostic[] {
+function dedupeDiagnostics(diagnostics: PiSessionDiagnostic[]): PiSessionDiagnostic[] {
   const seen = new Set<string>();
-  const deduped: AgentSessionRuntimeDiagnostic[] = [];
+  const deduped: PiSessionDiagnostic[] = [];
 
   for (const diagnostic of diagnostics) {
     const key = `${diagnostic.type}:${diagnostic.message}`;
