@@ -870,6 +870,48 @@ describe("PiSessionService", () => {
     }
   });
 
+  it("rethrows unexpected session-resolution errors instead of silently falling back", async () => {
+    mockState.SessionManager.listAll.mockRejectedValueOnce(new Error("list exploded"));
+    const service = await PiSessionService.create(createConfig());
+    const runtime = mockState.createdRuntimes[0]?.runtime;
+
+    await expect(service.switchSession("s1")).rejects.toThrow("list exploded");
+    expect(runtime.switchSession).not.toHaveBeenCalled();
+  });
+
+  it("switches using the resolved session path after handback when no handle is active", async () => {
+    mockState.SessionManager.listAll.mockRejectedValueOnce(new Error("boom"));
+    const tempDir = mkdtempSync(path.join(homedir(), "telepi-session-"));
+
+    try {
+      const sessionPath = path.join(tempDir, "tilde-reopen.jsonl");
+      writeFileSync(
+        sessionPath,
+        `${JSON.stringify({
+          type: "session",
+          version: 3,
+          id: "tilde-reopen",
+          timestamp: "2025-01-03T00:00:00.000Z",
+          cwd: tempDir,
+        })}\n`,
+      );
+      const tildePath = sessionPath.replace(homedir(), "~");
+      const service = await PiSessionService.create(createConfig({ workspace: "/workspace/projectA" }));
+
+      await service.handback();
+      expect(service.hasActiveSession()).toBe(false);
+
+      const info = await service.switchSession(tildePath);
+
+      expect(mockState.SessionManager.open).toHaveBeenLastCalledWith(sessionPath, undefined, tempDir);
+      expect(info.sessionFile).toBe(sessionPath);
+      expect(info.workspace).toBe(tempDir);
+      expect(service.hasActiveSession()).toBe(true);
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
   it("recreates the model registry each time the runtime factory creates a session", async () => {
     const service = await PiSessionService.create(createConfig());
     const firstRegistry = mockState.createAgentSessionServices.mock.calls[0]?.[0]?.modelRegistry;

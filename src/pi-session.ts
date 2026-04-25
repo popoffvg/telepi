@@ -98,6 +98,15 @@ export interface PiSessionNewSessionOptions {
   setup?: (sessionManager: SessionManager) => Promise<void>;
 }
 
+class SessionReferenceResolutionError extends Error {
+  readonly code = "SESSION_REFERENCE_RESOLUTION_ERROR";
+
+  constructor(message: string) {
+    super(message);
+    this.name = "SessionReferenceResolutionError";
+  }
+}
+
 interface PiSessionHandle {
   runtime: AgentSessionRuntime;
   getSlashCommands: () => SlashCommandInfo[];
@@ -507,7 +516,7 @@ export class PiSessionService {
   async resolveSessionReference(sessionReference: string): Promise<ResolvedSessionReference> {
     const normalizedReference = sessionReference.trim();
     if (!normalizedReference) {
-      throw new Error("Session reference cannot be empty.");
+      throw new SessionReferenceResolutionError("Session reference cannot be empty.");
     }
 
     const remappedReferencePath = resolveSessionPathForRuntime(normalizedReference);
@@ -517,7 +526,7 @@ export class PiSessionService {
       || normalizedReference.startsWith("~");
     if (looksLikePath) {
       if (!existsSync(remappedReferencePath)) {
-        throw new Error(`Saved session not found: ${normalizedReference}`);
+        throw new SessionReferenceResolutionError(`Saved session not found: ${normalizedReference}`);
       }
 
       const header = readSessionHeader(remappedReferencePath);
@@ -580,7 +589,7 @@ export class PiSessionService {
     }
 
     if (localPrefixMatches.length > 1) {
-      throw new Error(
+      throw new SessionReferenceResolutionError(
         `Session ID prefix "${normalizedReference}" matches ${localPrefixMatches.length} saved sessions in the current workspace. Use more characters or /sessions to pick one.`,
       );
     }
@@ -601,12 +610,12 @@ export class PiSessionService {
     }
 
     if (prefixMatches.length > 1) {
-      throw new Error(
+      throw new SessionReferenceResolutionError(
         `Session ID prefix "${normalizedReference}" matches ${prefixMatches.length} saved sessions. Use more characters or /sessions to pick one.`,
       );
     }
 
-    throw new Error(
+    throw new SessionReferenceResolutionError(
       `No saved session matches "${normalizedReference}". Use /sessions to browse, or pass a full session path or session ID.`,
     );
   }
@@ -646,8 +655,12 @@ export class PiSessionService {
   ): Promise<ResolvedSessionReference | undefined> {
     try {
       return await this.resolveSessionReference(sessionPath);
-    } catch {
-      return undefined;
+    } catch (error) {
+      if (error instanceof SessionReferenceResolutionError) {
+        return undefined;
+      }
+
+      throw error;
     }
   }
 
