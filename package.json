@@ -1,6 +1,6 @@
 {
   "name": "@futurelab-studio/telepi",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "description": "Telegram bridge for the Pi coding agent",
   "license": "MIT",
   "repository": {
