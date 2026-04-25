@@ -1,4 +1,7 @@
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { unlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { vi } from "vitest";
 
 vi.mock("@grammyjs/auto-retry", () => ({
@@ -41,6 +44,8 @@ import type {
 } from "../src/pi-session.js";
 import { createBot, registerCommands } from "../src/bot.js";
 import { getAvailableBackends, transcribeAudio } from "../src/voice.js";
+
+type SwitchResult = Awaited<ReturnType<PiSessionService["switchSession"]>>;
 
 const ALLOWED_USER_ID = 123;
 const ALLOWED_CHAT_ID = 456;
@@ -151,6 +156,7 @@ function createMockPiSession(overrides: Partial<PiSessionService> = {}) {
       sessionFile: "/tmp/switched.jsonl",
       workspace: "/other",
       model: "anthropic/claude-sonnet-4-5",
+      cancelled: false,
     }),
     handback: vi.fn().mockResolvedValue({
       sessionFile: "/tmp/test.jsonl",
@@ -681,6 +687,55 @@ describe("createBot", () => {
     expect(api.sendMessage.mock.calls[0]?.[1]).toContain("Nothing to retry yet in this chat/topic.");
   });
 
+  it("clears /retry memory after creating a new session or switching sessions", async () => {
+    const fresh = setupBot({
+      piSessionOverrides: {
+        listWorkspaces: vi.fn().mockResolvedValue(["/workspace/A"]),
+      },
+    });
+    await fresh.bot.handleUpdate(createTestUpdate({ message: { text: "retry me later" } }));
+    await fresh.bot.handleUpdate(createTestUpdate({ message: { text: "/new" } }));
+
+    fresh.api.sendMessage.mockClear();
+    await fresh.bot.handleUpdate(createTestUpdate({ message: { text: "/retry" } }));
+    expect(fresh.api.sendMessage.mock.calls[0]?.[1]).toContain("Nothing to retry yet");
+
+    const switched = setupBot();
+    await switched.bot.handleUpdate(createTestUpdate({ message: { text: "switch clears retry" } }));
+    await switched.bot.handleUpdate(createTestUpdate({ message: { text: "/sessions /saved/session.jsonl" } }));
+
+    switched.api.sendMessage.mockClear();
+    await switched.bot.handleUpdate(createTestUpdate({ message: { text: "/retry" } }));
+    expect(switched.api.sendMessage.mock.calls[0]?.[1]).toContain("Nothing to retry yet");
+  });
+
+  it("can retry failed prompts and prompts started from voice transcription", async () => {
+    const failing = setupBot();
+    const failingPrompt = failing.pi.service.prompt as ReturnType<typeof vi.fn>;
+    failingPrompt
+      .mockRejectedValueOnce(new Error("boom"))
+      .mockResolvedValueOnce(undefined);
+
+    await failing.bot.handleUpdate(createTestUpdate({ message: { text: "retry failed prompt" } }));
+    await failing.bot.handleUpdate(createTestUpdate({ message: { text: "/retry" } }));
+
+    expect(failing.pi.service.prompt).toHaveBeenNthCalledWith(1, "retry failed prompt");
+    expect(failing.pi.service.prompt).toHaveBeenNthCalledWith(2, "retry failed prompt");
+
+    const voice = setupBot();
+    const voicePrompt = voice.pi.service.prompt as ReturnType<typeof vi.fn>;
+    voicePrompt.mockImplementation(async () => {
+      voice.pi.emitTextDelta("Voice response");
+      voice.pi.emitAgentEnd();
+    });
+
+    await voice.bot.handleUpdate(createVoiceUpdate());
+    await voice.bot.handleUpdate(createTestUpdate({ message: { text: "/retry" } }));
+
+    expect(voice.pi.service.prompt).toHaveBeenNthCalledWith(1, "transcribed text");
+    expect(voice.pi.service.prompt).toHaveBeenNthCalledWith(2, "transcribed text");
+  });
+
   it("rejects unauthorized message senders", async () => {
     const { bot, api } = setupBot();
 
@@ -989,7 +1044,7 @@ describe("createBot", () => {
     await topicOnePending;
   });
 
-  it("switches directly via /sessions <path|id> and shows errors when switching fails", async () => {
+  it("switches directly via /sessions and /switch aliases and shows errors when switching fails", async () => {
     const ok = setupBot();
     await ok.bot.handleUpdate(createTestUpdate({ message: { text: "/sessions /saved/session.jsonl" } }));
     expect(ok.pi.service.resolveSessionReference).toHaveBeenCalledWith("/saved/session.jsonl");
@@ -998,6 +1053,29 @@ describe("createBot", () => {
       "/workspace/A",
     );
     expect(ok.api.sendMessage.mock.calls[0]?.[1]).toContain("Switched session");
+
+    const alias = setupBot();
+    await alias.bot.handleUpdate(createTestUpdate({ message: { text: "/switch /saved/session.jsonl" } }));
+    expect(alias.pi.service.resolveSessionReference).toHaveBeenCalledWith("/saved/session.jsonl");
+    expect(alias.pi.service.switchSession).toHaveBeenCalledWith(
+      "/saved/session.jsonl",
+      "/workspace/A",
+    );
+    expect(alias.api.sendMessage.mock.calls[0]?.[1]).toContain("Switched session");
+
+    const cancelled = setupBot({
+      piSessionOverrides: {
+        switchSession: vi.fn().mockResolvedValue({
+          sessionId: "test-id",
+          sessionFile: "/tmp/test.jsonl",
+          workspace: "/workspace",
+          model: "anthropic/claude-sonnet-4-5",
+          cancelled: true,
+        }),
+      },
+    });
+    await cancelled.bot.handleUpdate(createTestUpdate({ message: { text: "/sessions /saved/session.jsonl" } }));
+    expect(cancelled.api.sendMessage.mock.calls[0]?.[1]).toContain("Session switch was cancelled.");
 
     const byId = setupBot({
       piSessionOverrides: {
@@ -1038,6 +1116,21 @@ describe("createBot", () => {
     expect(ready.pi.service.switchSession).toHaveBeenCalledWith("/s2.jsonl", "/workspace/B");
     expect(ready.api.editMessageText).toHaveBeenCalled();
 
+    const cancelled = setupBot({
+      piSessionOverrides: {
+        switchSession: vi.fn().mockResolvedValue({
+          sessionId: "test-id",
+          sessionFile: "/tmp/test.jsonl",
+          workspace: "/workspace",
+          model: "anthropic/claude-sonnet-4-5",
+          cancelled: true,
+        }),
+      },
+    });
+    await cancelled.bot.handleUpdate(createTestUpdate({ message: { text: "/sessions" } }));
+    await cancelled.bot.handleUpdate(createCallbackUpdate("switch_0"));
+    expect(cancelled.api.editMessageText.mock.calls.at(-1)?.[2]).toContain("Session switch was cancelled.");
+
     const expired = setupBot();
     await expired.bot.handleUpdate(createCallbackUpdate("switch_0"));
     expect(expired.api.answerCallbackQuery).toHaveBeenCalledWith("cb_1", {
@@ -1067,6 +1160,58 @@ describe("createBot", () => {
     await firstPrompt;
   });
 
+  it("surfaces startup diagnostics after successful direct session switches", async () => {
+    const { bot, api } = setupBot({
+      piSessionOverrides: {
+        switchSession: vi.fn().mockResolvedValue({
+          sessionId: "switched-id",
+          sessionFile: "/tmp/switched.jsonl",
+          workspace: "/workspace/B",
+          model: "anthropic/claude-sonnet-4-5",
+          diagnostics: [
+            { type: "error", message: "Extension issue (/ext/rebound.ts): startup failed" },
+          ],
+          cancelled: false,
+        }),
+      },
+    });
+
+    await bot.handleUpdate(createTestUpdate({ message: { text: "/sessions /saved/session.jsonl" } }));
+
+    const startupMessages = api.sendMessage.mock.calls
+      .map((call) => String(call[1]))
+      .filter((text) => text.includes("Session startup issues"));
+    expect(startupMessages).toHaveLength(1);
+    expect(startupMessages[0]).toContain("Extension issue (/ext/rebound.ts): startup failed");
+  });
+
+  it("surfaces startup diagnostics after successful switch callbacks", async () => {
+    const { bot, api } = setupBot({
+      piSessionOverrides: {
+        switchSession: vi.fn().mockResolvedValue({
+          sessionId: "switched-id",
+          sessionFile: "/tmp/switched.jsonl",
+          workspace: "/workspace/B",
+          model: "anthropic/claude-sonnet-4-5",
+          diagnostics: [
+            { type: "error", message: "Prompt issue (/prompts/deploy.md): invalid frontmatter" },
+          ],
+          cancelled: false,
+        }),
+      },
+    });
+
+    await bot.handleUpdate(createTestUpdate({ message: { text: "/sessions" } }));
+    await bot.handleUpdate(createCallbackUpdate("switch_1"));
+
+    expect(api.editMessageText).toHaveBeenCalled();
+    const startupMessages = api.sendMessage.mock.calls
+      .map((call) => String(call[1]))
+      .filter((text) => text.includes("Session startup issues"));
+    expect(startupMessages).toHaveLength(1);
+    expect(startupMessages[0]).toContain("Prompt issue (/prompts/deploy.md): invalid frontmatter");
+  });
+
   it("shows a workspace picker for /new and creates directly when only one workspace exists", async () => {
     const picker = setupBot();
     await picker.bot.handleUpdate(createTestUpdate({ message: { text: "/new" } }));
@@ -1083,6 +1228,34 @@ describe("createBot", () => {
     expect(single.api.sendMessage.mock.calls[0]?.[1]).toContain("New session created.");
   });
 
+  it("surfaces startup diagnostics after successful direct /new session creation", async () => {
+    const { bot, api } = setupBot({
+      piSessionOverrides: {
+        listWorkspaces: vi.fn().mockResolvedValue(["/workspace/A"]),
+        newSession: vi.fn().mockResolvedValue({
+          info: {
+            sessionId: "new-id",
+            sessionFile: "/tmp/new.jsonl",
+            workspace: "/workspace/A",
+            model: "anthropic/claude-sonnet-4-5",
+            diagnostics: [
+              { type: "error", message: "Extension issue (/ext/new.ts): startup failed" },
+            ],
+          },
+          created: true,
+        }),
+      },
+    });
+
+    await bot.handleUpdate(createTestUpdate({ message: { text: "/new" } }));
+
+    const startupMessages = api.sendMessage.mock.calls
+      .map((call) => String(call[1]))
+      .filter((text) => text.includes("Session startup issues"));
+    expect(startupMessages).toHaveLength(1);
+    expect(startupMessages[0]).toContain("Extension issue (/ext/new.ts): startup failed");
+  });
+
   it("handles new workspace selection callbacks", async () => {
     const { bot, pi, api } = setupBot();
 
@@ -1092,6 +1265,35 @@ describe("createBot", () => {
     expect(api.answerCallbackQuery).toHaveBeenCalledWith("cb_1", { text: "Creating session..." });
     expect(pi.service.newSession).toHaveBeenCalledWith("/workspace/B");
     expect(api.editMessageText).toHaveBeenCalled();
+  });
+
+  it("surfaces startup diagnostics after successful workspace-picker session creation", async () => {
+    const { bot, api } = setupBot({
+      piSessionOverrides: {
+        newSession: vi.fn().mockResolvedValue({
+          info: {
+            sessionId: "new-id",
+            sessionFile: "/tmp/new.jsonl",
+            workspace: "/workspace/B",
+            model: "anthropic/claude-sonnet-4-5",
+            diagnostics: [
+              { type: "error", message: "Prompt issue (/prompts/new.md): invalid frontmatter" },
+            ],
+          },
+          created: true,
+        }),
+      },
+    });
+
+    await bot.handleUpdate(createTestUpdate({ message: { text: "/new" } }));
+    await bot.handleUpdate(createCallbackUpdate("newws_1"));
+
+    expect(api.editMessageText).toHaveBeenCalled();
+    const startupMessages = api.sendMessage.mock.calls
+      .map((call) => String(call[1]))
+      .filter((text) => text.includes("Session startup issues"));
+    expect(startupMessages).toHaveLength(1);
+    expect(startupMessages[0]).toContain("Prompt issue (/prompts/new.md): invalid frontmatter");
   });
 
   it("paginates workspace pickers and creates the selected workspace session", async () => {
@@ -1368,6 +1570,7 @@ describe("createBot", () => {
     });
 
     await bot.handleUpdate(createTestUpdate({ message: { text: "/tree" } }));
+    expect(api.sendMessage.mock.calls[0]?.[1]).toContain("Page 1/2");
     expect(getReplyMarkupData(api)).toEqual([
       "tree_nav_root0000",
       "tree_nav_node0002",
@@ -1382,11 +1585,48 @@ describe("createBot", () => {
     ]);
 
     await bot.handleUpdate(createCallbackUpdate("tree_page_1"));
+    expect(api.editMessageText.mock.calls[0]?.[2]).toContain("Page 2/2");
     expect(getEditedReplyMarkupButtons(api).map((button) => button.callback_data)).toEqual([
       "tree_nav_node0007",
       "tree_page_0",
       "noop_page",
       "tree_mode_all",
+      "tree_mode_user",
+    ]);
+  });
+
+  it("keeps the selected tree mode when paging", async () => {
+    const tree = generatePagedTree(8);
+    const { bot, api } = setupBot({
+      piSessionOverrides: {
+        getTree: vi.fn().mockReturnValue(tree),
+        getLeafId: vi.fn().mockReturnValue("node0001"),
+      },
+    });
+
+    await bot.handleUpdate(createTestUpdate({ message: { text: "/tree all" } }));
+    expect(api.sendMessage.mock.calls[0]?.[1]).toContain("Filter: all entries with navigation buttons.");
+    expect(getReplyMarkupData(api)).toEqual([
+      "tree_nav_root0000",
+      "tree_nav_node0001",
+      "tree_nav_node0002",
+      "tree_nav_node0003",
+      "tree_nav_node0004",
+      "tree_nav_node0005",
+      "noop_page",
+      "tree_page_1",
+      "tree_mode_default",
+      "tree_mode_user",
+    ]);
+
+    await bot.handleUpdate(createCallbackUpdate("tree_page_1"));
+    expect(api.editMessageText.mock.calls[0]?.[2]).toContain("Filter: all entries with navigation buttons.");
+    expect(getEditedReplyMarkupButtons(api).map((button) => button.callback_data)).toEqual([
+      "tree_nav_node0006",
+      "tree_nav_node0007",
+      "tree_page_0",
+      "noop_page",
+      "tree_mode_default",
       "tree_mode_user",
     ]);
   });
@@ -1511,8 +1751,16 @@ describe("createBot", () => {
     expect(cancel.api.editMessageText.mock.calls[0]?.[2]).toContain("Navigation cancelled.");
 
     const mode = setupBot();
+    await mode.bot.handleUpdate(createTestUpdate({ message: { text: "/tree" } }));
+    mode.api.editMessageText.mockClear();
     await mode.bot.handleUpdate(createCallbackUpdate("tree_mode_user"));
     expect(mode.api.editMessageText.mock.calls[0]?.[2]).toContain("Filter: user messages only.");
+
+    const modeExpired = setupBot();
+    await modeExpired.bot.handleUpdate(createCallbackUpdate("tree_mode_user"));
+    expect(modeExpired.api.answerCallbackQuery).toHaveBeenCalledWith("cb_1", {
+      text: "Expired, run /tree again",
+    });
   });
 
   it("processes plain text messages and subscribes to Pi events", async () => {
@@ -1555,6 +1803,83 @@ describe("createBot", () => {
 
     expect(pi.service.listSlashCommands).toHaveBeenCalledTimes(1);
     expect(pi.service.prompt).toHaveBeenCalledWith("/compact focus recent work");
+  });
+
+  it("bridges /cron status through TelePi and surfaces the extension notification", async () => {
+    const { bot, pi, api } = setupBot({
+      piSessionOverrides: {
+        listSlashCommands: vi.fn().mockResolvedValue([
+          { name: "cron", description: "Manage PiCron schedules", source: "extension", path: "/ext/picron.ts" },
+        ]),
+      },
+    });
+
+    const promptMock = pi.service.prompt as ReturnType<typeof vi.fn>;
+    promptMock.mockImplementation(async () => {
+      pi.getExtensionBindings()?.uiContext?.notify("Daemon: running\nSchedules: 1\nEnabled: 1\nNext due: 2026-01-01T09:00:00.000Z", "info");
+      pi.emitAgentEnd();
+    });
+
+    await bot.handleUpdate(createTestUpdate({ message: { text: "/cron status" } }));
+    await nextTick();
+
+    expect(pi.service.prompt).toHaveBeenCalledWith("/cron status");
+    expect(api.sendMessage.mock.calls.some((call) => String(call[1]).includes("Daemon: running"))).toBe(true);
+    expect(api.sendMessage.mock.calls.some((call) => String(call[1]).includes("Schedules: 1"))).toBe(true);
+  });
+
+  it("drives a /cron add style multi-step extension dialog flow through TelePi replies", async () => {
+    const { bot, pi, api } = setupBot({
+      piSessionOverrides: {
+        listSlashCommands: vi.fn().mockResolvedValue([
+          { name: "cron", description: "Manage PiCron schedules", source: "extension", path: "/ext/picron.ts" },
+        ]),
+      },
+    });
+
+    const promptMock = pi.service.prompt as ReturnType<typeof vi.fn>;
+    promptMock.mockImplementation(async () => {
+      const ui = pi.getExtensionBindings()?.uiContext;
+      const name = await ui?.input("Schedule name", "Daily review");
+      const cron = await ui?.input("Cron expression", "0 9 * * *");
+      const timezone = await ui?.input("Timezone", "UTC");
+      const prompt = await ui?.input("Prompt", "Review the repo");
+      const cwd = await ui?.input("Target cwd (optional)", "/workspace/current");
+      const sessionFile = await ui?.input("Target session file (optional)", "session.jsonl");
+      ui?.notify(`Created schedule ${name} (${cron}, ${timezone}, ${prompt}, ${cwd}, ${sessionFile}).`, "info");
+      pi.emitAgentEnd();
+    });
+
+    const pending = bot.handleUpdate(createTestUpdate({ message: { text: "/cron add" } }));
+    await nextTick();
+
+    expect(api.sendMessage.mock.calls.some((call) => String(call[1]).includes("Schedule name"))).toBe(true);
+
+    await bot.handleUpdate(createTestUpdate({ message: { text: "Daily review" } }));
+    await nextTick();
+    expect(api.sendMessage.mock.calls.some((call) => String(call[1]).includes("Cron expression"))).toBe(true);
+
+    await bot.handleUpdate(createTestUpdate({ message: { text: "0 9 * * *" } }));
+    await nextTick();
+    expect(api.sendMessage.mock.calls.some((call) => String(call[1]).includes("Timezone"))).toBe(true);
+
+    await bot.handleUpdate(createTestUpdate({ message: { text: "UTC" } }));
+    await nextTick();
+    expect(api.sendMessage.mock.calls.some((call) => String(call[1]).includes("Prompt"))).toBe(true);
+
+    await bot.handleUpdate(createTestUpdate({ message: { text: "Review the repo" } }));
+    await nextTick();
+    expect(api.sendMessage.mock.calls.some((call) => String(call[1]).includes("Target cwd (optional)"))).toBe(true);
+
+    await bot.handleUpdate(createTestUpdate({ message: { text: "/workspace/current" } }));
+    await nextTick();
+    expect(api.sendMessage.mock.calls.some((call) => String(call[1]).includes("Target session file (optional)"))).toBe(true);
+
+    await bot.handleUpdate(createTestUpdate({ message: { text: "session.jsonl" } }));
+    await pending;
+
+    expect(pi.service.prompt).toHaveBeenCalledWith("/cron add");
+    expect(api.sendMessage.mock.calls.some((call) => String(call[1]).includes("Created schedule Daily review"))).toBe(true);
   });
 
   it("normalizes bot-addressed Pi slash commands before bridging them", async () => {
@@ -1675,6 +2000,52 @@ describe("createBot", () => {
     expect(pi.service.prompt).toHaveBeenCalledWith("/compact");
   });
 
+  it("shows prompt argument hints in /commands without changing Pi command dispatch", async () => {
+    const tempDir = mkdtempSync(path.join(tmpdir(), "telepi-command-picker-"));
+    const promptPath = path.join(tempDir, "review.md");
+    writeFileSync(
+      promptPath,
+      [
+        "---",
+        "description: Review staged changes",
+        'argument-hint: "<PR-URL>"',
+        "---",
+        "Review changes.",
+        "",
+      ].join("\n"),
+    );
+
+    try {
+      const { bot, pi, api } = setupBot({
+        piSessionOverrides: {
+          listSlashCommands: vi.fn().mockResolvedValue([
+            {
+              name: "review",
+              description: "Review staged changes",
+              source: "prompt",
+              sourceInfo: { path: promptPath, source: "local", scope: "project", origin: "top-level" },
+            },
+          ]),
+        },
+      });
+
+      await bot.handleUpdate(createTestUpdate({ message: { text: "/commands" } }));
+      await bot.handleUpdate(createCallbackUpdate("cmd_filter_pi"));
+
+      expect(String(api.editMessageText.mock.calls[0]?.[2])).toContain("/review &lt;PR-URL&gt;");
+      expect(getEditedReplyMarkupTexts(api, 0)).toContain("📝 /review <PR-URL>");
+
+      const reviewButton = getEditedReplyMarkupButtons(api, 0).find((button) => button.text.includes("/review <PR-URL>"));
+      expect(reviewButton).toBeDefined();
+
+      await bot.handleUpdate(createCallbackUpdate(reviewButton!.callback_data));
+
+      expect(pi.service.prompt).toHaveBeenCalledWith("/review");
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
   it("keeps the /commands picker active when a Pi command is tapped while busy", async () => {
     const { bot, pi, api } = setupBot({
       piSessionOverrides: {
@@ -1783,6 +2154,50 @@ describe("createBot", () => {
     expect(api.setMyCommands).toHaveBeenCalledTimes(2);
     expect(getSetMyCommandsCall(api, 0)?.commands.some((command) => command.command === "compact")).toBe(true);
     expect(getSetMyCommandsCall(api, 1)?.commands.some((command) => command.command === "compact")).toBe(false);
+  });
+
+  it("forwards runtime-backed new-session options from extension command actions", async () => {
+    const { bot, pi } = setupBot();
+
+    const promptMock = pi.service.prompt as ReturnType<typeof vi.fn>;
+    promptMock.mockImplementation(async () => {
+      await pi.getExtensionBindings()?.commandContextActions?.newSession({
+        parentSession: "/tmp/handoff-parent.jsonl",
+      });
+      pi.emitAgentEnd();
+    });
+
+    await bot.handleUpdate(createTestUpdate({ message: { text: "prepare a handoff" } }));
+
+    expect(pi.service.newSession).toHaveBeenCalledWith({
+      parentSession: "/tmp/handoff-parent.jsonl",
+    });
+  });
+
+  it("bubbles cancelled switch-session results from extension command actions", async () => {
+    const { bot, pi } = setupBot({
+      piSessionOverrides: {
+        switchSession: vi.fn().mockResolvedValue({
+          sessionId: "test-id",
+          sessionFile: "/tmp/test.jsonl",
+          workspace: "/workspace",
+          model: "anthropic/claude-sonnet-4-5",
+          cancelled: true,
+        }),
+      },
+    });
+    let switchResult: { cancelled: boolean } | undefined;
+
+    const promptMock = pi.service.prompt as ReturnType<typeof vi.fn>;
+    promptMock.mockImplementation(async () => {
+      switchResult = await pi.getExtensionBindings()?.commandContextActions?.switchSession("/tmp/other.jsonl");
+      pi.emitAgentEnd();
+    });
+
+    await bot.handleUpdate(createTestUpdate({ message: { text: "switch from extension" } }));
+
+    expect(pi.service.switchSession).toHaveBeenCalledWith("/tmp/other.jsonl");
+    expect(switchResult).toEqual({ cancelled: true });
   });
 
   it("surfaces extension command notifications in Telegram", async () => {
@@ -1918,6 +2333,90 @@ describe("createBot", () => {
     expect(api.sendMessage.mock.calls.some((call) => String(call[1]).includes("hello Bene"))).toBe(true);
   });
 
+  it("times out pending extension dialogs and finalizes them in Telegram", async () => {
+    const { bot, pi, api } = setupBot({
+      piSessionOverrides: {
+        listSlashCommands: vi.fn().mockResolvedValue([
+          { name: "pick", description: "Pick an option", source: "extension", path: "/ext/pick.ts" },
+        ]),
+      },
+    });
+
+    const promptMock = pi.service.prompt as ReturnType<typeof vi.fn>;
+    promptMock.mockImplementation(async () => {
+      const choice = await pi.getExtensionBindings()?.uiContext?.select("Pick one", ["Alpha", "Beta"], { timeout: 5 });
+      pi.emitTextDelta(`picked ${choice}`);
+      pi.emitAgentEnd();
+    });
+
+    const pending = bot.handleUpdate(createTestUpdate({ message: { text: "/pick" } }));
+    await nextTick();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await pending;
+
+    expect(api.editMessageText.mock.calls.some((call) => String(call[2]).includes("Dialog timed out."))).toBe(true);
+    expect(api.sendMessage.mock.calls.some((call) => String(call[1]).includes("picked undefined"))).toBe(true);
+  });
+
+  it("cancels pending extension dialogs via /abort and still aborts the session", async () => {
+    const { bot, pi, api } = setupBot({
+      piSessionOverrides: {
+        listSlashCommands: vi.fn().mockResolvedValue([
+          { name: "confirm", description: "Confirm action", source: "extension", path: "/ext/confirm.ts" },
+        ]),
+      },
+    });
+
+    const promptMock = pi.service.prompt as ReturnType<typeof vi.fn>;
+    promptMock.mockImplementation(async () => {
+      const confirmed = await pi.getExtensionBindings()?.uiContext?.confirm("Confirm deploy", "Ship it?");
+      pi.emitTextDelta(`confirmed ${confirmed}`);
+      pi.emitAgentEnd();
+    });
+
+    const pending = bot.handleUpdate(createTestUpdate({ message: { text: "/confirm" } }));
+    await nextTick();
+    await bot.handleUpdate(createTestUpdate({ message: { text: "/abort" } }));
+    await pending;
+
+    expect(pi.service.abort).toHaveBeenCalledTimes(1);
+    expect(api.editMessageText.mock.calls.some((call) => String(call[2]).includes("Dialog cancelled."))).toBe(true);
+    expect(api.sendMessage.mock.calls.some((call) => String(call[1]).includes("confirmed false"))).toBe(true);
+  });
+
+  it("blocks voice messages while an extension input dialog is pending", async () => {
+    const { bot, pi, api } = setupBot({
+      piSessionOverrides: {
+        listSlashCommands: vi.fn().mockResolvedValue([
+          { name: "ask", description: "Ask for input", source: "extension", path: "/ext/ask.ts" },
+        ]),
+      },
+    });
+
+    let resolveInput!: (value: void | PromiseLike<void>) => void;
+    const promptMock = pi.service.prompt as ReturnType<typeof vi.fn>;
+    promptMock.mockImplementation(async () => {
+      await new Promise<void>(async (resolve) => {
+        resolveInput = resolve;
+        const value = await pi.getExtensionBindings()?.uiContext?.input("Name", "Your name");
+        pi.emitTextDelta(`hello ${value}`);
+        pi.emitAgentEnd();
+        resolve();
+      });
+    });
+
+    const pending = bot.handleUpdate(createTestUpdate({ message: { text: "/ask" } }));
+    await nextTick();
+    await bot.handleUpdate(createVoiceUpdate());
+
+    expect(api.sendMessage.mock.calls.at(-1)?.[1]).toContain("Please answer the pending prompt above or use /abort.");
+    expect(transcribeAudio).not.toHaveBeenCalled();
+
+    await bot.handleUpdate(createTestUpdate({ message: { text: "Bene" } }));
+    resolveInput();
+    await pending;
+  });
+
   it("transcribes voice messages and feeds the transcript into the prompt flow", async () => {
     const { bot, pi, api } = setupBot();
     const promptMock = pi.service.prompt as ReturnType<typeof vi.fn>;
@@ -2045,12 +2544,12 @@ describe("createBot", () => {
   });
 
   it("blocks commands while switching sessions", async () => {
-    let resolveSwitch!: (info: PiSessionInfo) => void;
+    let resolveSwitch!: (info: SwitchResult) => void;
     const { bot, api } = setupBot({
       piSessionOverrides: {
         switchSession: vi.fn().mockImplementation(
           () =>
-            new Promise<PiSessionInfo>((resolve) => {
+            new Promise<SwitchResult>((resolve) => {
               resolveSwitch = resolve;
             }),
         ),
@@ -2070,6 +2569,7 @@ describe("createBot", () => {
       sessionFile: "/tmp/switched.jsonl",
       workspace: "/other",
       model: "anthropic/claude-sonnet-4-5",
+      cancelled: false,
     });
     await switching;
   });
@@ -2103,6 +2603,134 @@ describe("createBot", () => {
 
     resolvePrompt();
     await pending;
+  });
+
+  it("surfaces startup error diagnostics once before the first prompt in a fresh context", async () => {
+    const topicKey = makeContextKey(ALLOWED_CHAT_ID, 909);
+    let registryRef: ReturnType<typeof createMockPiSessionRegistry> | undefined;
+    const prompt = vi.fn().mockImplementation(async () => {
+      const topicSession = registryRef?.getSession(ALLOWED_CHAT_ID, 909);
+      topicSession?.emitTextDelta("Fresh context response");
+      topicSession?.emitAgentEnd();
+    });
+    const harness = setupBot({
+      perContextSessionOverrides: {
+        [topicKey]: {
+          getInfo: vi.fn().mockReturnValue({
+            sessionId: "diagnostic-session",
+            sessionFile: "/tmp/diagnostic.jsonl",
+            workspace: "/workspace",
+            model: "anthropic/claude-sonnet-4-5",
+            diagnostics: [
+              { type: "error", message: 'Failed to load extension "/ext/bad.ts": boom' },
+              { type: "warning", message: "Theme issue (/themes/missing.json): theme path does not exist" },
+            ],
+          }),
+          prompt,
+        },
+      },
+    });
+    registryRef = harness.registry;
+    const { bot, api } = harness;
+
+    await bot.handleUpdate(createTestUpdate({
+      message: {
+        text: "first prompt",
+        chat: { id: ALLOWED_CHAT_ID, type: "supergroup" },
+        message_thread_id: 909,
+      },
+    }));
+    await bot.handleUpdate(createTestUpdate({
+      message: {
+        text: "second prompt",
+        chat: { id: ALLOWED_CHAT_ID, type: "supergroup" },
+        message_thread_id: 909,
+      },
+    }));
+
+    const startupMessages = api.sendMessage.mock.calls
+      .map((call) => String(call[1]))
+      .filter((text) => text.includes("Session startup issues"));
+    expect(startupMessages).toHaveLength(1);
+    expect(startupMessages[0]).toContain('Failed to load extension "/ext/bad.ts": boom');
+    expect(startupMessages[0]).not.toContain("Theme issue");
+  });
+
+  it("surfaces startup error diagnostics when /model creates a fresh session context", async () => {
+    const topicKey = makeContextKey(ALLOWED_CHAT_ID, 910);
+    const { bot, api } = setupBot({
+      perContextSessionOverrides: {
+        [topicKey]: {
+          getInfo: vi.fn().mockReturnValue({
+            sessionId: "model-diagnostic-session",
+            sessionFile: "/tmp/model-diagnostic.jsonl",
+            workspace: "/workspace",
+            model: "anthropic/claude-sonnet-4-5",
+            diagnostics: [
+              { type: "error", message: "Prompt issue (/prompts/deploy.md): invalid frontmatter" },
+            ],
+          }),
+        },
+      },
+    });
+
+    await bot.handleUpdate(createTestUpdate({
+      message: {
+        text: "/model",
+        chat: { id: ALLOWED_CHAT_ID, type: "supergroup" },
+        message_thread_id: 910,
+      },
+    }));
+
+    expect(api.sendMessage.mock.calls.some((call) => String(call[1]).includes("Session startup issues"))).toBe(true);
+    expect(api.sendMessage.mock.calls.some((call) => String(call[1]).includes("Prompt issue (/prompts/deploy.md): invalid frontmatter"))).toBe(true);
+    expect(api.sendMessage.mock.calls.some((call) => String(call[1]).includes("Select a model"))).toBe(true);
+  });
+
+  it("re-surfaces startup diagnostics after /handback tears down the context", async () => {
+    const topicKey = makeContextKey(ALLOWED_CHAT_ID, 911);
+    let registryRef: ReturnType<typeof createMockPiSessionRegistry> | undefined;
+    const prompt = vi.fn().mockImplementation(async () => {
+      const session = registryRef?.getSession(ALLOWED_CHAT_ID, 911);
+      session?.emitTextDelta("Context rebuilt response");
+      session?.emitAgentEnd();
+    });
+    const harness = setupBot({
+      perContextSessionOverrides: {
+        [topicKey]: {
+          getInfo: vi.fn().mockReturnValue({
+            sessionId: "reused-diagnostic-session",
+            sessionFile: "/tmp/reused-diagnostic.jsonl",
+            workspace: "/workspace",
+            model: "anthropic/claude-sonnet-4-5",
+            diagnostics: [
+              { type: "error", message: "Extension issue (/ext/reload.ts): startup failed" },
+            ],
+          }),
+          prompt,
+        },
+      },
+    });
+    registryRef = harness.registry;
+    const { bot, api } = harness;
+    const topicMessage = (text: string) => createTestUpdate({
+      message: {
+        text,
+        chat: { id: ALLOWED_CHAT_ID, type: "supergroup" },
+        message_thread_id: 911,
+      },
+    });
+
+    await bot.handleUpdate(topicMessage("first prompt"));
+    await bot.handleUpdate(topicMessage("/handback"));
+    await bot.handleUpdate(topicMessage("second prompt"));
+
+    const startupMessages = api.sendMessage.mock.calls
+      .map((call) => String(call[1]))
+      .filter((text) => text.includes("Session startup issues"));
+    expect(startupMessages).toHaveLength(2);
+    expect(startupMessages[0]).toContain("Extension issue (/ext/reload.ts): startup failed");
+    expect(startupMessages[1]).toContain("Extension issue (/ext/reload.ts): startup failed");
   });
 
   it("covers additional command edge cases", async () => {
@@ -2139,6 +2767,20 @@ describe("createBot", () => {
     });
     await failedNew.bot.handleUpdate(createTestUpdate({ message: { text: "/new" } }));
     expect(failedNew.api.sendMessage.mock.calls[0]?.[1]).toContain("new failed");
+
+    const sameWorkspaceNewUnavailable = setupBot({
+      piSessionOverrides: {
+        listWorkspaces: vi.fn().mockResolvedValue(["/workspace/A"]),
+        newSession: vi.fn().mockRejectedValue(
+          new Error("Starting a fresh session in the current workspace isn't available in this TelePi version yet."),
+        ),
+      },
+    });
+    await sameWorkspaceNewUnavailable.bot.handleUpdate(createTestUpdate({ message: { text: "/new" } }));
+    expect(sameWorkspaceNewUnavailable.api.sendMessage.mock.calls[0]?.[1]).toContain(
+      "Starting a fresh session in the current workspace isn't available in this TelePi version yet.",
+    );
+    expect(sameWorkspaceNewUnavailable.api.sendMessage.mock.calls[0]?.[1]).not.toContain("AgentSessionRuntime migration");
 
     const failedModelBootstrap = setupBot({
       piSessionOverrides: {
@@ -2456,12 +3098,12 @@ describe("createBot", () => {
   });
 
   it("blocks text messages when isSwitching is active", async () => {
-    let resolveSwitch!: (info: PiSessionInfo) => void;
+    let resolveSwitch!: (info: SwitchResult) => void;
     const { bot, api } = setupBot({
       piSessionOverrides: {
         switchSession: vi.fn().mockImplementation(
           () =>
-            new Promise<PiSessionInfo>((resolve) => {
+            new Promise<SwitchResult>((resolve) => {
               resolveSwitch = resolve;
             }),
         ),
@@ -2481,6 +3123,7 @@ describe("createBot", () => {
       sessionFile: "/tmp/switched.jsonl",
       workspace: "/other",
       model: "anthropic/claude-sonnet-4-5",
+      cancelled: false,
     });
     await switching;
   });

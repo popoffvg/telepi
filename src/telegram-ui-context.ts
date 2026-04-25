@@ -2,6 +2,53 @@ import type { ExtensionUIContext } from "@mariozechner/pi-coding-agent";
 
 export type TelegramExtensionNoticeType = "info" | "warning" | "error";
 
+type TelegramThemeShim = Pick<
+  ExtensionUIContext["theme"],
+  | "fg"
+  | "bg"
+  | "bold"
+  | "italic"
+  | "underline"
+  | "inverse"
+  | "strikethrough"
+  | "getFgAnsi"
+  | "getBgAnsi"
+  | "getColorMode"
+  | "getThinkingBorderColor"
+  | "getBashModeBorderColor"
+>;
+
+const passthroughText = (text: string): string => text;
+
+const plainTextTheme: TelegramThemeShim = {
+  fg(_color, text) {
+    return text;
+  },
+  bg(_color, text) {
+    return text;
+  },
+  bold: passthroughText,
+  italic: passthroughText,
+  underline: passthroughText,
+  inverse: passthroughText,
+  strikethrough: passthroughText,
+  getFgAnsi() {
+    return "";
+  },
+  getBgAnsi() {
+    return "";
+  },
+  getColorMode() {
+    return "truecolor";
+  },
+  getThinkingBorderColor() {
+    return passthroughText;
+  },
+  getBashModeBorderColor() {
+    return passthroughText;
+  },
+};
+
 export interface CreateTelegramUIContextOptions {
   notify: (message: string, type?: TelegramExtensionNoticeType) => void;
   select?: (title: string, options: string[], dialogOptions?: { signal?: AbortSignal; timeout?: number }) => Promise<string | undefined>;
@@ -41,6 +88,7 @@ export function createTelegramUIContext(options: CreateTelegramUIContextOptions)
     },
     setStatus() {},
     setWorkingMessage() {},
+    setHiddenThinkingLabel() {},
     setWidget() {},
     setFooter() {},
     setHeader() {},
@@ -57,7 +105,9 @@ export function createTelegramUIContext(options: CreateTelegramUIContextOptions)
       unsupported("editor");
     },
     setEditorComponent() {},
-    theme: {} as any,
+    // Pi exposes ctx.ui.theme in degraded UI modes like RPC. TelePi does not render ANSI,
+    // so we provide a plain-text shim instead of the interactive terminal Theme instance.
+    theme: plainTextTheme as unknown as ExtensionUIContext["theme"],
     getAllThemes() {
       return [];
     },

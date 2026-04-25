@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -302,6 +302,38 @@ describe("install helpers", () => {
     expect(status.resolvedConfigPath).toBe(context.configPath);
     expect(status.configExists).toBe(true);
     expect(status.configSource).toBe("launchd-env");
+  });
+
+  it("reports the installed extension as a symlink when it points to the package source", () => {
+    const cliModuleUrl = pathToFileURL(path.join(packageRoot, "dist", "cli.js")).href;
+    const context = resolveTelePiInstallContext(cliModuleUrl);
+
+    mkdirSync(path.dirname(context.extensionDestinationPath), { recursive: true });
+    symlinkSync(context.extensionSourcePath, context.extensionDestinationPath);
+
+    const status = getTelePiStatus(cliModuleUrl);
+
+    expect(status.extension.exists).toBe(true);
+    expect(status.extension.mode).toBe("symlink");
+    expect(status.extension.targetPath).toBe(context.extensionSourcePath);
+  });
+
+  it("reports the installed extension as a copy when the destination matches the source file", () => {
+    const cliModuleUrl = pathToFileURL(path.join(packageRoot, "dist", "cli.js")).href;
+    const context = resolveTelePiInstallContext(cliModuleUrl);
+
+    mkdirSync(path.dirname(context.extensionDestinationPath), { recursive: true });
+    writeFileSync(
+      context.extensionDestinationPath,
+      readFileSync(context.extensionSourcePath, "utf8"),
+      "utf8",
+    );
+
+    const status = getTelePiStatus(cliModuleUrl);
+
+    expect(status.extension.exists).toBe(true);
+    expect(status.extension.mode).toBe("copy");
+    expect(status.extension.targetPath).toBeUndefined();
   });
 
   it("requires dist/cli.js before telepi setup when invoked from src/cli.ts", async () => {

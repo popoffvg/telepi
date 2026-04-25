@@ -13,41 +13,89 @@ const mockState = vi.hoisted(() => {
   ];
 
   let sessionCounter = 0;
+  let runtimeCounter = 0;
+  let sessionFileCounter = 0;
   const createdSessions: Array<{ session: any; options: any }> = [];
+  const createdRuntimes: Array<{ runtime: any; options: any }> = [];
   const modelRegistryInstances: any[] = [];
   const sessionSubscribers = new WeakMap<object, (event: any) => void>();
+  const sessionPathWorkspaces = new Map<string, string>();
+  const resolvedSessionPaths = new Map<string, string>();
   let slashCommands = [
     { name: "deploy", description: "Deploy app", source: "extension", path: "/ext/deploy.ts" },
     { name: "review", description: "Review staged changes", source: "prompt", path: "/prompts/review.md" },
   ];
 
-  const defaultSessions = () => [
-    {
-      id: "s2",
-      firstMessage: "World",
-      path: "/sessions/s2.jsonl",
-      messageCount: 3,
-      cwd: "/workspace/projectB",
-      modified: new Date("2025-01-01T00:00:00.000Z"),
-      name: "Second",
-    },
-    {
-      id: "s1",
-      firstMessage: "Hello",
-      path: "/sessions/s1.jsonl",
-      messageCount: 5,
-      cwd: "/workspace/projectA",
-      modified: new Date("2025-01-02T00:00:00.000Z"),
-      name: "First",
-    },
-  ];
+  const defaultSessions = () => {
+    const sessions = [
+      {
+        id: "s2",
+        firstMessage: "World",
+        path: "/sessions/s2.jsonl",
+        messageCount: 3,
+        cwd: "/workspace/projectB",
+        modified: new Date("2025-01-01T00:00:00.000Z"),
+        name: "Second",
+      },
+      {
+        id: "s1",
+        firstMessage: "Hello",
+        path: "/sessions/s1.jsonl",
+        messageCount: 5,
+        cwd: "/workspace/projectA",
+        modified: new Date("2025-01-02T00:00:00.000Z"),
+        name: "First",
+      },
+    ];
+
+    for (const session of sessions) {
+      sessionPathWorkspaces.set(session.path, session.cwd);
+    }
+
+    return sessions;
+  };
+
+  const createSessionManagerInstance = (workspace: string, sessionDir = "/sessions") => {
+    const manager: any = {
+      kind: "create",
+      workspace,
+      sessionDir,
+      sessionPath: undefined,
+      parentSession: undefined,
+      setSessionFile: vi.fn().mockImplementation((sessionPath: string) => {
+        manager.sessionPath = sessionPath;
+        sessionPathWorkspaces.set(sessionPath, workspace);
+      }),
+      newSession: vi.fn().mockImplementation((options?: { id?: string; parentSession?: string }) => {
+        manager.parentSession = options?.parentSession;
+        manager.sessionPath = path.join(sessionDir, `${options?.id ?? `generated-${++sessionFileCounter}`}.jsonl`);
+        sessionPathWorkspaces.set(manager.sessionPath, workspace);
+        return manager.sessionPath;
+      }),
+      getSessionFile: vi.fn().mockImplementation(() => manager.sessionPath),
+      getSessionDir: vi.fn().mockImplementation(() => manager.sessionDir),
+      getCwd: vi.fn().mockImplementation(() => manager.workspace),
+      getSessionId: vi.fn().mockImplementation(() => {
+        const sessionFile = manager.sessionPath;
+        return sessionFile ? path.basename(sessionFile, ".jsonl") : `manager-${sessionCounter + 1}`;
+      }),
+      isPersisted: vi.fn().mockImplementation(() => Boolean(manager.sessionPath)),
+      buildSessionContext: vi.fn().mockReturnValue({ messages: [] }),
+    };
+    return manager;
+  };
 
   const createSession = (options: Record<string, unknown> = {}) => {
     sessionCounter += 1;
 
+    const bashExecute = vi.fn();
+    const sessionManager = options.sessionManager as any ?? createSessionManagerInstance(
+      (options.cwd as string | undefined) ?? "/workspace/base",
+    );
+
     const session: any = {
       sessionId: options.sessionId ?? `session-${sessionCounter}`,
-      sessionFile: options.sessionFile ?? `/tmp/session-${sessionCounter}.jsonl`,
+      sessionFile: options.sessionFile ?? sessionManager.getSessionFile?.() ?? `/tmp/session-${sessionCounter}.jsonl`,
       sessionName: options.sessionName,
       model: options.model ?? models[0],
       thinkingLevel: options.thinkingLevel ?? "medium",
@@ -55,23 +103,26 @@ const mockState = vi.hoisted(() => {
       isStreaming: false,
       agent: {
         state: {
+          messages: [],
           tools: [
             { name: "read", description: "Read files", execute: vi.fn() },
-            { name: "bash", description: "Execute bash", execute: vi.fn(), label: "bash", parameters: {} },
+            { name: "bash", description: "Execute bash", execute: bashExecute, label: "bash", parameters: {} },
             { name: "edit", description: "Edit files", execute: vi.fn() },
             { name: "write", description: "Write files", execute: vi.fn() },
           ],
         },
-        setTools: vi.fn(),
       },
       prompt: vi.fn().mockResolvedValue(undefined),
       bindExtensions: vi.fn().mockResolvedValue(undefined),
       abort: vi.fn().mockResolvedValue(undefined),
-      newSession: vi.fn().mockResolvedValue(true),
-      fork: vi.fn().mockResolvedValue({ cancelled: false, selectedText: "" }),
       reload: vi.fn().mockResolvedValue(undefined),
       navigateTree: vi.fn().mockResolvedValue({ cancelled: false }),
+      extensionRunner: {
+        getCommands: vi.fn().mockImplementation(() => slashCommands),
+        hasHandlers: vi.fn().mockReturnValue(false),
+      },
       sessionManager: {
+        ...sessionManager,
         getTree: vi.fn().mockReturnValue([]),
         getLeafId: vi.fn().mockReturnValue("leaf-id"),
         getEntry: vi.fn().mockImplementation((id: string) =>
@@ -105,16 +156,18 @@ const mockState = vi.hoisted(() => {
       dispose: vi.fn(),
     };
 
-    createdSessions.push({ session, options });
+    createdSessions.push({ session, options: { ...options, bashExecute } });
     return session;
   };
 
   const createAgentSession = vi.fn().mockImplementation(async (options: any) => ({
     session: createSession({
+      cwd: options.services.cwd,
       model: options.model,
       thinkingLevel: options.thinkingLevel,
       scopedModels: options.scopedModels,
-      sessionFile: options.sessionManager?.sessionPath,
+      sessionManager: options.sessionManager,
+      sessionFile: options.sessionManager?.getSessionFile?.(),
     }),
     extensionsResult: {
       runtime: {
@@ -124,37 +177,138 @@ const mockState = vi.hoisted(() => {
     modelFallbackMessage: options.model ? undefined : "fallback-model",
   }));
 
+  const createAgentSessionServices = vi.fn().mockImplementation(async (options: any) => ({
+    cwd: options.cwd,
+    agentDir: options.agentDir ?? "/mock-agent",
+    authStorage: options.authStorage ?? { kind: "auth-storage" },
+    settingsManager: options.settingsManager,
+    modelRegistry: options.modelRegistry,
+    resourceLoader: { kind: "resource-loader", cwd: options.cwd },
+    diagnostics: [],
+  }));
+
+  const createAgentSessionRuntime = vi.fn().mockImplementation(async (factory: any, options: any) => {
+    runtimeCounter += 1;
+
+    let result = await factory(options);
+    let currentSession = result.session;
+    let currentServices = result.services;
+    let currentDiagnostics = result.diagnostics;
+    let currentFallbackMessage = result.modelFallbackMessage;
+
+    const runtime: any = {
+      id: `runtime-${runtimeCounter}`,
+      get session() {
+        return currentSession;
+      },
+      get services() {
+        return currentServices;
+      },
+      get cwd() {
+        return currentServices.cwd;
+      },
+      get diagnostics() {
+        return currentDiagnostics;
+      },
+      get modelFallbackMessage() {
+        return currentFallbackMessage;
+      },
+      newSession: vi.fn().mockImplementation(async (runtimeOptions?: any) => {
+        const sessionDir = currentSession.sessionManager.getSessionDir();
+        const sessionManager = SessionManager.create(currentServices.cwd, sessionDir);
+        if (runtimeOptions?.parentSession) {
+          sessionManager.newSession({ parentSession: runtimeOptions.parentSession });
+        }
+        const nextResult = await factory({
+          cwd: currentServices.cwd,
+          agentDir: currentServices.agentDir,
+          sessionManager,
+          sessionStartEvent: { type: "session_start", reason: "new", previousSessionFile: currentSession.sessionFile },
+        });
+        currentSession.dispose();
+        currentSession = nextResult.session;
+        currentServices = nextResult.services;
+        currentDiagnostics = nextResult.diagnostics;
+        currentFallbackMessage = nextResult.modelFallbackMessage;
+        if (runtimeOptions?.setup) {
+          await runtimeOptions.setup(currentSession.sessionManager);
+          currentSession.agent.state.messages = currentSession.sessionManager.buildSessionContext().messages;
+        }
+        return { cancelled: false };
+      }),
+      switchSession: vi.fn().mockImplementation(async (sessionPath: string, cwdOverride?: string) => {
+        const sessionManager = SessionManager.open(sessionPath, undefined, cwdOverride);
+        const nextResult = await factory({
+          cwd: sessionManager.getCwd(),
+          agentDir: currentServices.agentDir,
+          sessionManager,
+          sessionStartEvent: { type: "session_start", reason: "resume", previousSessionFile: currentSession.sessionFile },
+        });
+        currentSession.dispose();
+        currentSession = nextResult.session;
+        currentServices = nextResult.services;
+        currentDiagnostics = nextResult.diagnostics;
+        currentFallbackMessage = nextResult.modelFallbackMessage;
+        return { cancelled: false };
+      }),
+      fork: vi.fn().mockImplementation(async (_entryId: string) => {
+        const sessionManager = SessionManager.create(currentServices.cwd, currentSession.sessionManager.getSessionDir());
+        sessionManager.newSession({ parentSession: currentSession.sessionFile });
+        const nextResult = await factory({
+          cwd: currentServices.cwd,
+          agentDir: currentServices.agentDir,
+          sessionManager,
+          sessionStartEvent: { type: "session_start", reason: "fork", previousSessionFile: currentSession.sessionFile },
+        });
+        currentSession.dispose();
+        currentSession = nextResult.session;
+        currentServices = nextResult.services;
+        currentDiagnostics = nextResult.diagnostics;
+        currentFallbackMessage = nextResult.modelFallbackMessage;
+        return { cancelled: false, selectedText: "Known entry" };
+      }),
+      dispose: vi.fn().mockImplementation(async () => {
+        currentSession.dispose();
+      }),
+    };
+
+    createdRuntimes.push({ runtime, options });
+    return runtime;
+  });
+
   const createCodingTools = vi.fn().mockReturnValue(["mock-tool"]);
 
   const AuthStorage = {
     create: vi.fn().mockReturnValue({ kind: "auth-storage" }),
   };
 
-  const ModelRegistry = vi.fn().mockImplementation(() => {
-    const instance = {
-      getAvailable: vi.fn().mockReturnValue(models),
-      getAll: vi.fn().mockReturnValue(models),
-      find: vi.fn().mockImplementation((provider: string, id: string) =>
-        models.find((model) => model.provider === provider && model.id === id),
-      ),
-    };
-    modelRegistryInstances.push(instance);
-    return instance;
-  });
+  const ModelRegistry = {
+    create: vi.fn().mockImplementation(() => {
+      const instance = {
+        getAvailable: vi.fn().mockReturnValue(models),
+        getAll: vi.fn().mockReturnValue(models),
+        find: vi.fn().mockImplementation((provider: string, id: string) =>
+          models.find((model) => model.provider === provider && model.id === id),
+        ),
+      };
+      modelRegistryInstances.push(instance);
+      return instance;
+    }),
+  };
 
   const SessionManager = {
-    create: vi.fn().mockImplementation((workspace: string) => {
-      const manager: any = {
-        kind: "create",
-        workspace,
-        sessionPath: undefined,
-        setSessionFile: vi.fn().mockImplementation((sessionPath: string) => {
-          manager.sessionPath = sessionPath;
-        }),
-      };
+    create: vi.fn().mockImplementation((workspace: string, sessionDir?: string) =>
+      createSessionManagerInstance(workspace, sessionDir ?? "/sessions")
+    ),
+    open: vi.fn().mockImplementation((sessionPath: string, sessionDir?: string, cwdOverride?: string) => {
+      const manager = createSessionManagerInstance(
+        cwdOverride ?? sessionPathWorkspaces.get(sessionPath) ?? "/workspace/base",
+        sessionDir ?? path.resolve(sessionPath, ".."),
+      );
+      manager.kind = "open";
+      manager.setSessionFile(sessionPath);
       return manager;
     }),
-    open: vi.fn().mockImplementation((sessionPath: string) => ({ kind: "open", sessionPath })),
     listAll: vi.fn().mockResolvedValue(defaultSessions()),
   };
 
@@ -170,22 +324,42 @@ const mockState = vi.hoisted(() => {
   return {
     models,
     createdSessions,
+    createdRuntimes,
     modelRegistryInstances,
     createAgentSession,
+    createAgentSessionRuntime,
+    createAgentSessionServices,
     createCodingTools,
     AuthStorage,
     ModelRegistry,
     SessionManager,
     SettingsManager,
     getSubscriber: (session: object) => sessionSubscribers.get(session),
+    setSessionPathWorkspace: (sessionPath: string, workspace: string) => {
+      sessionPathWorkspaces.set(sessionPath, workspace);
+    },
+    resolveSessionPathForRuntime: (
+      sessionPath: string,
+      fallback: (sessionPath: string) => string,
+    ) => resolvedSessionPaths.get(sessionPath) ?? fallback(sessionPath),
+    setResolvedSessionPath: (sessionPath: string, resolvedPath: string) => {
+      resolvedSessionPaths.set(sessionPath, resolvedPath);
+    },
     reset: () => {
       sessionCounter = 0;
+      runtimeCounter = 0;
+      sessionFileCounter = 0;
       createdSessions.length = 0;
+      createdRuntimes.length = 0;
       modelRegistryInstances.length = 0;
+      sessionPathWorkspaces.clear();
+      resolvedSessionPaths.clear();
       createAgentSession.mockClear();
+      createAgentSessionRuntime.mockClear();
+      createAgentSessionServices.mockClear();
       createCodingTools.mockClear();
       AuthStorage.create.mockClear();
-      ModelRegistry.mockClear();
+      ModelRegistry.create.mockClear();
       SessionManager.create.mockClear();
       SessionManager.open.mockClear();
       SessionManager.listAll.mockReset();
@@ -203,13 +377,27 @@ const mockState = vi.hoisted(() => {
 });
 
 vi.mock("@mariozechner/pi-coding-agent", () => ({
-  createAgentSession: mockState.createAgentSession,
+  createAgentSessionFromServices: mockState.createAgentSession,
+  createAgentSessionRuntime: mockState.createAgentSessionRuntime,
+  createAgentSessionServices: mockState.createAgentSessionServices,
   createCodingTools: mockState.createCodingTools,
   AuthStorage: mockState.AuthStorage,
   ModelRegistry: mockState.ModelRegistry,
   SessionManager: mockState.SessionManager,
   SettingsManager: mockState.SettingsManager,
+  getAgentDir: vi.fn().mockReturnValue("/mock-agent"),
 }));
+
+vi.mock("../src/pi-session-paths.js", async () => {
+  const actual = await vi.importActual<typeof import("../src/pi-session-paths.js")>("../src/pi-session-paths.js");
+
+  return {
+    ...actual,
+    resolveSessionPathForRuntime: vi.fn((sessionPath: string) =>
+      mockState.resolveSessionPathForRuntime(sessionPath, actual.resolveSessionPathForRuntime)
+    ),
+  };
+});
 
 import { getPiSessionContextKey, PiSessionRegistry, PiSessionService } from "../src/pi-session.js";
 
@@ -229,16 +417,30 @@ describe("PiSessionService", () => {
     mockState.reset();
   });
 
-  it("creates a session service and initializes the Pi session", async () => {
+  it("creates a session service and initializes the Pi session runtime", async () => {
     const service = await PiSessionService.create(createConfig());
 
     expect(mockState.AuthStorage.create).toHaveBeenCalledTimes(1);
-    expect(mockState.ModelRegistry).toHaveBeenCalledTimes(1);
+    expect(mockState.ModelRegistry.create).toHaveBeenCalledTimes(1);
+    expect(mockState.ModelRegistry.create).toHaveBeenCalledWith({ kind: "auth-storage" });
+    expect(mockState.createAgentSessionRuntime).toHaveBeenCalledWith(
+      expect.any(Function),
+      expect.objectContaining({
+        cwd: "/workspace/base",
+        agentDir: "/mock-agent",
+      }),
+    );
     expect(mockState.SettingsManager.create).toHaveBeenCalledWith("/workspace/base");
+    expect(mockState.createAgentSessionServices).toHaveBeenCalledWith(
+      expect.objectContaining({
+        cwd: "/workspace/base",
+        authStorage: { kind: "auth-storage" },
+      }),
+    );
     expect(mockState.createCodingTools).toHaveBeenCalledWith("/workspace/base");
     expect(mockState.createAgentSession).toHaveBeenCalledWith(
       expect.objectContaining({
-        cwd: "/workspace/base",
+        services: expect.objectContaining({ cwd: "/workspace/base" }),
         tools: ["mock-tool"],
         model: undefined,
         scopedModels: [],
@@ -253,6 +455,86 @@ describe("PiSessionService", () => {
       modelFallbackMessage: "fallback-model",
       model: "anthropic/claude-sonnet-4-5",
     });
+  });
+
+  it("collects runtime diagnostics for Telegram-visible session info", async () => {
+    mockState.SettingsManager.create.mockImplementationOnce(() => ({
+      getEnabledModels: vi.fn().mockReturnValue(undefined),
+      getDefaultProvider: vi.fn().mockReturnValue(undefined),
+      getDefaultModel: vi.fn().mockReturnValue(undefined),
+      drainErrors: vi.fn().mockReturnValue([
+        { scope: "project", error: new Error("failed to parse .pi/settings.json") },
+      ]),
+    }));
+
+    const originalCreateServices = mockState.createAgentSessionServices.getMockImplementation();
+    mockState.createAgentSessionServices.mockImplementationOnce(async (options: any) => {
+      const result = await originalCreateServices!(options);
+      return {
+        ...result,
+        diagnostics: [{ type: "warning", message: "Project auth: no API key configured for anthropic" }],
+        resourceLoader: {
+          ...result.resourceLoader,
+          getExtensions: vi.fn().mockReturnValue({
+            extensions: [],
+            errors: [{ path: "/ext/bad.ts", error: "boom" }],
+            runtime: { pendingProviderRegistrations: [] },
+          }),
+          getSkills: vi.fn().mockReturnValue({
+            skills: [],
+            diagnostics: [{ type: "warning", message: "skill path does not exist", path: "/skills/missing" }],
+          }),
+          getPrompts: vi.fn().mockReturnValue({ prompts: [], diagnostics: [] }),
+          getThemes: vi.fn().mockReturnValue({
+            themes: [],
+            diagnostics: [{ type: "warning", message: "theme path does not exist", path: "/themes/missing.json" }],
+          }),
+        },
+      };
+    });
+
+    const service = await PiSessionService.create(createConfig());
+
+    expect(service.getInfo()).toMatchObject({
+      diagnostics: [
+        { type: "warning", message: "Project auth: no API key configured for anthropic" },
+        { type: "warning", message: "Project settings: failed to parse .pi/settings.json" },
+        { type: "error", message: 'Failed to load extension "/ext/bad.ts": boom' },
+        { type: "warning", message: "Skill issue (/skills/missing): skill path does not exist" },
+        { type: "warning", message: "Theme issue (/themes/missing.json): theme path does not exist" },
+      ],
+    });
+  });
+
+  it("patches the live bash tool via agent state mutation", async () => {
+    await PiSessionService.create(createConfig());
+    const currentSession = mockState.createdSessions[0]?.session;
+    const originalExecute = mockState.createdSessions[0]?.options?.bashExecute;
+    const bashTool = currentSession.agent.state.tools.find((tool: any) => tool.name === "bash");
+
+    expect(bashTool.description).toContain("Commands time out after 120 seconds by default.");
+    expect(bashTool.execute).not.toBe(originalExecute);
+
+    await bashTool.execute("tool-1", { command: "pwd" });
+
+    expect(originalExecute).toHaveBeenCalledWith(
+      "tool-1",
+      { command: "pwd", timeout: 120 },
+      undefined,
+      undefined,
+    );
+  });
+
+  it("adds the provider-response notice extension factory to session services", async () => {
+    await PiSessionService.create(createConfig());
+
+    expect(mockState.createAgentSessionServices).toHaveBeenCalledWith(
+      expect.objectContaining({
+        resourceLoaderOptions: expect.objectContaining({
+          extensionFactories: [expect.any(Function)],
+        }),
+      }),
+    );
   });
 
   it("binds extension hooks through the underlying session", async () => {
@@ -289,12 +571,10 @@ describe("PiSessionService", () => {
     const originalImpl = mockState.createAgentSession.getMockImplementation();
     mockState.createAgentSession.mockImplementationOnce(async (options: any) => {
       const result = await (originalImpl as any)(options);
-      return {
-        ...result,
-        extensionsResult: {
-          runtime: {},
-        },
+      result.extensionsResult = {
+        runtime: {},
       };
+      return result;
     });
 
     const service = await PiSessionService.create(createConfig());
@@ -331,18 +611,52 @@ describe("PiSessionService", () => {
     expect(service.hasActiveSession()).toBe(true);
   });
 
-  it("creates a new session in the current workspace", async () => {
+  it("creates a new session in the current workspace via AgentSessionRuntime", async () => {
     const service = await PiSessionService.create(createConfig());
-    const currentSession = mockState.createdSessions[0]?.session;
+    const runtime = mockState.createdRuntimes[0]?.runtime;
 
     const result = await service.newSession();
 
-    expect(currentSession.newSession).toHaveBeenCalledTimes(1);
+    expect(runtime.newSession).toHaveBeenCalledTimes(1);
     expect(result).toEqual({
       created: true,
       info: service.getInfo(),
     });
-    expect(mockState.createAgentSession).toHaveBeenCalledTimes(1);
+    expect(mockState.createAgentSession).toHaveBeenCalledTimes(2);
+  });
+
+  it("forwards runtime new-session options and rebinds extensions and subscriptions after replacement", async () => {
+    const service = await PiSessionService.create(createConfig());
+    const initialSession = mockState.createdSessions[0]?.session;
+    const runtime = mockState.createdRuntimes[0]?.runtime;
+    const bindings = { uiContext: { notify: vi.fn() } } as any;
+    const onTextDelta = vi.fn();
+
+    await service.bindExtensions(bindings);
+    service.subscribe({
+      onTextDelta,
+      onToolStart: vi.fn(),
+      onToolUpdate: vi.fn(),
+      onToolEnd: vi.fn(),
+      onAgentEnd: vi.fn(),
+    });
+
+    const setup = vi.fn().mockResolvedValue(undefined);
+    const result = await service.newSession({ parentSession: "/tmp/parent.jsonl", setup });
+    const nextSession = mockState.createdSessions[1]?.session;
+
+    expect(runtime.newSession).toHaveBeenCalledWith({ parentSession: "/tmp/parent.jsonl", setup });
+    expect(result.created).toBe(true);
+    expect(setup).toHaveBeenCalledWith(nextSession.sessionManager);
+    expect(nextSession.bindExtensions).toHaveBeenCalledWith(bindings);
+    expect(mockState.getSubscriber(initialSession)).toBeUndefined();
+    expect(mockState.getSubscriber(nextSession)).toBeTypeOf("function");
+
+    mockState.getSubscriber(nextSession)?.({
+      type: "message_update",
+      assistantMessageEvent: { type: "text_delta", delta: "Rebound" },
+    });
+    expect(onTextDelta).toHaveBeenCalledWith("Rebound");
   });
 
   it("creates a new handle when starting a session in another workspace", async () => {
@@ -359,22 +673,318 @@ describe("PiSessionService", () => {
     expect(service.getCurrentWorkspace()).toBe("/workspace/other");
   });
 
-  it("switches to a specific saved session and workspace", async () => {
+  it("clears the active handle when extension rebinding fails during replacement", async () => {
     const service = await PiSessionService.create(createConfig());
     const previousSession = mockState.createdSessions[0]?.session;
+    const bindings = { uiContext: { notify: vi.fn() } } as any;
+    const originalCreateAgentSession = mockState.createAgentSession.getMockImplementation();
+
+    await service.bindExtensions(bindings);
+    mockState.createAgentSession.mockImplementationOnce(async (options: any) => {
+      const result = await originalCreateAgentSession!(options);
+      result.session.bindExtensions.mockRejectedValueOnce(new Error("extension rebinding exploded"));
+      return result;
+    });
+
+    await expect(service.newSession("/workspace/other")).rejects.toThrow("extension rebinding exploded");
+
+    expect(mockState.createdSessions[1]?.session.bindExtensions).toHaveBeenCalledWith(bindings);
+    expect(mockState.createdRuntimes[1]?.runtime.dispose).toHaveBeenCalledTimes(1);
+    expect(previousSession.dispose).toHaveBeenCalledTimes(1);
+    expect(service.hasActiveSession()).toBe(false);
+    expect(service.getInfo()).toEqual({
+      sessionId: "(no active session)",
+      sessionFile: undefined,
+      workspace: "/workspace/base",
+      sessionName: undefined,
+      modelFallbackMessage: undefined,
+      model: undefined,
+    });
+    expect(() => service.getSession()).toThrow("Pi session is not initialized");
+  });
+
+  it("clears the active handle when extension rebinding fails during same-runtime new-session replacement", async () => {
+    const service = await PiSessionService.create(createConfig());
+    const previousSession = mockState.createdSessions[0]?.session;
+    const runtime = mockState.createdRuntimes[0]?.runtime;
+    const bindings = { uiContext: { notify: vi.fn() } } as any;
+    const originalCreateAgentSession = mockState.createAgentSession.getMockImplementation();
+
+    await service.bindExtensions(bindings);
+    service.subscribe({
+      onTextDelta: vi.fn(),
+      onToolStart: vi.fn(),
+      onToolUpdate: vi.fn(),
+      onToolEnd: vi.fn(),
+      onAgentEnd: vi.fn(),
+    });
+
+    mockState.createAgentSession.mockImplementationOnce(async (options: any) => {
+      const result = await originalCreateAgentSession!(options);
+      result.session.bindExtensions.mockRejectedValueOnce(new Error("extension rebinding exploded"));
+      return result;
+    });
+
+    await expect(service.newSession()).rejects.toThrow("extension rebinding exploded");
+
+    const nextSession = mockState.createdSessions[1]?.session;
+    expect(nextSession.bindExtensions).toHaveBeenCalledWith(bindings);
+    expect(runtime.dispose).toHaveBeenCalledTimes(1);
+    expect(previousSession.dispose).toHaveBeenCalledTimes(1);
+    expect(nextSession.dispose).toHaveBeenCalledTimes(1);
+    expect(mockState.getSubscriber(previousSession)).toBeUndefined();
+    expect(mockState.getSubscriber(nextSession)).toBeUndefined();
+    expect(service.hasActiveSession()).toBe(false);
+    expect(service.getInfo()).toEqual({
+      sessionId: "(no active session)",
+      sessionFile: undefined,
+      workspace: "/workspace/base",
+      sessionName: undefined,
+      modelFallbackMessage: undefined,
+      model: undefined,
+    });
+    expect(() => service.getSession()).toThrow("Pi session is not initialized");
+  });
+
+  it("disposes the created runtime when cross-workspace setup fails", async () => {
+    const service = await PiSessionService.create(createConfig());
+    const previousSession = mockState.createdSessions[0]?.session;
+    const setup = vi.fn().mockRejectedValue(new Error("setup exploded"));
+
+    await expect(service.newSession({ workspace: "/workspace/other", setup })).rejects.toThrow("setup exploded");
+
+    expect(setup).toHaveBeenCalledWith(mockState.createdSessions[1]?.session.sessionManager);
+    expect(mockState.createdRuntimes[1]?.runtime.dispose).toHaveBeenCalledTimes(1);
+    expect(mockState.createdSessions[1]?.session.dispose).toHaveBeenCalledTimes(1);
+    expect(previousSession.dispose).not.toHaveBeenCalled();
+    expect(service.getCurrentWorkspace()).toBe("/workspace/base");
+    expect(service.getInfo().sessionId).toBe("session-1");
+  });
+
+  it("switches to a specific saved session and workspace via AgentSessionRuntime", async () => {
+    const service = await PiSessionService.create(createConfig());
+    const previousSession = mockState.createdSessions[0]?.session;
+    const runtime = mockState.createdRuntimes[0]?.runtime;
 
     const info = await service.switchSession("/sessions/saved.jsonl", "/workspace/projectA");
 
-    expect(mockState.SessionManager.create).toHaveBeenLastCalledWith("/workspace/projectA", "/sessions");
-    expect(mockState.createAgentSession).toHaveBeenLastCalledWith(
-      expect.objectContaining({
-        cwd: "/workspace/projectA",
-        sessionManager: expect.objectContaining({ sessionPath: "/sessions/saved.jsonl" }),
-      }),
+    expect(runtime.switchSession).toHaveBeenCalledWith("/sessions/saved.jsonl", "/workspace/projectA");
+    expect(mockState.SessionManager.open).toHaveBeenLastCalledWith(
+      "/sessions/saved.jsonl",
+      undefined,
+      "/workspace/projectA",
     );
     expect(previousSession.dispose).toHaveBeenCalledTimes(1);
     expect(info.workspace).toBe("/workspace/projectA");
     expect(info.sessionFile).toBe("/sessions/saved.jsonl");
+  });
+
+  it("adopts the runtime-resolved cwd when switching without an explicit workspace override", async () => {
+    const targetWorkspace = mkdtempSync(path.join(tmpdir(), "telepi-session-"));
+
+    try {
+      const sessionPath = path.join(targetWorkspace, "cross-cwd.jsonl");
+      writeFileSync(
+        sessionPath,
+        `${JSON.stringify({
+          type: "session",
+          version: 3,
+          id: "crosscwd1",
+          timestamp: "2025-01-03T00:00:00.000Z",
+          cwd: targetWorkspace,
+        })}\n`,
+      );
+      const service = await PiSessionService.create(createConfig({ workspace: "/workspace/projectA" }));
+      const runtime = mockState.createdRuntimes[0]?.runtime;
+
+      const info = await service.switchSession(sessionPath);
+
+      expect(runtime.switchSession).toHaveBeenCalledWith(sessionPath, targetWorkspace);
+      expect(service.getCurrentWorkspace()).toBe(targetWorkspace);
+      expect(info.workspace).toBe(targetWorkspace);
+    } finally {
+      rmSync(targetWorkspace, { recursive: true, force: true });
+    }
+  });
+
+  it("switches using the resolved session path when the caller passes a ~ path", async () => {
+    mockState.SessionManager.listAll.mockRejectedValueOnce(new Error("boom"));
+    const tempDir = mkdtempSync(path.join(homedir(), "telepi-session-"));
+
+    try {
+      const sessionPath = path.join(tempDir, "tilde-switch.jsonl");
+      writeFileSync(
+        sessionPath,
+        `${JSON.stringify({
+          type: "session",
+          version: 3,
+          id: "tilde-switch",
+          timestamp: "2025-01-03T00:00:00.000Z",
+          cwd: tempDir,
+        })}\n`,
+      );
+      const tildePath = sessionPath.replace(homedir(), "~");
+      const service = await PiSessionService.create(createConfig({ workspace: "/workspace/projectA" }));
+      const runtime = mockState.createdRuntimes[0]?.runtime;
+
+      const info = await service.switchSession(tildePath);
+
+      expect(runtime.switchSession).toHaveBeenCalledWith(sessionPath, tempDir);
+      expect(mockState.SessionManager.open).toHaveBeenLastCalledWith(sessionPath, undefined, tempDir);
+      expect(info.sessionFile).toBe(sessionPath);
+      expect(info.workspace).toBe(tempDir);
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("switches using the remapped runtime session path instead of the raw caller input", async () => {
+    mockState.SessionManager.listAll.mockRejectedValueOnce(new Error("boom"));
+    const tempDir = mkdtempSync(path.join(tmpdir(), "telepi-session-"));
+    const rawSessionPath = "/Users/example/.pi/agent/sessions/remapped.jsonl";
+
+    try {
+      const resolvedSessionPath = path.join(tempDir, "remapped.jsonl");
+      writeFileSync(
+        resolvedSessionPath,
+        `${JSON.stringify({
+          type: "session",
+          version: 3,
+          id: "remapped1",
+          timestamp: "2025-01-03T00:00:00.000Z",
+          cwd: tempDir,
+        })}\n`,
+      );
+      mockState.setResolvedSessionPath(rawSessionPath, resolvedSessionPath);
+      const service = await PiSessionService.create(createConfig({ workspace: "/workspace/projectA" }));
+      const runtime = mockState.createdRuntimes[0]?.runtime;
+
+      const info = await service.switchSession(rawSessionPath);
+
+      expect(runtime.switchSession).toHaveBeenCalledWith(resolvedSessionPath, tempDir);
+      expect(mockState.SessionManager.open).toHaveBeenLastCalledWith(resolvedSessionPath, undefined, tempDir);
+      expect(info.sessionFile).toBe(resolvedSessionPath);
+      expect(info.workspace).toBe(tempDir);
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("rethrows unexpected session-resolution errors instead of silently falling back", async () => {
+    mockState.SessionManager.listAll.mockRejectedValueOnce(new Error("list exploded"));
+    const service = await PiSessionService.create(createConfig());
+    const runtime = mockState.createdRuntimes[0]?.runtime;
+
+    await expect(service.switchSession("s1")).rejects.toThrow("list exploded");
+    expect(runtime.switchSession).not.toHaveBeenCalled();
+  });
+
+  it("switches using the resolved session path after handback when no handle is active", async () => {
+    mockState.SessionManager.listAll.mockRejectedValueOnce(new Error("boom"));
+    const tempDir = mkdtempSync(path.join(homedir(), "telepi-session-"));
+
+    try {
+      const sessionPath = path.join(tempDir, "tilde-reopen.jsonl");
+      writeFileSync(
+        sessionPath,
+        `${JSON.stringify({
+          type: "session",
+          version: 3,
+          id: "tilde-reopen",
+          timestamp: "2025-01-03T00:00:00.000Z",
+          cwd: tempDir,
+        })}\n`,
+      );
+      const tildePath = sessionPath.replace(homedir(), "~");
+      const service = await PiSessionService.create(createConfig({ workspace: "/workspace/projectA" }));
+
+      await service.handback();
+      expect(service.hasActiveSession()).toBe(false);
+
+      const info = await service.switchSession(tildePath);
+
+      expect(mockState.SessionManager.open).toHaveBeenLastCalledWith(sessionPath, undefined, tempDir);
+      expect(info.sessionFile).toBe(sessionPath);
+      expect(info.workspace).toBe(tempDir);
+      expect(service.hasActiveSession()).toBe(true);
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("recreates the model registry each time the runtime factory creates a session", async () => {
+    const service = await PiSessionService.create(createConfig());
+    const firstRegistry = mockState.createAgentSessionServices.mock.calls[0]?.[0]?.modelRegistry;
+
+    await service.switchSession("/sessions/saved.jsonl", "/workspace/projectA");
+
+    const secondRegistry = mockState.createAgentSessionServices.mock.calls[1]?.[0]?.modelRegistry;
+    expect(mockState.ModelRegistry.create).toHaveBeenCalledTimes(2);
+    expect(firstRegistry).toBe(mockState.modelRegistryInstances[0]);
+    expect(secondRegistry).toBe(mockState.modelRegistryInstances[1]);
+    expect(secondRegistry).not.toBe(firstRegistry);
+  });
+
+  it("returns the runtime cancellation signal when switching sessions is cancelled", async () => {
+    const service = await PiSessionService.create(createConfig());
+    const previousSession = mockState.createdSessions[0]?.session;
+    const runtime = mockState.createdRuntimes[0]?.runtime;
+    const initialInfo = service.getInfo();
+
+    runtime.switchSession.mockResolvedValueOnce({ cancelled: true });
+
+    const result = await service.switchSession("/sessions/saved.jsonl", "/workspace/projectA");
+
+    expect(result).toEqual({
+      ...initialInfo,
+      cancelled: true,
+    });
+    expect(previousSession.dispose).not.toHaveBeenCalled();
+  });
+
+  it("clears the active handle when extension rebinding fails during same-runtime session switching", async () => {
+    const service = await PiSessionService.create(createConfig());
+    const previousSession = mockState.createdSessions[0]?.session;
+    const runtime = mockState.createdRuntimes[0]?.runtime;
+    const bindings = { uiContext: { notify: vi.fn() } } as any;
+    const originalCreateAgentSession = mockState.createAgentSession.getMockImplementation();
+
+    await service.bindExtensions(bindings);
+    service.subscribe({
+      onTextDelta: vi.fn(),
+      onToolStart: vi.fn(),
+      onToolUpdate: vi.fn(),
+      onToolEnd: vi.fn(),
+      onAgentEnd: vi.fn(),
+    });
+
+    mockState.createAgentSession.mockImplementationOnce(async (options: any) => {
+      const result = await originalCreateAgentSession!(options);
+      result.session.bindExtensions.mockRejectedValueOnce(new Error("extension rebinding exploded"));
+      return result;
+    });
+
+    await expect(service.switchSession("/sessions/saved.jsonl", "/workspace/projectA")).rejects.toThrow(
+      "extension rebinding exploded",
+    );
+
+    const nextSession = mockState.createdSessions[1]?.session;
+    expect(nextSession.bindExtensions).toHaveBeenCalledWith(bindings);
+    expect(runtime.dispose).toHaveBeenCalledTimes(1);
+    expect(previousSession.dispose).toHaveBeenCalledTimes(1);
+    expect(nextSession.dispose).toHaveBeenCalledTimes(1);
+    expect(mockState.getSubscriber(previousSession)).toBeUndefined();
+    expect(mockState.getSubscriber(nextSession)).toBeUndefined();
+    expect(service.hasActiveSession()).toBe(false);
+    expect(service.getCurrentWorkspace()).toBe("/workspace/base");
+    expect(service.getInfo()).toEqual({
+      sessionId: "(no active session)",
+      sessionFile: undefined,
+      workspace: "/workspace/base",
+      sessionName: undefined,
+      modelFallbackMessage: undefined,
+      model: undefined,
+    });
   });
 
   it("hands back the active session and clears the handle", async () => {
@@ -838,6 +1448,13 @@ describe("PiSessionService", () => {
     await expect(service.resolveWorkspaceForSession("/sessions/missing.jsonl")).resolves.toBeUndefined();
   });
 
+  it("returns undefined when an ID-based workspace lookup hits an unexpected index failure", async () => {
+    mockState.SessionManager.listAll.mockRejectedValueOnce(new Error("boom"));
+    const service = await PiSessionService.create(createConfig());
+
+    await expect(service.resolveWorkspaceForSession("s1")).resolves.toBeUndefined();
+  });
+
   it("lists models with the current one marked", async () => {
     const service = await PiSessionService.create(createConfig());
 
@@ -1002,6 +1619,47 @@ describe("PiSessionService", () => {
     expect(currentSession.setThinkingLevel).toHaveBeenCalledWith("high");
   });
 
+  it("forks via AgentSessionRuntime", async () => {
+    const service = await PiSessionService.create(createConfig());
+    const runtime = mockState.createdRuntimes[0]?.runtime;
+
+    await expect(service.fork("known-id")).resolves.toEqual({ cancelled: false });
+    expect(runtime.fork).toHaveBeenCalledWith("known-id");
+  });
+
+  it("clears the active handle when extension rebinding fails during same-runtime forks", async () => {
+    const service = await PiSessionService.create(createConfig());
+    const previousSession = mockState.createdSessions[0]?.session;
+    const runtime = mockState.createdRuntimes[0]?.runtime;
+    const bindings = { uiContext: { notify: vi.fn() } } as any;
+    const originalCreateAgentSession = mockState.createAgentSession.getMockImplementation();
+
+    await service.bindExtensions(bindings);
+
+    mockState.createAgentSession.mockImplementationOnce(async (options: any) => {
+      const result = await originalCreateAgentSession!(options);
+      result.session.bindExtensions.mockRejectedValueOnce(new Error("extension rebinding exploded"));
+      return result;
+    });
+
+    await expect(service.fork("known-id")).rejects.toThrow("extension rebinding exploded");
+
+    const nextSession = mockState.createdSessions[1]?.session;
+    expect(nextSession.bindExtensions).toHaveBeenCalledWith(bindings);
+    expect(runtime.dispose).toHaveBeenCalledTimes(1);
+    expect(previousSession.dispose).toHaveBeenCalledTimes(1);
+    expect(nextSession.dispose).toHaveBeenCalledTimes(1);
+    expect(service.hasActiveSession()).toBe(false);
+    expect(service.getInfo()).toEqual({
+      sessionId: "(no active session)",
+      sessionFile: undefined,
+      workspace: "/workspace/base",
+      sessionName: undefined,
+      modelFallbackMessage: undefined,
+      model: undefined,
+    });
+  });
+
   it("delegates tree access, navigation, and labels", async () => {
     const service = await PiSessionService.create(createConfig());
     const currentSession = mockState.createdSessions[0]?.session;
@@ -1056,13 +1714,16 @@ describe("PiSessionService", () => {
     expect(currentSession.navigateTree).toHaveBeenCalledWith("known-id", { summarize: true });
 
     await expect(service.fork("known-id")).resolves.toEqual({ cancelled: false });
-    expect(currentSession.fork).toHaveBeenCalledWith("known-id");
+    expect(mockState.createdRuntimes[0]?.runtime.fork).toHaveBeenCalledWith("known-id");
+
+    const forkedSession = mockState.createdSessions[1]?.session;
+    forkedSession.sessionManager.getTree.mockReturnValue(currentSession.sessionManager.getTree());
 
     await expect(service.reload()).resolves.toBeUndefined();
-    expect(currentSession.reload).toHaveBeenCalledTimes(1);
+    expect(forkedSession.reload).toHaveBeenCalledTimes(1);
 
     service.setLabel("known-id", "saved");
-    expect(currentSession.sessionManager.appendLabelChange).toHaveBeenCalledWith("known-id", "saved");
+    expect(forkedSession.sessionManager.appendLabelChange).toHaveBeenCalledWith("known-id", "saved");
 
     expect(service.getLabels()).toEqual([
       {
@@ -1177,12 +1838,12 @@ describe("PiSessionService", () => {
     expect(rootAgain).toBe(rootService);
     expect(topicService).not.toBe(rootService);
     expect(mockState.createAgentSession).toHaveBeenCalledTimes(2);
-    expect(mockState.SessionManager.create).toHaveBeenNthCalledWith(1, "/workspace/base", "/sessions");
-    expect(mockState.SessionManager.create).toHaveBeenNthCalledWith(2, "/workspace/base");
+    expect(mockState.SessionManager.open).toHaveBeenNthCalledWith(1, "/sessions/bootstrap.jsonl", undefined, "/workspace/base");
+    expect(mockState.SessionManager.create).toHaveBeenNthCalledWith(1, "/workspace/base");
     expect(mockState.createAgentSession).toHaveBeenNthCalledWith(
       1,
       expect.objectContaining({
-        cwd: "/workspace/base",
+        services: expect.objectContaining({ cwd: "/workspace/base" }),
         sessionManager: expect.objectContaining({ sessionPath: "/sessions/bootstrap.jsonl" }),
       }),
     );
@@ -1190,27 +1851,27 @@ describe("PiSessionService", () => {
 
   it("deduplicates concurrent getOrCreate calls for the same context", async () => {
     const registry = await PiSessionRegistry.create(createConfig());
-    const originalImpl = mockState.createAgentSession.getMockImplementation();
+    const originalImpl = mockState.createAgentSessionRuntime.getMockImplementation();
     let resolveCreate!: () => void;
 
-    mockState.createAgentSession.mockImplementationOnce(async (options: any) => {
+    mockState.createAgentSessionRuntime.mockImplementationOnce(async (factory: any, options: any) => {
       await new Promise<void>((resolve) => {
         resolveCreate = resolve;
       });
-      return originalImpl!(options);
+      return originalImpl!(factory, options);
     });
 
     const first = registry.getOrCreate({ chatId: 7, messageThreadId: 1 });
     const second = registry.getOrCreate({ chatId: 7, messageThreadId: 1 });
 
     await Promise.resolve();
-    expect(mockState.createAgentSession).toHaveBeenCalledTimes(1);
+    expect(mockState.createAgentSessionRuntime).toHaveBeenCalledTimes(1);
 
     resolveCreate();
     const [firstService, secondService] = await Promise.all([first, second]);
 
     expect(firstService).toBe(secondService);
-    expect(mockState.createAgentSession).toHaveBeenCalledTimes(1);
+    expect(mockState.createAgentSessionRuntime).toHaveBeenCalledTimes(1);
   });
 
   it("returns fallback info for untouched contexts in the registry", async () => {
@@ -1238,14 +1899,14 @@ describe("PiSessionService", () => {
 
   it("rejects inflight creations that are removed before they finish", async () => {
     const registry = await PiSessionRegistry.create(createConfig());
-    const originalImpl = mockState.createAgentSession.getMockImplementation();
+    const originalImpl = mockState.createAgentSessionRuntime.getMockImplementation();
     let resolveCreate!: () => void;
 
-    mockState.createAgentSession.mockImplementationOnce(async (options: any) => {
+    mockState.createAgentSessionRuntime.mockImplementationOnce(async (factory: any, options: any) => {
       await new Promise<void>((resolve) => {
         resolveCreate = resolve;
       });
-      return originalImpl!(options);
+      return originalImpl!(factory, options);
     });
 
     const pending = registry.getOrCreate({ chatId: 11, messageThreadId: 4 });

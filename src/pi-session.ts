@@ -1,14 +1,21 @@
-import { closeSync, existsSync, openSync, readSync } from "node:fs";
+import { existsSync } from "node:fs";
 import path from "node:path";
 
 import {
   AuthStorage,
-  createAgentSession,
+  createAgentSessionFromServices,
+  createAgentSessionRuntime,
+  createAgentSessionServices,
   createCodingTools,
+  getAgentDir,
   ModelRegistry,
   SessionManager,
   SettingsManager,
   type AgentSession,
+  type AgentSessionRuntime,
+  type CreateAgentSessionRuntimeFactory,
+  type ResourceDiagnostic,
+  type ResourceLoader,
   type SessionEntry,
   type SlashCommandInfo,
 } from "@mariozechner/pi-coding-agent";
@@ -16,11 +23,16 @@ import type { ThinkingLevel } from "@mariozechner/pi-agent-core";
 import type { Api, Model } from "@mariozechner/pi-ai";
 
 import type { TelePiConfig } from "./config.js";
+import { createProviderResponseNoticeExtension } from "./provider-response-notices.js";
 import {
   resolveInitialScopedModelSelection,
   resolveScopedModels,
 } from "./model-scope.js";
-import { expandHomePath } from "./paths.js";
+import {
+  readSessionHeader,
+  resolveSessionPathForRuntime,
+  resolveWorkspacePathForRuntime,
+} from "./pi-session-paths.js";
 
 /**
  * Default timeout (seconds) for bash commands in TelePi sessions.
@@ -40,6 +52,11 @@ export interface PiSessionCallbacks {
   onAgentEnd: () => void;
 }
 
+export interface PiSessionDiagnostic {
+  type: "info" | "warning" | "error";
+  message: string;
+}
+
 export interface PiSessionInfo {
   sessionId: string;
   sessionFile?: string;
@@ -47,6 +64,11 @@ export interface PiSessionInfo {
   sessionName?: string;
   modelFallbackMessage?: string;
   model?: string;
+  diagnostics?: PiSessionDiagnostic[];
+}
+
+export interface PiSessionSwitchResult extends PiSessionInfo {
+  cancelled: boolean;
 }
 
 export interface PiSessionModelOption {
@@ -70,17 +92,25 @@ export interface ResolvedSessionReference {
   matchType: "path" | "id" | "prefix";
 }
 
-interface PiSessionHandle {
-  session: AgentSession;
-  modelRegistry: ModelRegistry;
-  getSlashCommands: () => SlashCommandInfo[];
-  modelFallbackMessage?: string;
-  dispose: () => void;
+export interface PiSessionNewSessionOptions {
+  workspace?: string;
+  parentSession?: string;
+  setup?: (sessionManager: SessionManager) => Promise<void>;
 }
 
-interface SessionHeaderInfo {
-  id: string;
-  cwd?: string;
+class SessionReferenceResolutionError extends Error {
+  readonly code = "SESSION_REFERENCE_RESOLUTION_ERROR";
+
+  constructor(message: string) {
+    super(message);
+    this.name = "SessionReferenceResolutionError";
+  }
+}
+
+interface PiSessionHandle {
+  runtime: AgentSessionRuntime;
+  getSlashCommands: () => SlashCommandInfo[];
+  dispose: () => Promise<void>;
 }
 
 /**
@@ -92,7 +122,7 @@ interface SessionHeaderInfo {
  *
  * We can't override the tool via `createAgentSession({ tools })` because the
  * SDK only reads tool names from that option and rebuilds implementations
- * internally. Instead, we patch the live tool on `session.agent` after creation.
+ * internally. Instead, we patch the live tool on `session.agent.state` after creation.
  */
 function patchBashTimeout(session: AgentSession): void {
   const tools = session.agent.state.tools;
@@ -114,7 +144,7 @@ function patchBashTimeout(session: AgentSession): void {
         ),
     };
   });
-  session.agent.setTools(patched);
+  session.agent.state.tools = patched;
 }
 
 export async function createPiSession(
@@ -123,57 +153,117 @@ export async function createPiSession(
   overrideWorkspace?: string,
 ): Promise<PiSessionHandle> {
   const workspace = overrideWorkspace ?? config.workspace;
-  const sessionPath = overrideSessionPath ?? config.piSessionPath;
-  return createPiSessionHandle(config, workspace, createSessionManager(config, workspace, overrideSessionPath), {
-    hasExistingSession: Boolean(sessionPath && existsSync(resolveSessionPathForRuntime(sessionPath))),
-  });
+  return createPiSessionHandle(
+    config,
+    workspace,
+    createSessionManager(config, workspace, overrideSessionPath, overrideWorkspace !== undefined),
+  );
 }
 
-async function createNewPiSession(config: TelePiConfig, workspace: string): Promise<PiSessionHandle> {
-  return createPiSessionHandle(config, workspace, SessionManager.create(workspace), {
-    hasExistingSession: false,
-  });
+async function createNewPiSession(
+  config: TelePiConfig,
+  workspace: string,
+  options?: Omit<PiSessionNewSessionOptions, "workspace">,
+): Promise<PiSessionHandle> {
+  const sessionManager = SessionManager.create(workspace);
+  if (options?.parentSession) {
+    sessionManager.newSession({ parentSession: options.parentSession });
+  }
+
+  const handle = await createPiSessionHandle(config, workspace, sessionManager, { reason: "new" });
+
+  try {
+    await applySessionSetup(handle.runtime.session, options?.setup);
+    return handle;
+  } catch (error) {
+    try {
+      await handle.dispose();
+    } catch (disposeError) {
+      console.error("Failed to dispose session after setup error:", disposeError);
+    }
+    throw error;
+  }
 }
 
 async function createPiSessionHandle(
   config: TelePiConfig,
   workspace: string,
   sessionManager: SessionManager,
-  options: { hasExistingSession: boolean },
+  initialSessionStartEvent?: { reason: "new" | "resume" | "fork" },
 ): Promise<PiSessionHandle> {
   const authStorage = AuthStorage.create();
-  const modelRegistry = new ModelRegistry(authStorage);
-  const settingsManager = SettingsManager.create(workspace);
-  drainSettingsWarnings(settingsManager);
-  const configuredModel = resolveModelOverride(modelRegistry, config.piModel);
-  const scopedModels = await resolveScopedModels(settingsManager, modelRegistry);
-  const { model, thinkingLevel } = resolveInitialScopedModelSelection({
-    configuredModel,
-    scopedModels,
-    settingsManager,
-    modelRegistry,
-    hasExistingSession: options.hasExistingSession,
-  });
+  let getSlashCommands = (): SlashCommandInfo[] => [];
+  const createRuntime: CreateAgentSessionRuntimeFactory = async ({
+    cwd,
+    agentDir,
+    sessionManager: runtimeSessionManager,
+    sessionStartEvent,
+  }) => {
+    const settingsManager = SettingsManager.create(cwd);
+    const modelRegistry = ModelRegistry.create(authStorage);
+    const services = await createAgentSessionServices({
+      cwd,
+      agentDir,
+      authStorage,
+      modelRegistry,
+      settingsManager,
+      resourceLoaderOptions: {
+        extensionFactories: [createProviderResponseNoticeExtension()],
+      },
+    });
+    const configuredModel = resolveModelOverride(services.modelRegistry, config.piModel);
+    const scopedModels = await resolveScopedModels(services.settingsManager, services.modelRegistry);
+    const hasExistingSession = sessionStartEvent?.reason !== "new"
+      && Boolean(runtimeSessionManager.getSessionFile?.());
+    const { model, thinkingLevel } = resolveInitialScopedModelSelection({
+      configuredModel,
+      scopedModels,
+      settingsManager: services.settingsManager,
+      modelRegistry: services.modelRegistry,
+      hasExistingSession,
+    });
 
-  const { session, extensionsResult, modelFallbackMessage } = await createAgentSession({
+    const result = await createAgentSessionFromServices({
+      services,
+      sessionManager: runtimeSessionManager,
+      sessionStartEvent,
+      model,
+      thinkingLevel,
+      scopedModels,
+      tools: createCodingTools(cwd),
+    });
+    getSlashCommands = () => result.extensionsResult.runtime.getCommands?.() ?? [];
+    patchBashTimeout(result.session);
+
+    return {
+      ...result,
+      services,
+      diagnostics: dedupeDiagnostics([
+        ...services.diagnostics,
+        ...collectSettingsDiagnostics(settingsManager),
+        ...collectSessionResourceDiagnostics(services.resourceLoader, result.session),
+      ]),
+    };
+  };
+
+  const runtime = await createAgentSessionRuntime(createRuntime, {
     cwd: workspace,
-    authStorage,
-    modelRegistry,
-    model,
-    thinkingLevel,
-    scopedModels,
+    agentDir: getAgentDir(),
     sessionManager,
-    settingsManager,
-    tools: createCodingTools(workspace),
+    ...(initialSessionStartEvent ? {
+      sessionStartEvent: {
+        type: "session_start",
+        reason: initialSessionStartEvent.reason,
+      },
+    } : {}),
   });
-  patchBashTimeout(session);
 
   return {
-    session,
-    modelRegistry,
-    getSlashCommands: () => extensionsResult.runtime.getCommands?.() ?? [],
-    modelFallbackMessage,
-    dispose: () => session.dispose(),
+    runtime,
+    getSlashCommands: () => getSlashCommands(),
+    dispose: async () => {
+      await runtime.dispose();
+    },
   };
 }
 
@@ -217,6 +307,9 @@ export async function promptSession(session: AgentSession, text: string): Promis
 export class PiSessionService {
   private handle?: PiSessionHandle;
   private currentWorkspace: string;
+  private sessionCallbacks?: PiSessionCallbacks;
+  private sessionUnsubscribe?: () => void;
+  private extensionBindings?: Parameters<AgentSession["bindExtensions"]>[0];
 
   private constructor(private readonly config: TelePiConfig) {
     this.currentWorkspace = config.workspace;
@@ -225,15 +318,16 @@ export class PiSessionService {
   static async create(config: TelePiConfig): Promise<PiSessionService> {
     const service = new PiSessionService(config);
     service.handle = await createPiSession(config);
+    service.currentWorkspace = service.handle.runtime.cwd;
     return service;
   }
 
   getSession(): AgentSession {
-    return this.getHandle().session;
+    return this.getHandle().runtime.session;
   }
 
   isStreaming(): boolean {
-    return this.handle?.session.isStreaming ?? false;
+    return this.handle?.runtime.session.isStreaming ?? false;
   }
 
   hasActiveSession(): boolean {
@@ -256,20 +350,34 @@ export class PiSessionService {
       };
     }
 
-    const { session, modelFallbackMessage } = this.handle;
+    const session = this.handle.runtime.session;
     const model = session.model;
+    const diagnostics = this.handle.runtime.diagnostics.length > 0
+      ? [...this.handle.runtime.diagnostics]
+      : undefined;
+
     return {
       sessionId: session.sessionId,
       sessionFile: session.sessionFile,
       workspace: this.currentWorkspace,
       sessionName: session.sessionName,
-      modelFallbackMessage,
+      modelFallbackMessage: this.handle.runtime.modelFallbackMessage,
       model: model ? `${model.provider}/${model.id}` : undefined,
+      ...(diagnostics ? { diagnostics } : {}),
     };
   }
 
   subscribe(callbacks: PiSessionCallbacks): () => void {
-    return subscribeToSession(this.getSession(), callbacks);
+    this.sessionCallbacks = callbacks;
+    this.rebindSessionSubscription();
+
+    return () => {
+      if (this.sessionCallbacks === callbacks) {
+        this.sessionCallbacks = undefined;
+        this.sessionUnsubscribe?.();
+        this.sessionUnsubscribe = undefined;
+      }
+    };
   }
 
   async prompt(text: string): Promise<void> {
@@ -277,7 +385,8 @@ export class PiSessionService {
   }
 
   async bindExtensions(bindings: Parameters<AgentSession["bindExtensions"]>[0]): Promise<void> {
-    await this.getSession().bindExtensions(bindings);
+    this.extensionBindings = bindings;
+    await this.bindExtensionsToCurrentSession();
   }
 
   async listSlashCommands(): Promise<SlashCommandInfo[]> {
@@ -302,7 +411,7 @@ export class PiSessionService {
     if (!this.handle) {
       return;
     }
-    await this.handle.session.abort();
+    await this.handle.runtime.session.abort();
   }
 
   async listAllSessions(): Promise<
@@ -340,24 +449,26 @@ export class PiSessionService {
     return [...workspaces].sort();
   }
 
-  async newSession(workspace?: string): Promise<{ info: PiSessionInfo; created: boolean }> {
-    const effectiveWorkspace = workspace ?? this.currentWorkspace;
+  async newSession(
+    request?: string | PiSessionNewSessionOptions,
+  ): Promise<{ info: PiSessionInfo; created: boolean }> {
+    const options = normalizeNewSessionOptions(request);
+    const effectiveWorkspace = options.workspace ?? this.currentWorkspace;
 
     if (!this.handle || effectiveWorkspace !== this.currentWorkspace) {
-      const nextHandle = await createNewPiSession(this.config, effectiveWorkspace);
-      const previousHandle = this.handle;
-      this.handle = nextHandle;
-      this.currentWorkspace = effectiveWorkspace;
-      try {
-        previousHandle?.dispose();
-      } catch (error) {
-        console.error("Failed to dispose previous session:", error);
-      }
+      const nextHandle = await createNewPiSession(this.config, effectiveWorkspace, options);
+      await this.replaceHandle(nextHandle);
       return { info: this.getInfo(), created: true };
     }
 
-    const created = await this.getSession().newSession();
-    return { info: this.getInfo(), created };
+    const previousSession = this.getSession();
+    const previousWorkspace = this.currentWorkspace;
+    const result = await this.getHandle().runtime.newSession({
+      parentSession: options.parentSession,
+      setup: options.setup,
+    });
+    await this.rebindAfterRuntimeSessionReplacement(previousSession, previousWorkspace);
+    return { info: this.getInfo(), created: !result.cancelled };
   }
 
   async listModels(showAll = false): Promise<PiSessionModelOption[]> {
@@ -405,7 +516,7 @@ export class PiSessionService {
   async resolveSessionReference(sessionReference: string): Promise<ResolvedSessionReference> {
     const normalizedReference = sessionReference.trim();
     if (!normalizedReference) {
-      throw new Error("Session reference cannot be empty.");
+      throw new SessionReferenceResolutionError("Session reference cannot be empty.");
     }
 
     const remappedReferencePath = resolveSessionPathForRuntime(normalizedReference);
@@ -415,7 +526,7 @@ export class PiSessionService {
       || normalizedReference.startsWith("~");
     if (looksLikePath) {
       if (!existsSync(remappedReferencePath)) {
-        throw new Error(`Saved session not found: ${normalizedReference}`);
+        throw new SessionReferenceResolutionError(`Saved session not found: ${normalizedReference}`);
       }
 
       const header = readSessionHeader(remappedReferencePath);
@@ -478,7 +589,7 @@ export class PiSessionService {
     }
 
     if (localPrefixMatches.length > 1) {
-      throw new Error(
+      throw new SessionReferenceResolutionError(
         `Session ID prefix "${normalizedReference}" matches ${localPrefixMatches.length} saved sessions in the current workspace. Use more characters or /sessions to pick one.`,
       );
     }
@@ -499,37 +610,67 @@ export class PiSessionService {
     }
 
     if (prefixMatches.length > 1) {
-      throw new Error(
+      throw new SessionReferenceResolutionError(
         `Session ID prefix "${normalizedReference}" matches ${prefixMatches.length} saved sessions. Use more characters or /sessions to pick one.`,
       );
     }
 
-    throw new Error(
+    throw new SessionReferenceResolutionError(
       `No saved session matches "${normalizedReference}". Use /sessions to browse, or pass a full session path or session ID.`,
     );
   }
 
+  /**
+   * Best-effort helper for UI flows that want a workspace hint before switching.
+   * Missing sessions and transient session-index failures should both surface as
+   * "no workspace available" so callers can safely fall back.
+   */
   async resolveWorkspaceForSession(sessionPath: string): Promise<string | undefined> {
     try {
-      const match = await this.resolveSessionReference(sessionPath);
-      return match.cwd;
+      return (await this.tryResolveSessionReference(sessionPath))?.cwd;
     } catch {
       return undefined;
     }
   }
 
-  async switchSession(sessionPath: string, workspace?: string): Promise<PiSessionInfo> {
-    const effectiveWorkspace = workspace ?? this.currentWorkspace;
-    const nextHandle = await createPiSession(this.config, sessionPath, effectiveWorkspace);
-    const previousHandle = this.handle;
-    this.handle = nextHandle;
-    this.currentWorkspace = effectiveWorkspace;
-    try {
-      previousHandle?.dispose();
-    } catch (error) {
-      console.error("Failed to dispose previous session:", error);
+  async switchSession(sessionPath: string, workspace?: string): Promise<PiSessionSwitchResult> {
+    const resolvedReference = await this.tryResolveSessionReference(sessionPath);
+    const runtimeSessionPath = resolvedReference?.path ?? resolveSessionPathForRuntime(sessionPath);
+    const effectiveWorkspace = workspace
+      ?? resolvedReference?.cwd
+      ?? this.currentWorkspace;
+
+    if (!this.handle) {
+      const nextHandle = await createPiSession(this.config, runtimeSessionPath, effectiveWorkspace);
+      await this.replaceHandle(nextHandle);
+      return {
+        ...this.getInfo(),
+        cancelled: false,
+      };
     }
-    return this.getInfo();
+
+    const previousSession = this.getSession();
+    const previousWorkspace = this.currentWorkspace;
+    const result = await this.getHandle().runtime.switchSession(runtimeSessionPath, effectiveWorkspace);
+    await this.rebindAfterRuntimeSessionReplacement(previousSession, previousWorkspace);
+    return {
+      ...this.getInfo(),
+      cancelled: result.cancelled,
+    };
+  }
+
+  private async tryResolveSessionReference(
+    sessionPath: string,
+  ): Promise<ResolvedSessionReference | undefined> {
+    try {
+      return await this.resolveSessionReference(sessionPath);
+    } catch (error) {
+      if (error instanceof SessionReferenceResolutionError) {
+        return undefined;
+      }
+
+      throw error;
+    }
   }
 
   private resolveSessionWorkspace(workspace: string | undefined): {
@@ -585,7 +726,10 @@ export class PiSessionService {
   }
 
   async fork(entryId: string): Promise<{ cancelled: boolean }> {
-    const result = await this.getSession().fork(entryId);
+    const previousSession = this.getSession();
+    const previousWorkspace = this.currentWorkspace;
+    const result = await this.getHandle().runtime.fork(entryId);
+    await this.rebindAfterRuntimeSessionReplacement(previousSession, previousWorkspace);
     return { cancelled: result.cancelled };
   }
 
@@ -624,7 +768,7 @@ export class PiSessionService {
 
   async handback(): Promise<{ sessionFile?: string; workspace: string }> {
     const info = {
-      sessionFile: this.handle?.session.sessionFile,
+      sessionFile: this.handle?.runtime.session.sessionFile,
       workspace: this.currentWorkspace,
     };
 
@@ -637,19 +781,33 @@ export class PiSessionService {
       );
     }
 
+    const previousHandle = this.handle;
+    this.sessionUnsubscribe?.();
+    this.sessionUnsubscribe = undefined;
+    this.handle = undefined;
+
     try {
-      this.handle?.dispose();
+      await previousHandle?.dispose();
     } catch (error) {
       console.error("Failed to dispose session during handback:", error);
     }
-    this.handle = undefined;
 
     return info;
   }
 
   dispose(): void {
-    this.handle?.dispose();
+    this.sessionUnsubscribe?.();
+    this.sessionUnsubscribe = undefined;
+
+    const handle = this.handle;
     this.handle = undefined;
+    if (!handle) {
+      return;
+    }
+
+    void handle.dispose().catch((error) => {
+      console.error("Failed to dispose Pi session:", error);
+    });
   }
 
   private getHandle(): PiSessionHandle {
@@ -660,7 +818,94 @@ export class PiSessionService {
   }
 
   private getModelRegistry(): ModelRegistry {
-    return this.getHandle().modelRegistry;
+    return this.getHandle().runtime.services.modelRegistry;
+  }
+
+  private async replaceHandle(nextHandle: PiSessionHandle): Promise<void> {
+    const previousHandle = this.handle;
+    const previousSession = previousHandle?.runtime.session;
+    const previousWorkspace = this.currentWorkspace;
+    this.handle = nextHandle;
+
+    try {
+      await this.rebindAfterSessionReplacement(previousSession);
+    } catch (error) {
+      await this.disposeHandleAfterRebindFailure(nextHandle, previousWorkspace, error);
+    } finally {
+      try {
+        await previousHandle?.dispose();
+      } catch (error) {
+        console.error("Failed to dispose previous session:", error);
+      }
+    }
+  }
+
+  private async bindExtensionsToCurrentSession(): Promise<void> {
+    if (!this.extensionBindings || !this.handle) {
+      return;
+    }
+
+    await this.getSession().bindExtensions(this.extensionBindings);
+  }
+
+  private rebindSessionSubscription(): void {
+    this.sessionUnsubscribe?.();
+    this.sessionUnsubscribe = undefined;
+
+    if (!this.sessionCallbacks || !this.handle) {
+      return;
+    }
+
+    this.sessionUnsubscribe = subscribeToSession(this.getSession(), this.sessionCallbacks);
+  }
+
+  private async disposeHandleAfterRebindFailure(
+    handle: PiSessionHandle | undefined,
+    previousWorkspace: string,
+    error: unknown,
+  ): Promise<never> {
+    this.sessionUnsubscribe?.();
+    this.sessionUnsubscribe = undefined;
+    this.handle = undefined;
+    this.currentWorkspace = previousWorkspace;
+
+    try {
+      await handle?.dispose();
+    } catch (disposeError) {
+      console.error("Failed to dispose replacement session after rebinding error:", disposeError);
+    }
+
+    throw error;
+  }
+
+  private async rebindAfterRuntimeSessionReplacement(
+    previousSession: AgentSession | undefined,
+    previousWorkspace: string,
+  ): Promise<void> {
+    try {
+      await this.rebindAfterSessionReplacement(previousSession);
+    } catch (error) {
+      await this.disposeHandleAfterRebindFailure(this.handle, previousWorkspace, error);
+    }
+  }
+
+  private async rebindAfterSessionReplacement(previousSession?: AgentSession): Promise<void> {
+    if (!this.handle) {
+      return;
+    }
+
+    const currentSession = this.getSession();
+    // AgentSessionRuntime replacements currently perform a process.chdir(runtime.cwd).
+    // TelePi therefore treats runtime.cwd as the source of truth after every runtime-driven
+    // session replacement and assumes these flows stay serialized enough to avoid surprising
+    // process-wide cwd races if maintainers add more concurrent workspace-sensitive work later.
+    this.currentWorkspace = this.handle.runtime.cwd;
+    if (previousSession === currentSession) {
+      return;
+    }
+
+    await this.bindExtensionsToCurrentSession();
+    this.rebindSessionSubscription();
   }
 }
 
@@ -782,95 +1027,115 @@ export class PiSessionRegistry {
   }
 }
 
-function drainSettingsWarnings(settingsManager: SettingsManager): void {
-  const errors = settingsManager.drainErrors?.() ?? [];
-  for (const error of errors) {
-    console.warn(`Pi settings warning (${error.scope}): ${error.error.message}`);
+function normalizeNewSessionOptions(
+  request?: string | PiSessionNewSessionOptions,
+): PiSessionNewSessionOptions {
+  if (typeof request === "string") {
+    return { workspace: request };
   }
+
+  return request ?? {};
+}
+
+async function applySessionSetup(
+  session: AgentSession,
+  setup?: PiSessionNewSessionOptions["setup"],
+): Promise<void> {
+  if (!setup) {
+    return;
+  }
+
+  await setup(session.sessionManager);
+  session.agent.state.messages = session.sessionManager.buildSessionContext().messages;
+}
+
+function collectSettingsDiagnostics(settingsManager: SettingsManager): PiSessionDiagnostic[] {
+  return (settingsManager.drainErrors?.() ?? []).map(({ scope, error }): PiSessionDiagnostic => ({
+    type: "warning",
+    message: `${humanizeDiagnosticScope(scope)} settings: ${error.message}`,
+  }));
+}
+
+function collectSessionResourceDiagnostics(
+  resourceLoader: ResourceLoader,
+  session: AgentSession,
+): PiSessionDiagnostic[] {
+  return [
+    ...(resourceLoader.getExtensions?.().errors ?? []).map(({ path, error }): PiSessionDiagnostic => ({
+      type: "error",
+      message: `Failed to load extension "${path}": ${error}`,
+    })),
+    ...normalizeResourceDiagnostics("Skill", resourceLoader.getSkills?.().diagnostics ?? []),
+    ...normalizeResourceDiagnostics("Prompt", resourceLoader.getPrompts?.().diagnostics ?? []),
+    ...normalizeResourceDiagnostics("Theme", resourceLoader.getThemes?.().diagnostics ?? []),
+    ...normalizeResourceDiagnostics("Extension", session.extensionRunner?.getCommandDiagnostics?.() ?? []),
+    ...normalizeResourceDiagnostics("Extension", session.extensionRunner?.getShortcutDiagnostics?.() ?? []),
+  ];
+}
+
+function normalizeResourceDiagnostics(
+  label: string,
+  diagnostics: ResourceDiagnostic[],
+): PiSessionDiagnostic[] {
+  return diagnostics.map((diagnostic) => {
+    if (diagnostic.type === "collision" && diagnostic.collision) {
+      return {
+        type: "warning",
+        message:
+          `${label} collision (${diagnostic.collision.name}): using ${diagnostic.collision.winnerPath}, skipped ${diagnostic.collision.loserPath}`,
+      };
+    }
+
+    const location = diagnostic.path ? ` (${diagnostic.path})` : "";
+    return {
+      type: diagnostic.type === "error" ? "error" : "warning",
+      message: `${label} issue${location}: ${diagnostic.message}`,
+    };
+  });
+}
+
+function dedupeDiagnostics(diagnostics: PiSessionDiagnostic[]): PiSessionDiagnostic[] {
+  const seen = new Set<string>();
+  const deduped: PiSessionDiagnostic[] = [];
+
+  for (const diagnostic of diagnostics) {
+    const key = `${diagnostic.type}:${diagnostic.message}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    deduped.push(diagnostic);
+  }
+
+  return deduped;
+}
+
+function humanizeDiagnosticScope(scope: string): string {
+  if (!scope) {
+    return "Unknown";
+  }
+
+  return scope.charAt(0).toUpperCase() + scope.slice(1);
 }
 
 function createSessionManager(
   config: TelePiConfig,
   workspace: string,
   overrideSessionPath?: string,
+  hasWorkspaceOverride = false,
 ): SessionManager {
   const sessionPath = overrideSessionPath ?? config.piSessionPath;
   if (sessionPath) {
     const runtimeSessionPath = resolveSessionPathForRuntime(sessionPath);
-    const sessionManager = SessionManager.create(workspace, path.resolve(runtimeSessionPath, ".."));
-    sessionManager.setSessionFile(runtimeSessionPath);
-    return sessionManager;
+    const headerWorkspace = resolveWorkspacePathForRuntime(readSessionHeader(runtimeSessionPath)?.cwd);
+    return SessionManager.open(
+      runtimeSessionPath,
+      undefined,
+      hasWorkspaceOverride ? workspace : (headerWorkspace ?? workspace),
+    );
   }
 
   return SessionManager.create(workspace);
-}
-
-function resolveSessionPathForRuntime(sessionPath: string): string {
-  const expandedPath = expandHomePath(sessionPath);
-  if (existsSync(expandedPath)) {
-    return expandedPath;
-  }
-
-  // Remap host paths to container paths (e.g. /Users/<user>/.pi/agent/... → /home/telepi/.pi/agent/...)
-  const marker = `${path.sep}.pi${path.sep}agent${path.sep}`;
-  const markerIndex = expandedPath.lastIndexOf(marker);
-  if (markerIndex === -1) {
-    return expandedPath;
-  }
-
-  const suffix = expandedPath.slice(markerIndex + marker.length);
-  for (const base of ["/home/telepi/.pi/agent", "/root/.pi/agent"]) {
-    const remapped = path.resolve(base, suffix);
-    // Ensure remapped path stays within the base directory (prevent traversal)
-    if (!remapped.startsWith(base + path.sep) && remapped !== base) {
-      continue;
-    }
-    if (existsSync(remapped)) {
-      return remapped;
-    }
-  }
-
-  return expandedPath;
-}
-
-function readSessionHeader(sessionPath: string): SessionHeaderInfo | undefined {
-  try {
-    const fd = openSync(sessionPath, "r");
-    try {
-      const buffer = Buffer.alloc(1024);
-      const bytesRead = readSync(fd, buffer, 0, buffer.length, 0);
-      const firstLine = buffer.toString("utf8", 0, bytesRead).split("\n", 1)[0]?.trim();
-      if (!firstLine) {
-        return undefined;
-      }
-
-      const parsed = JSON.parse(firstLine) as { type?: string; id?: unknown; cwd?: unknown };
-      if (parsed.type !== "session" || typeof parsed.id !== "string") {
-        return undefined;
-      }
-
-      return {
-        id: parsed.id,
-        cwd: typeof parsed.cwd === "string" ? parsed.cwd : undefined,
-      };
-    } finally {
-      closeSync(fd);
-    }
-  } catch {
-    return undefined;
-  }
-}
-
-function resolveWorkspacePathForRuntime(workspace: string | undefined): string | undefined {
-  if (!workspace) {
-    return undefined;
-  }
-
-  if (existsSync(workspace)) {
-    return workspace;
-  }
-
-  return undefined;
 }
 
 function resolveModelOverride(

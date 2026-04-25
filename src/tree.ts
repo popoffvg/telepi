@@ -1,17 +1,19 @@
 import type { SessionEntry } from "@mariozechner/pi-coding-agent";
 
+import { NOOP_PAGE_CALLBACK_DATA } from "./callback-data.js";
+import { escapeHTML } from "./format.js";
+
 export interface SessionTreeNodeLike {
   entry: SessionEntry;
   children: SessionTreeNodeLike[];
   label?: string;
 }
 
-import { escapeHTML } from "./format.js";
-
 const DEFAULT_TREE_LIMIT = 10;
 const TELEGRAM_TREE_TEXT_LIMIT = 3900;
-const ENTRY_DESCRIPTION_LIMIT = 50;
-const BUTTON_LABEL_DESCRIPTION_LIMIT = 28;
+const ENTRY_DESCRIPTION_LIMIT = 120;
+const BUTTON_LABEL_DESCRIPTION_LIMIT = 20;
+const TREE_BUTTON_PAGE_LIMIT = 6;
 
 type TreeEntryLike = { type: string; id?: string; [key: string]: any };
 
@@ -27,6 +29,12 @@ type FlatDisplayNode = {
   ancestorHasNext: boolean[];
 };
 
+type TreePage = {
+  nodes: FlatDisplayNode[];
+  startIndex: number;
+  endIndex: number;
+};
+
 export interface TreeButton {
   label: string;
   callbackData: string;
@@ -37,6 +45,8 @@ export interface TreeRenderResult {
   buttons: TreeButton[];
   totalEntries: number;
   shownEntries: number;
+  page: number;
+  totalPages: number;
 }
 
 export type TreeFilterMode = "default" | "user-only" | "all-with-buttons";
@@ -115,6 +125,7 @@ export function renderTree(
   options: {
     mode?: TreeFilterMode;
     limit?: number;
+    page?: number;
   } = {},
 ): TreeRenderResult {
   if (tree.length === 0) {
@@ -123,44 +134,71 @@ export function renderTree(
       buttons: [],
       totalEntries: 0,
       shownEntries: 0,
+      page: 0,
+      totalPages: 0,
     };
   }
 
   const mode = options.mode ?? "default";
-  const limit = Math.max(1, options.limit ?? DEFAULT_TREE_LIMIT);
+  const pageEntryLimit = Math.max(1, options.limit ?? DEFAULT_TREE_LIMIT);
   const displayTree = buildDisplayTree(tree, mode);
   const flattened = flattenDisplayTree(displayTree);
 
   if (flattened.length === 0) {
     return {
-      text: wrapTreeText("No matching entries."),
-      buttons: buildFilterButtons(mode),
+      text: buildTreeHtml(
+        ["No matching entries."],
+        {
+          totalEntries: 0,
+          shownEntries: 0,
+          page: 0,
+          totalPages: 0,
+          rangeStart: 0,
+          rangeEnd: 0,
+          mode,
+          focusPage: 0,
+          showFocusNote: false,
+        },
+      ),
+      buttons: buildTreeButtons([], [], leafId, mode, 0, 0, 0),
       totalEntries: 0,
       shownEntries: 0,
+      page: 0,
+      totalPages: 0,
     };
   }
 
   const totalEntries = flattened.length;
-  let visibleNodes = flattened.slice(-limit);
-  let omittedByLimit = totalEntries - visibleNodes.length;
-  let omittedByLength = 0;
-
-  const renderedLines = (): string[] => visibleNodes.map((flatNode) => renderTreeLine(flatNode, leafId));
-
-  let html = buildTreeHtml(renderedLines(), totalEntries, visibleNodes.length, omittedByLimit, omittedByLength, mode);
-  while (html.length > TELEGRAM_TREE_TEXT_LIMIT && visibleNodes.length > 1) {
-    visibleNodes = visibleNodes.slice(1);
-    omittedByLength += 1;
-    html = buildTreeHtml(renderedLines(), totalEntries, visibleNodes.length, omittedByLimit, omittedByLength, mode);
-  }
-
-  const buttons = buildTreeButtons(visibleNodes, leafId, mode);
+  const pages = buildTreePages(flattened, leafId, mode, pageEntryLimit);
+  const focusIndex = getFocusIndex(tree, flattened, leafId);
+  const focusPage = getPageIndexForEntry(pages, focusIndex);
+  const safePage = clampPage(options.page ?? focusPage, pages.length);
+  const visiblePage = pages[safePage] ?? pages[0];
+  const visibleNodes = visiblePage?.nodes ?? [];
+  const pageBaseDepth = visibleNodes.reduce((minDepth, flatNode) => Math.min(minDepth, flatNode.depth), Number.POSITIVE_INFINITY);
+  const renderedLines = visibleNodes.map((flatNode) =>
+    renderTreeLine(flatNode, leafId, Number.isFinite(pageBaseDepth) ? pageBaseDepth : 0)
+  );
+  const html = buildTreeHtml(renderedLines, {
+    totalEntries,
+    shownEntries: visibleNodes.length,
+    page: safePage,
+    totalPages: pages.length,
+    rangeStart: visibleNodes.length === 0 ? 0 : visiblePage.startIndex + 1,
+    rangeEnd: visibleNodes.length === 0 ? 0 : visiblePage.endIndex + 1,
+    mode,
+    focusPage,
+    showFocusNote: leafId !== null,
+  });
+  const buttons = buildTreeButtons(flattened, visibleNodes, leafId, mode, safePage, pages.length, focusIndex);
 
   return {
     text: html,
     buttons,
     totalEntries,
     shownEntries: visibleNodes.length,
+    page: safePage,
+    totalPages: pages.length,
   };
 }
 
@@ -264,64 +302,247 @@ function shouldIncludeEntry(entry: SessionEntry, mode: TreeFilterMode): boolean 
   return true;
 }
 
-function renderTreeLine(flatNode: FlatDisplayNode, leafId: string | null): string {
+function buildTreePages(
+  flattened: FlatDisplayNode[],
+  leafId: string | null,
+  mode: TreeFilterMode,
+  pageEntryLimit: number,
+): TreePage[] {
+  const pages: TreePage[] = [];
+  let currentNodes: FlatDisplayNode[] = [];
+  let currentStartIndex = 0;
+  let currentNavButtonCount = 0;
+
+  flattened.forEach((flatNode, index) => {
+    const nextButtonCount = getNavButton(flatNode.node, leafId, mode) ? 1 : 0;
+    const wouldOverflowEntryLimit = currentNodes.length >= pageEntryLimit;
+    const wouldOverflowButtonLimit = currentNodes.length > 0
+      && currentNavButtonCount + nextButtonCount > TREE_BUTTON_PAGE_LIMIT;
+
+    if (currentNodes.length > 0 && (wouldOverflowEntryLimit || wouldOverflowButtonLimit)) {
+      pages.push({
+        nodes: currentNodes,
+        startIndex: currentStartIndex,
+        endIndex: index - 1,
+      });
+      currentNodes = [];
+      currentStartIndex = index;
+      currentNavButtonCount = 0;
+    }
+
+    currentNodes.push(flatNode);
+    currentNavButtonCount += nextButtonCount;
+  });
+
+  if (currentNodes.length > 0) {
+    pages.push({
+      nodes: currentNodes,
+      startIndex: currentStartIndex,
+      endIndex: flattened.length - 1,
+    });
+  }
+
+  return pages.length > 0 ? pages : [{ nodes: [], startIndex: 0, endIndex: 0 }];
+}
+
+function getFocusIndex(
+  tree: SessionTreeNodeLike[],
+  flattened: FlatDisplayNode[],
+  leafId: string | null,
+): number {
+  if (flattened.length === 0) {
+    return 0;
+  }
+
+  if (!leafId) {
+    return flattened.length - 1;
+  }
+
+  const exactIndex = flattened.findIndex((flatNode) => flatNode.node.entry.id === leafId);
+  if (exactIndex >= 0) {
+    return exactIndex;
+  }
+
+  const ancestorIds = collectAncestorIds(tree, leafId);
+  for (let index = flattened.length - 1; index >= 0; index -= 1) {
+    if (ancestorIds.has(flattened[index]!.node.entry.id)) {
+      return index;
+    }
+  }
+
+  return flattened.length - 1;
+}
+
+function collectAncestorIds(tree: SessionTreeNodeLike[], leafId: string): Set<string> {
+  const parentById = new Map<string, string | null>();
+
+  const walk = (node: SessionTreeNodeLike): void => {
+    parentById.set(node.entry.id, node.entry.parentId ?? null);
+    for (const child of node.children) {
+      walk(child);
+    }
+  };
+
+  for (const root of tree) {
+    walk(root);
+  }
+
+  const result = new Set<string>();
+  const visited = new Set<string>();
+  let currentId: string | null = leafId;
+  while (currentId && !visited.has(currentId)) {
+    visited.add(currentId);
+    result.add(currentId);
+    currentId = parentById.get(currentId) ?? null;
+  }
+
+  return result;
+}
+
+function getPageIndexForEntry(pages: TreePage[], entryIndex: number): number {
+  const safeEntryIndex = Math.max(0, entryIndex);
+  const pageIndex = pages.findIndex((page) => safeEntryIndex >= page.startIndex && safeEntryIndex <= page.endIndex);
+  return pageIndex >= 0 ? pageIndex : 0;
+}
+
+function clampPage(page: number, totalPages: number): number {
+  if (totalPages <= 0) {
+    return 0;
+  }
+
+  return Math.max(0, Math.min(page, totalPages - 1));
+}
+
+function renderTreeLine(flatNode: FlatDisplayNode, leafId: string | null, baseDepth = 0): string {
   const { node, depth, isLast, ancestorHasNext } = flatNode;
-  const indent = ancestorHasNext.map((hasNext) => (hasNext ? "│  " : "   ")).join("");
-  const connector = depth === 0 ? "" : isLast ? "└─ " : "├─ ";
+  const relativeDepth = Math.max(0, depth - baseDepth);
+  const visibleAncestors = relativeDepth > 0 ? ancestorHasNext.slice(-relativeDepth) : [];
+  const hiddenPrefix = baseDepth > 0 && relativeDepth === 0 ? "… " : "";
+  const indent = visibleAncestors.map((hasNext) => (hasNext ? "│  " : "   ")).join("");
+  const connector = relativeDepth === 0 ? "" : isLast ? "└─ " : "├─ ";
   const shortId = node.entry.id.slice(0, 4);
   const label = node.label ? ` [${node.label}]` : "";
   const active = node.entry.id === leafId ? " ← active" : "";
-  return `${indent}${connector}${shortId} ${describeEntry(node.entry)}${label}${active}`;
+  return `${hiddenPrefix}${indent}${connector}${shortId} ${describeEntry(node.entry)}${label}${active}`;
 }
 
 function buildTreeHtml(
   lines: string[],
-  totalEntries: number,
-  shownEntries: number,
-  omittedByLimit: number,
-  omittedByLength: number,
-  mode: TreeFilterMode,
+  details: {
+    totalEntries: number;
+    shownEntries: number;
+    page: number;
+    totalPages: number;
+    rangeStart: number;
+    rangeEnd: number;
+    mode: TreeFilterMode;
+    focusPage: number;
+    showFocusNote: boolean;
+  },
 ): string {
   const notes: string[] = [];
+  const pageLabel = `Page ${details.page + 1}/${Math.max(details.totalPages, 1)}`;
 
-  if (omittedByLimit > 0 && omittedByLength > 0) {
-    notes.push(`Showing the latest ${shownEntries} of ${totalEntries} entries; ${omittedByLength} more omitted to fit Telegram.`);
-  } else if (omittedByLimit > 0) {
-    notes.push(`Showing ${shownEntries} of ${totalEntries} entries.`);
-  } else if (omittedByLength > 0) {
-    notes.push(`… ${omittedByLength} entries omitted to fit Telegram.`);
+  if (details.totalEntries === 0) {
+    notes.push(`${pageLabel} · no matching entries.`);
+  } else {
+    notes.push(`${pageLabel} · entries ${details.rangeStart}-${details.rangeEnd} of ${details.totalEntries}.`);
   }
 
-  if (mode === "user-only") {
+  if (details.mode === "default") {
+    if (details.showFocusNote && details.page === details.focusPage) {
+      notes.push("Current branch context.");
+    } else if (details.showFocusNote) {
+      notes.push(`Current branch page: ${details.focusPage + 1}/${Math.max(details.totalPages, 1)}.`);
+    }
+  } else if (details.mode === "user-only") {
     notes.push("Filter: user messages only.");
-  } else if (mode === "all-with-buttons") {
+  } else if (details.mode === "all-with-buttons") {
     notes.push("Filter: all entries with navigation buttons.");
   }
 
-  const parts = [wrapTreeText(lines.join("\n"))];
-  if (notes.length > 0) {
-    parts.push(`<i>${escapeHTML(notes.join(" "))}</i>`);
+  const notesHtml = `<i>${escapeHTML(notes.join(" "))}</i>`;
+  const renderHtml = (renderedLines: string[]): string => [wrapTreeText(renderedLines.join("\n")), notesHtml].join("\n");
+
+  const html = renderHtml(lines);
+  if (html.length <= TELEGRAM_TREE_TEXT_LIMIT) {
+    return html;
   }
 
-  return parts.join("\n");
+  for (const width of [220, 160, 120, 90, 60, 40]) {
+    const compactHtml = renderHtml(lines.map((line) => truncateText(line, width)));
+    if (compactHtml.length <= TELEGRAM_TREE_TEXT_LIMIT) {
+      return compactHtml;
+    }
+  }
+
+  let emergencyBudget = TELEGRAM_TREE_TEXT_LIMIT - notesHtml.length - 16;
+  while (emergencyBudget > 40) {
+    const emergencyHtml = renderHtml([truncateText(lines.join("\n"), emergencyBudget)]);
+    if (emergencyHtml.length <= TELEGRAM_TREE_TEXT_LIMIT) {
+      return emergencyHtml;
+    }
+    emergencyBudget -= 50;
+  }
+
+  return renderHtml([truncateText(lines.join("\n"), 40)]);
 }
 
 function buildTreeButtons(
+  flattened: FlatDisplayNode[],
   visibleNodes: FlatDisplayNode[],
   leafId: string | null,
   mode: TreeFilterMode,
+  page: number,
+  totalPages: number,
+  focusIndex: number,
 ): TreeButton[] {
   const buttons: TreeButton[] = [];
   const seenIds = new Set<string>();
 
-  for (const flatNode of visibleNodes) {
+  const pushNavButton = (flatNode: FlatDisplayNode): void => {
     const button = getNavButton(flatNode.node, leafId, mode);
     if (!button || seenIds.has(flatNode.node.entry.id)) {
-      continue;
+      return;
     }
 
     buttons.push(button);
     seenIds.add(flatNode.node.entry.id);
+  };
+
+  for (const flatNode of visibleNodes) {
+    pushNavButton(flatNode);
+  }
+
+  if (mode === "default" && buttons.length === 0) {
+    const fallbackCandidates = flattened
+      .map((flatNode, index) => ({ flatNode, index }))
+      .filter(({ flatNode }) => getNavButton(flatNode.node, leafId, mode) !== undefined)
+      .sort((left, right) => {
+        const leftDistance = Math.abs(left.index - focusIndex);
+        const rightDistance = Math.abs(right.index - focusIndex);
+        if (leftDistance !== rightDistance) {
+          return leftDistance - rightDistance;
+        }
+        return left.index - right.index;
+      });
+
+    for (const candidate of fallbackCandidates) {
+      if (buttons.length >= TREE_BUTTON_PAGE_LIMIT) {
+        break;
+      }
+      pushNavButton(candidate.flatNode);
+    }
+  }
+
+  if (totalPages > 1) {
+    if (page > 0) {
+      buttons.push({ label: "◀️ Prev", callbackData: `tree_page_${page - 1}` });
+    }
+    buttons.push({ label: `${page + 1}/${totalPages}`, callbackData: NOOP_PAGE_CALLBACK_DATA });
+    if (page < totalPages - 1) {
+      buttons.push({ label: "Next ▶️", callbackData: `tree_page_${page + 1}` });
+    }
   }
 
   buttons.push(...buildFilterButtons(mode));
@@ -334,35 +555,35 @@ function getNavButton(node: SessionTreeNodeLike, leafId: string | null, mode: Tr
 
   if (mode === "all-with-buttons") {
     return {
-      label: `🔀 ${shortId} — ${description}`,
+      label: `🔀 ${shortId} · ${description}`,
       callbackData: `tree_nav_${node.entry.id}`,
     };
   }
 
   if (mode === "user-only") {
     return {
-      label: `👤 ${shortId} — ${description}`,
+      label: `👤 ${shortId} · ${description}`,
       callbackData: `tree_nav_${node.entry.id}`,
     };
   }
 
   if (node.children.length >= 2) {
     return {
-      label: `🔀 ${shortId} — ${description}`,
+      label: `🔀 ${shortId} · ${description}`,
       callbackData: `tree_nav_${node.entry.id}`,
     };
   }
 
   if (node.label) {
     return {
-      label: `🏷️ ${shortId} — [${truncateText(node.label, 18)}]`,
+      label: `🏷️ ${shortId} · ${truncateText(node.label, 14)}`,
       callbackData: `tree_nav_${node.entry.id}`,
     };
   }
 
   if (node.children.length === 0 && node.entry.id !== leafId) {
     return {
-      label: `🌿 ${shortId} — ${description}`,
+      label: `🌿 ${shortId} · ${description}`,
       callbackData: `tree_nav_${node.entry.id}`,
     };
   }
@@ -374,15 +595,15 @@ function buildFilterButtons(mode: TreeFilterMode): TreeButton[] {
   const buttons: TreeButton[] = [];
 
   if (mode !== "default") {
-    buttons.push({ label: "🌲 Default view", callbackData: "tree_mode_default" });
+    buttons.push({ label: "🌲 Default", callbackData: "tree_mode_default" });
   }
 
   if (mode !== "all-with-buttons") {
-    buttons.push({ label: "📄 Show all", callbackData: "tree_mode_all" });
+    buttons.push({ label: "📄 All", callbackData: "tree_mode_all" });
   }
 
   if (mode !== "user-only") {
-    buttons.push({ label: "👤 User only", callbackData: "tree_mode_user" });
+    buttons.push({ label: "👤 User", callbackData: "tree_mode_user" });
   }
 
   return buttons;
