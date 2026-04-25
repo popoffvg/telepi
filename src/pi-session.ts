@@ -620,8 +620,17 @@ export class PiSessionService {
     );
   }
 
+  /**
+   * Best-effort helper for UI flows that want a workspace hint before switching.
+   * Missing sessions and transient session-index failures should both surface as
+   * "no workspace available" so callers can safely fall back.
+   */
   async resolveWorkspaceForSession(sessionPath: string): Promise<string | undefined> {
-    return (await this.tryResolveSessionReference(sessionPath))?.cwd;
+    try {
+      return (await this.tryResolveSessionReference(sessionPath))?.cwd;
+    } catch {
+      return undefined;
+    }
   }
 
   async switchSession(sessionPath: string, workspace?: string): Promise<PiSessionSwitchResult> {

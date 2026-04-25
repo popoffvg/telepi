@@ -1448,6 +1448,13 @@ describe("PiSessionService", () => {
     await expect(service.resolveWorkspaceForSession("/sessions/missing.jsonl")).resolves.toBeUndefined();
   });
 
+  it("returns undefined when an ID-based workspace lookup hits an unexpected index failure", async () => {
+    mockState.SessionManager.listAll.mockRejectedValueOnce(new Error("boom"));
+    const service = await PiSessionService.create(createConfig());
+
+    await expect(service.resolveWorkspaceForSession("s1")).resolves.toBeUndefined();
+  });
+
   it("lists models with the current one marked", async () => {
     const service = await PiSessionService.create(createConfig());
 
