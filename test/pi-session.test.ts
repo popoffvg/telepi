@@ -20,6 +20,7 @@ const mockState = vi.hoisted(() => {
   const modelRegistryInstances: any[] = [];
   const sessionSubscribers = new WeakMap<object, (event: any) => void>();
   const sessionPathWorkspaces = new Map<string, string>();
+  const resolvedSessionPaths = new Map<string, string>();
   let slashCommands = [
     { name: "deploy", description: "Deploy app", source: "extension", path: "/ext/deploy.ts" },
     { name: "review", description: "Review staged changes", source: "prompt", path: "/prompts/review.md" },
@@ -337,6 +338,13 @@ const mockState = vi.hoisted(() => {
     setSessionPathWorkspace: (sessionPath: string, workspace: string) => {
       sessionPathWorkspaces.set(sessionPath, workspace);
     },
+    resolveSessionPathForRuntime: (
+      sessionPath: string,
+      fallback: (sessionPath: string) => string,
+    ) => resolvedSessionPaths.get(sessionPath) ?? fallback(sessionPath),
+    setResolvedSessionPath: (sessionPath: string, resolvedPath: string) => {
+      resolvedSessionPaths.set(sessionPath, resolvedPath);
+    },
     reset: () => {
       sessionCounter = 0;
       runtimeCounter = 0;
@@ -345,6 +353,7 @@ const mockState = vi.hoisted(() => {
       createdRuntimes.length = 0;
       modelRegistryInstances.length = 0;
       sessionPathWorkspaces.clear();
+      resolvedSessionPaths.clear();
       createAgentSession.mockClear();
       createAgentSessionRuntime.mockClear();
       createAgentSessionServices.mockClear();
@@ -378,6 +387,17 @@ vi.mock("@mariozechner/pi-coding-agent", () => ({
   SettingsManager: mockState.SettingsManager,
   getAgentDir: vi.fn().mockReturnValue("/mock-agent"),
 }));
+
+vi.mock("../src/pi-session-paths.js", async () => {
+  const actual = await vi.importActual<typeof import("../src/pi-session-paths.js")>("../src/pi-session-paths.js");
+
+  return {
+    ...actual,
+    resolveSessionPathForRuntime: vi.fn((sessionPath: string) =>
+      mockState.resolveSessionPathForRuntime(sessionPath, actual.resolveSessionPathForRuntime)
+    ),
+  };
+});
 
 import { getPiSessionContextKey, PiSessionRegistry, PiSessionService } from "../src/pi-session.js";
 
@@ -785,6 +805,82 @@ describe("PiSessionService", () => {
     } finally {
       rmSync(targetWorkspace, { recursive: true, force: true });
     }
+  });
+
+  it("switches using the resolved session path when the caller passes a ~ path", async () => {
+    mockState.SessionManager.listAll.mockRejectedValueOnce(new Error("boom"));
+    const tempDir = mkdtempSync(path.join(homedir(), "telepi-session-"));
+
+    try {
+      const sessionPath = path.join(tempDir, "tilde-switch.jsonl");
+      writeFileSync(
+        sessionPath,
+        `${JSON.stringify({
+          type: "session",
+          version: 3,
+          id: "tilde-switch",
+          timestamp: "2025-01-03T00:00:00.000Z",
+          cwd: tempDir,
+        })}\n`,
+      );
+      const tildePath = sessionPath.replace(homedir(), "~");
+      const service = await PiSessionService.create(createConfig({ workspace: "/workspace/projectA" }));
+      const runtime = mockState.createdRuntimes[0]?.runtime;
+
+      const info = await service.switchSession(tildePath);
+
+      expect(runtime.switchSession).toHaveBeenCalledWith(sessionPath, tempDir);
+      expect(mockState.SessionManager.open).toHaveBeenLastCalledWith(sessionPath, undefined, tempDir);
+      expect(info.sessionFile).toBe(sessionPath);
+      expect(info.workspace).toBe(tempDir);
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("switches using the remapped runtime session path instead of the raw caller input", async () => {
+    mockState.SessionManager.listAll.mockRejectedValueOnce(new Error("boom"));
+    const tempDir = mkdtempSync(path.join(tmpdir(), "telepi-session-"));
+    const rawSessionPath = "/Users/example/.pi/agent/sessions/remapped.jsonl";
+
+    try {
+      const resolvedSessionPath = path.join(tempDir, "remapped.jsonl");
+      writeFileSync(
+        resolvedSessionPath,
+        `${JSON.stringify({
+          type: "session",
+          version: 3,
+          id: "remapped1",
+          timestamp: "2025-01-03T00:00:00.000Z",
+          cwd: tempDir,
+        })}\n`,
+      );
+      mockState.setResolvedSessionPath(rawSessionPath, resolvedSessionPath);
+      const service = await PiSessionService.create(createConfig({ workspace: "/workspace/projectA" }));
+      const runtime = mockState.createdRuntimes[0]?.runtime;
+
+      const info = await service.switchSession(rawSessionPath);
+
+      expect(runtime.switchSession).toHaveBeenCalledWith(resolvedSessionPath, tempDir);
+      expect(mockState.SessionManager.open).toHaveBeenLastCalledWith(resolvedSessionPath, undefined, tempDir);
+      expect(info.sessionFile).toBe(resolvedSessionPath);
+      expect(info.workspace).toBe(tempDir);
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("recreates the model registry each time the runtime factory creates a session", async () => {
+    const service = await PiSessionService.create(createConfig());
+    const firstRegistry = mockState.createAgentSessionServices.mock.calls[0]?.[0]?.modelRegistry;
+
+    await service.switchSession("/sessions/saved.jsonl", "/workspace/projectA");
+
+    const secondRegistry = mockState.createAgentSessionServices.mock.calls[1]?.[0]?.modelRegistry;
+    expect(mockState.ModelRegistry.create).toHaveBeenCalledTimes(2);
+    expect(firstRegistry).toBe(mockState.modelRegistryInstances[0]);
+    expect(secondRegistry).toBe(mockState.modelRegistryInstances[1]);
+    expect(secondRegistry).not.toBe(firstRegistry);
   });
 
   it("returns the runtime cancellation signal when switching sessions is cancelled", async () => {

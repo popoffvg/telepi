@@ -183,7 +183,6 @@ async function createPiSessionHandle(
   initialSessionStartEvent?: { reason: "new" | "resume" | "fork" },
 ): Promise<PiSessionHandle> {
   const authStorage = AuthStorage.create();
-  const modelRegistry = ModelRegistry.create(authStorage);
   let getSlashCommands = (): SlashCommandInfo[] => [];
   const createRuntime: CreateAgentSessionRuntimeFactory = async ({
     cwd,
@@ -192,6 +191,7 @@ async function createPiSessionHandle(
     sessionStartEvent,
   }) => {
     const settingsManager = SettingsManager.create(cwd);
+    const modelRegistry = ModelRegistry.create(authStorage);
     const services = await createAgentSessionServices({
       cwd,
       agentDir,
@@ -612,21 +612,18 @@ export class PiSessionService {
   }
 
   async resolveWorkspaceForSession(sessionPath: string): Promise<string | undefined> {
-    try {
-      const match = await this.resolveSessionReference(sessionPath);
-      return match.cwd;
-    } catch {
-      return undefined;
-    }
+    return (await this.tryResolveSessionReference(sessionPath))?.cwd;
   }
 
   async switchSession(sessionPath: string, workspace?: string): Promise<PiSessionSwitchResult> {
+    const resolvedReference = await this.tryResolveSessionReference(sessionPath);
+    const runtimeSessionPath = resolvedReference?.path ?? resolveSessionPathForRuntime(sessionPath);
     const effectiveWorkspace = workspace
-      ?? await this.resolveWorkspaceForSession(sessionPath)
+      ?? resolvedReference?.cwd
       ?? this.currentWorkspace;
 
     if (!this.handle) {
-      const nextHandle = await createPiSession(this.config, sessionPath, effectiveWorkspace);
+      const nextHandle = await createPiSession(this.config, runtimeSessionPath, effectiveWorkspace);
       await this.replaceHandle(nextHandle);
       return {
         ...this.getInfo(),
@@ -636,12 +633,22 @@ export class PiSessionService {
 
     const previousSession = this.getSession();
     const previousWorkspace = this.currentWorkspace;
-    const result = await this.getHandle().runtime.switchSession(sessionPath, effectiveWorkspace);
+    const result = await this.getHandle().runtime.switchSession(runtimeSessionPath, effectiveWorkspace);
     await this.rebindAfterRuntimeSessionReplacement(previousSession, previousWorkspace);
     return {
       ...this.getInfo(),
       cancelled: result.cancelled,
     };
+  }
+
+  private async tryResolveSessionReference(
+    sessionPath: string,
+  ): Promise<ResolvedSessionReference | undefined> {
+    try {
+      return await this.resolveSessionReference(sessionPath);
+    } catch {
+      return undefined;
+    }
   }
 
   private resolveSessionWorkspace(workspace: string | undefined): {
