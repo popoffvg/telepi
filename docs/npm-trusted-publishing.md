@@ -86,18 +86,30 @@ Also note npm's current Trusted Publishing requirements:
 - **npm CLI `11.5.1+`**
 - **Node `22.14.0+`**
 
-This requirement matters in practice: TelePi initially had a correctly configured OIDC workflow, but publishes still failed with a misleading `E404 Not Found - PUT ... is not in this registry` error until the workflow explicitly upgraded npm on the runner.
+This requirement matters in practice: TelePi initially had a correctly configured OIDC workflow, but publishes still failed with a misleading `E404 Not Found - PUT ... is not in this registry` error until the workflow explicitly ran npm 11 in CI.
 
-In practice, the workflow should explicitly upgrade npm after `actions/setup-node`, for example:
+Prefer invoking a pinned npm 11 release via `npx` instead of trying to self-upgrade the runner's global npm installation. In practice, the workflow should keep the runner's bundled npm untouched and run a known-good npm 11 build for release steps, for example:
 
 ```yaml
-- name: Update npm for trusted publishing
-  run: npm install -g npm@^11.10.0
+- name: Set up Node.js
+  uses: actions/setup-node@v4
+  with:
+    node-version: 22.14
+    cache: npm
 
 - name: Show Node and npm versions
   run: |
     node -v
     npm -v
+    # Trusted Publishing needs npm 11.5.1+.
+    # Use npx to run a pinned npm 11 without mutating the runner.
+    npx --yes npm@11.10.0 -v
+
+- name: Install dependencies
+  run: npx --yes npm@11.10.0 ci
+
+- name: Run release CI
+  run: npx --yes npm@11.10.0 run ci:release
 ```
 
 ### Core release steps
@@ -106,9 +118,9 @@ A typical workflow should:
 1. check out the repo
 2. set up Node and npm registry access
 3. verify the pushed tag matches `package.json`
-4. install dependencies with `npm ci`
-5. run release CI (`test`, `build`, packaging if needed)
-6. publish to npm with `--provenance`
+4. install dependencies with `npx --yes npm@11.10.0 ci` (or another pinned npm `11.5.1+`)
+5. run release CI with the same pinned npm 11 invocation (`test`, `build`, packaging if needed)
+6. publish to npm with `--provenance` using npm `11.5.1+` (TelePi pins `11.10.0` via `npx`)
 7. optionally upload GitHub Release assets
 
 TelePi uses this publish step:
@@ -118,9 +130,9 @@ TelePi uses this publish step:
   shell: bash
   run: |
     if [[ "${GITHUB_REF_NAME}" == *-* ]]; then
-      npm publish --access public --tag next --provenance
+      npx --yes npm@11.10.0 publish --access public --tag next --provenance
     else
-      npm publish --access public --provenance
+      npx --yes npm@11.10.0 publish --access public --provenance
     fi
 ```
 

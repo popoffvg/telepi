@@ -20,16 +20,17 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 22
+          # npm Trusted Publishing currently requires Node 22.14.0+.
+          node-version: 22.14
           cache: npm
-
-      - name: Update npm for trusted publishing
-        run: npm install -g npm@^11.10.0
 
       - name: Show Node and npm versions
         run: |
           node -v
           npm -v
+          # Trusted Publishing needs npm 11+, but the runner's bundled npm can lag.
+          # Run npm 11 via npx instead of mutating the global install on the runner.
+          npx --yes npm@11.10.0 -v
 
       - name: Verify tag matches package.json version
         run: |
@@ -49,18 +50,22 @@ jobs:
           EOF
 
       - name: Install dependencies
-        run: npm ci
+        run: npx --yes npm@11.10.0 ci
 
       - name: Run release CI
-        run: npm run ci:release
+        run: |
+          # npm calls inside ci:release script bodies still resolve to the runner's system npm on PATH,
+          # not the npx npm@11 wrapper launched here. That's OK because only the publish step
+          # requires npm 11.5.1+ for Trusted Publishing.
+          npx --yes npm@11.10.0 run ci:release
 
       - name: Publish package to npm
         shell: bash
         run: |
           if [[ "${GITHUB_REF_NAME}" == *-* ]]; then
-            npm publish --access public --tag next --provenance
+            npx --yes npm@11.10.0 publish --access public --tag next --provenance
           else
-            npm publish --access public --provenance
+            npx --yes npm@11.10.0 publish --access public --provenance
           fi
 
       - name: Publish GitHub Release assets
