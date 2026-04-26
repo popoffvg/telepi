@@ -544,8 +544,7 @@ git push origin main --follow-tags
 
 The release workflow then:
 - verifies the pushed tag matches `package.json`
-- runs release install/build/publish steps via `npx --yes npm@11.10.0`
-- runs `npx --yes npm@11.10.0 run ci:release`
+- installs dependencies and runs release CI via `npx --yes npm@11.10.0`
 - publishes `@futurelab-studio/telepi` to npm
 - creates a GitHub Release with the packaged tarball and checksum
 

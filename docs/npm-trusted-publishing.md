@@ -91,6 +91,12 @@ This requirement matters in practice: TelePi initially had a correctly configure
 Prefer invoking a pinned npm 11 release via `npx` instead of trying to self-upgrade the runner's global npm installation. In practice, the workflow should keep the runner's bundled npm untouched and run a known-good npm 11 build for release steps, for example:
 
 ```yaml
+- name: Set up Node.js
+  uses: actions/setup-node@v4
+  with:
+    node-version: 22.14
+    cache: npm
+
 - name: Show Node and npm versions
   run: |
     node -v
