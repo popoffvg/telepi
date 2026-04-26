@@ -544,8 +544,8 @@ git push origin main --follow-tags
 
 The release workflow then:
 - verifies the pushed tag matches `package.json`
-- upgrades npm to a Trusted Publishing-compatible version
-- runs `npm run ci:release`
+- runs release install/build/publish steps via `npx --yes npm@11.10.0`
+- runs `npx --yes npm@11.10.0 run ci:release`
 - publishes `@futurelab-studio/telepi` to npm
 - creates a GitHub Release with the packaged tarball and checksum
 
@@ -553,6 +553,6 @@ Notes:
 - prerelease tags like `v0.2.0-beta.1` are published to npm with the `next` dist-tag and marked as GitHub prereleases
 - npm publishing uses Trusted Publishing from GitHub Actions; no `NPM_TOKEN` secret is required
 - the trusted publisher must be configured on npm for repo `benedict2310/TelePi` and workflow `.github/workflows/release.yml`
-- npm Trusted Publishing currently requires npm CLI `11.5.1+` and Node `22.14.0+`; TelePi's workflow upgrades npm explicitly because older npm versions can fail with misleading `E404 Not Found` publish errors even when OIDC is configured correctly
+- npm Trusted Publishing currently requires npm CLI `11.5.1+` and Node `22.14.0+`; TelePi keeps the runner's bundled npm unchanged and uses `npx --yes npm@11.10.0` for release steps because older npm versions can fail with misleading `E404 Not Found` publish errors even when OIDC is configured correctly
 - the workflow has been verified end-to-end with release `v0.2.2`
 - reusable setup details for this pattern live in `docs/npm-trusted-publishing.md`

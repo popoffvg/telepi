@@ -53,7 +53,7 @@ jobs:
 
       - name: Run release CI
         run: |
-          # npm tokens inside ci:release script bodies still resolve to the runner's system npm on PATH,
+          # npm calls inside ci:release script bodies still resolve to the runner's system npm on PATH,
           # not the npx npm@11 wrapper launched here. That's OK because only the publish step
           # requires npm 11.5.1+ for Trusted Publishing.
           npx --yes npm@11.10.0 run ci:release
