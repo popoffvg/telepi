@@ -23,13 +23,13 @@ jobs:
           node-version: 22
           cache: npm
 
-      - name: Update npm for trusted publishing
-        run: npm install -g npm@^11.10.0
-
       - name: Show Node and npm versions
         run: |
           node -v
           npm -v
+          # Trusted Publishing needs npm 11+, but the runner's bundled npm can lag.
+          # Run npm 11 via npx instead of mutating the global install on the runner.
+          npx --yes npm@11.10.0 -v
 
       - name: Verify tag matches package.json version
         run: |
@@ -49,18 +49,18 @@ jobs:
           EOF
 
       - name: Install dependencies
-        run: npm ci
+        run: npx --yes npm@11.10.0 ci
 
       - name: Run release CI
-        run: npm run ci:release
+        run: npx --yes npm@11.10.0 run ci:release
 
       - name: Publish package to npm
         shell: bash
         run: |
           if [[ "${GITHUB_REF_NAME}" == *-* ]]; then
-            npm publish --access public --tag next --provenance
+            npx --yes npm@11.10.0 publish --access public --tag next --provenance
           else
-            npm publish --access public --provenance
+            npx --yes npm@11.10.0 publish --access public --provenance
           fi
 
       - name: Publish GitHub Release assets
